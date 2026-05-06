@@ -102,7 +102,7 @@ latents_out/
   000000000001.json
 ```
 
-Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA training](lora_training.md) for the full training workflow.
+Pass the output directory to `train_lora.py` via `--encoded_dir`. See [LoRA training](lora.md) for the full training workflow.
 
 ### Options
 

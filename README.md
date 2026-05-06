@@ -157,7 +157,7 @@ TBD
 | Guide | Description |
 |-------|-------------|
 | [Inference Methods](docs/workflows/inference.md) | Overview of inference modes (text-to-audio, inpainting, etc.) |
-| [LoRA Training](docs/workflows/lora_training.md) | Fine-tune with LoRA: setup, training loop, and checkpointing |
+| [LoRA Training](docs/workflows/lora.md) | Fine-tune with LoRA: setup, training loop, and checkpointing |
 | [Autoencoder Workflows](docs/workflows/autoencoder.md) | Encode and decode audio with the VAE directly |
 | [Prompting Guide](docs/guides/prompting.md) | Prompt and control signal reference |
 | [Model Overview](docs/guides/model-overview.md) | Architecture and design overview |
