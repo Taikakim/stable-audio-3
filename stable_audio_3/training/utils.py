@@ -1,6 +1,5 @@
 import torch
 import math
-import torch
 import typing as tp
 
 def create_optimizer_from_config(optimizer_config, parameters):
@@ -15,25 +14,8 @@ def create_optimizer_from_config(optimizer_config, parameters):
     """
 
     optimizer_type = optimizer_config["type"]
-
-    if optimizer_type == "FusedAdam":
-        from deepspeed.ops.adam import FusedAdam
-        optimizer = FusedAdam(parameters, **optimizer_config["config"])
-    elif optimizer_type == "CAdamW":
-        from stable_audio_tools.training.optims import CAdamW
-        optimizer = CAdamW(parameters, **optimizer_config["config"])
-    elif optimizer_type == "CLion":
-        from stable_audio_tools.training.optims import CLion
-        optimizer = CLion(parameters, **optimizer_config["config"])
-    elif optimizer_type == "AdamW8bit":
-        from bitsandbytes.optim import AdamW8bit
-        optimizer = AdamW8bit(parameters, **optimizer_config["config"])
-    elif optimizer_type == "MuonAdamW":
-        from stable_audio_tools.training.optims import MuonAdamW
-        optimizer = MuonAdamW(parameters, **optimizer_config["config"])
-    else:
-        optimizer_fn = getattr(torch.optim, optimizer_type)
-        optimizer = optimizer_fn(parameters, **optimizer_config["config"])
+    optimizer_fn = getattr(torch.optim, optimizer_type)
+    optimizer = optimizer_fn(parameters, **optimizer_config["config"])
     return optimizer
 
 def create_scheduler_from_config(scheduler_config, optimizer):

@@ -245,7 +245,7 @@ def train(args):
 
     trainer = pl.Trainer(
         devices="auto",
-        accelerator="gpu",
+        accelerator="auto",
         strategy="auto",
         precision="bf16-mixed",
         accumulate_grad_batches=1,
@@ -348,7 +348,7 @@ def main():
         help="Maximum clip duration in seconds (default 380)",
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--logger", choices=["wandb", "comet", "csv", None], default="csv")
+    p.add_argument("--logger", choices=["wandb", "comet", "csv", "none"], default="csv")
     p.add_argument("--name", type=str, default="lora-finetune")
     p.add_argument("--save_dir", type=str, default="./lora_checkpoints")
     p.add_argument("--checkpoint_every", type=int, default=100)
