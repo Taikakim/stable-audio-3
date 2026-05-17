@@ -51,7 +51,7 @@ def load_autoencoder(config_path: str, ckpt_path: str, device: str = "cpu"):
         state_dict = {
             k[len(effective_prefix) :]: f.get_tensor(k)
             for k in all_keys
-            if k.startswith(effective_prefix) or not effective_prefix
+            if k.startswith(effective_prefix)
         }
 
     copy_state_dict(autoencoder, state_dict)
