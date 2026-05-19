@@ -6,6 +6,23 @@ from tests.utils.audio import assert_audio_valid, sine_wave
 
 DURATION_SEC = 10
 STEPS = 8
+STEPS_BASE = 50
+
+
+def test_text_to_audio_base(sa3_base_model, maybe_save_audio):
+    model = sa3_base_model
+    sr = model.model_config["sample_rate"]
+    prompt = "trap drums, hip hop beat, 120bpm"
+
+    audio = model.generate(
+        prompt=prompt,
+        duration=DURATION_SEC,
+        steps=STEPS_BASE,
+        cfg_scale=7.0,
+        seed=1234,
+    )
+    maybe_save_audio(audio, sr, prompt)
+    assert_audio_valid(audio, DURATION_SEC, sr)
 
 
 def test_text_to_audio(sa3_model, maybe_save_audio):
@@ -239,3 +256,15 @@ def test_batch_inference(sa3_model, maybe_save_audio):
             audio_different_durations[i : i + 1], sr, f"{prompts[i]}_{dur}s"
         )
         assert_audio_valid(audio_different_durations[i : i + 1], d, sr)
+
+    audio_shared_neg = model.generate(
+        prompt=prompts,
+        negative_prompt="low quality, noise",
+        duration=durations,
+        steps=STEPS,
+        duration_padding_sec=duration_padding_sec,
+        batch_size=batch_size,
+    )
+    d = max(durations) + duration_padding_sec
+    for i in range(batch_size):
+        assert_audio_valid(audio_shared_neg[i : i + 1], d, sr)

@@ -6,7 +6,7 @@ import torch
 import torchaudio
 
 from stable_audio_3 import AutoencoderModel, StableAudioModel
-from stable_audio_3.model_configs import ae_models
+from stable_audio_3.model_configs import ae_models, base_models
 
 # ---------------------------------------------------------------------------
 # Hardware detection — used by fixtures and tests to gate GPU-only paths
@@ -59,6 +59,21 @@ def sa3_model(request):
         if not HAS_CUDA:
             pytest.skip("Medium model requires a CUDA GPU — none detected")
         return StableAudioModel.from_pretrained("medium", device=ACCEL_DEVICE)
+
+
+@pytest.fixture(scope="session", params=list(base_models))
+def sa3_base_model(request):
+    """Session-scoped fixture for base (un-fine-tuned) models.
+
+    small-*-base — runs on CUDA if available, otherwise CPU (MPS is skipped because
+                   APG projection requires float64 which MPS does not support).
+    medium-base  — requires a CUDA GPU; skipped otherwise.
+    """
+    name = request.param
+    if name == "medium-base" and not HAS_CUDA:
+        pytest.skip("medium-base requires a CUDA GPU — none detected")
+    device = "cuda" if HAS_CUDA else "cpu"
+    return StableAudioModel.from_pretrained(name, device=device)
 
 
 @pytest.fixture(scope="session", params=list(ae_models))
