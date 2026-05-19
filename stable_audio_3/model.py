@@ -385,9 +385,30 @@ class StableAudioModel:
 
         negative_conditioning = None
         if negative_prompt:
-            negative_conditioning = [
-                {"prompt": negative_prompt, "seconds_total": duration}
-            ] * batch_size
+            if isinstance(negative_prompt, str):
+                if isinstance(duration, (int, float)):
+                    negative_conditioning = [
+                        {"prompt": negative_prompt, "seconds_total": duration}
+                    ] * batch_size
+                else:
+                    negative_conditioning = [
+                        {"prompt": negative_prompt, "seconds_total": d}
+                        for d in duration
+                    ]
+            else:
+                assert len(negative_prompt) == batch_size, (
+                    "When passing a list of negative prompts, the length must match the batch size"
+                )
+                if isinstance(duration, (int, float)):
+                    negative_conditioning = [
+                        {"prompt": p, "seconds_total": duration}
+                        for p in negative_prompt
+                    ]
+                else:
+                    negative_conditioning = [
+                        {"prompt": p, "seconds_total": d}
+                        for p, d in zip(negative_prompt, duration)
+                    ]
 
         return conditioning, negative_conditioning
 

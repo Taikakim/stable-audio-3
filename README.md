@@ -2,7 +2,7 @@
 
 **A state-of-the-art open platform for fast, high-quality generated audio and music.**
 
-[Technical Report](https://arxiv.org/abs/2605.17991) · [Blog Post](TODO) · [🤗 Models](https://huggingface.co/collections/stabilityai/stable-audio-3) · [🤗 Extra Models](https://huggingface.co/collections/stabilityai/stable-audio-3-extra) · [Discord](https://discord.gg/cKpvjey8b)
+[Technical Report](https://arxiv.org/abs/2605.17991) · [Blog Post](https://stability.ai/news-updates/meet-stable-audio-3-the-model-family-built-for-artistic-experimentation-with-open-weight-models) · [🤗 Models](https://huggingface.co/collections/stabilityai/stable-audio-3) · [🤗 Extra Models](https://huggingface.co/collections/stabilityai/stable-audio-3-extra) · [Discord](https://discord.gg/cKpvjey8b)
 
 ![Stable Audio 3 Architecture](stable-audio-3.png)
 

@@ -194,7 +194,7 @@ def test_batch_inference(sa3_model, maybe_save_audio):
     prompts = ["ocean waves", "summer breeze", "city traffic"]
 
     neg_prompts = ["loud background noise", "bad quality", "loud background noise"]
-    durations = [2, 5, 20]
+    durations = [5, 10, 20]
     duration_padding_sec = 6  # Default, just defining here for clarity
 
     audio_same_durations = model.generate(
