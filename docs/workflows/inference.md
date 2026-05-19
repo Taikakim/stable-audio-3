@@ -110,7 +110,7 @@ audio = model.generate(
 
 Both lists must have the same length. Each `(start, end)` pair defines one region to regenerate; everything else is preserved.
 
-You can also *extend* an audio by performing continuation. Simply choose a duration that is longer than your `inpaint_audio` and set `mask_start_seconds` to be the length of your audio file.
+You can also *extend* an audio by performing continuation. Simply choose a duration that is longer than your `inpaint_audio` and set `inpaint_mask_start_seconds` to be the length of your audio file.
 
 ```python
 import torchaudio

@@ -178,16 +178,28 @@ class StableAudioModel:
             inpaint_mask_start_seconds is not None
             and inpaint_mask_end_seconds is not None
         ):
+            start_is_list = isinstance(inpaint_mask_start_seconds, list)
+            end_is_list = isinstance(inpaint_mask_end_seconds, list)
+            if start_is_list != end_is_list:
+                raise ValueError(
+                    "inpaint_mask_start_seconds and inpaint_mask_end_seconds must both be "
+                    "scalars or both be lists, got "
+                    f"{type(inpaint_mask_start_seconds).__name__} and "
+                    f"{type(inpaint_mask_end_seconds).__name__}."
+                )
             starts = (
                 inpaint_mask_start_seconds
-                if isinstance(inpaint_mask_start_seconds, list)
+                if start_is_list
                 else [inpaint_mask_start_seconds]
             )
             ends = (
-                inpaint_mask_end_seconds
-                if isinstance(inpaint_mask_end_seconds, list)
-                else [inpaint_mask_end_seconds]
+                inpaint_mask_end_seconds if end_is_list else [inpaint_mask_end_seconds]
             )
+            if len(starts) != len(ends):
+                raise ValueError(
+                    f"inpaint_mask_start_seconds and inpaint_mask_end_seconds must have the same "
+                    f"length, got {len(starts)} and {len(ends)}."
+                )
             inpaint_mask = torch.ones(1, audio_sample_size, device=device)
             for start_sec, end_sec in zip(starts, ends):
                 mask_start_samples = min(
