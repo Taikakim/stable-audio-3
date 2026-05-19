@@ -175,6 +175,18 @@ audio = model.generate(
 )
 ```
 
+To regenerate **multiple non-contiguous regions** in one pass, pass lists to both mask parameters:
+
+```python
+audio = model.generate(
+    inpaint_audio=inpaint_audio,
+    inpaint_mask_start_seconds=[4.0, 16.0],
+    inpaint_mask_end_seconds=[8.0, 20.0],
+    prompt="punchy kick drum fill",
+    duration=30,
+)
+```
+
 To extend an audio clip (continuation), set `inpaint_mask_start_seconds` to the length of the source file and choose a longer `duration`. See [Inference Methods](docs/workflows/inference.md) for the full controls reference.
 
 

@@ -50,6 +50,32 @@ def test_inpainting(sa3_model, maybe_save_audio):
     assert_audio_valid(audio, inpaint_duration, sr)
 
 
+def test_inpainting_multiple_regions(sa3_model, maybe_save_audio):
+    model = sa3_model
+    sr = model.model_config["sample_rate"]
+    channels = model.model_config.get("io_channels", 2)
+    inpaint_duration = 20.0
+    prompt = "jazz piano trio, upbeat swing, 120bpm"
+
+    base_audio = sine_wave(
+        inpaint_duration,
+        sr,
+        channels=channels,
+        device=str(model.device),
+        half=model.model_half,
+    )
+    audio = model.generate(
+        prompt=prompt,
+        duration=inpaint_duration,
+        steps=STEPS,
+        inpaint_audio=(sr, base_audio),
+        inpaint_mask_start_seconds=[2.0, 12.0],
+        inpaint_mask_end_seconds=[11.0, 19.0],
+    )
+    maybe_save_audio(audio, sr, prompt)
+    assert_audio_valid(audio, inpaint_duration, sr)
+
+
 def test_continuation(sa3_model, maybe_save_audio):
     model = sa3_model
     sr = model.model_config["sample_rate"]

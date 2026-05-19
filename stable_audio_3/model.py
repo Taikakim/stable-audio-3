@@ -97,8 +97,8 @@ class StableAudioModel:
         init_noise_level: float = 1.0,
         inpaint_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
         inpaint_mask=None,
-        inpaint_mask_start_seconds: tp.Optional[float] = None,
-        inpaint_mask_end_seconds: tp.Optional[float] = None,
+        inpaint_mask_start_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
+        inpaint_mask_end_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
         # Schedule options
         duration_padding_sec: float = 6.0,
         apg_scale: float = 1.0,
@@ -135,8 +135,10 @@ class StableAudioModel:
             inpaint_audio: A tuple of (sample_rate, audio) to use as the source audio for inpainting. The inpaint region will be determined by the inpaint_mask or inpaint_mask_start_seconds/inpaint_mask_end_seconds parameters.
             inpaint_mask: A prebuilt mask tensor for inpainting. Shape should be [batch_size, sample_size].
                 Ignored if inpaint_mask_start_seconds/inpaint_mask_end_seconds are provided.
-            inpaint_mask_start_seconds: Start of the inpaint region in seconds.
-            inpaint_mask_end_seconds: End of the inpaint region in seconds.
+            inpaint_mask_start_seconds: Start of the inpaint region in seconds. Can be a float
+                for a single region, or a list of floats for multiple non-contiguous regions.
+            inpaint_mask_end_seconds: End of the inpaint region in seconds. Can be a float
+                for a single region, or a list of floats matching inpaint_mask_start_seconds.
             duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
@@ -176,16 +178,27 @@ class StableAudioModel:
             inpaint_mask_start_seconds is not None
             and inpaint_mask_end_seconds is not None
         ):
-            mask_start_samples = min(
-                int(inpaint_mask_start_seconds * self.model.sample_rate),
-                audio_sample_size,
+            starts = (
+                inpaint_mask_start_seconds
+                if isinstance(inpaint_mask_start_seconds, list)
+                else [inpaint_mask_start_seconds]
             )
-            mask_end_samples = min(
-                int(inpaint_mask_end_seconds * self.model.sample_rate),
-                audio_sample_size,
+            ends = (
+                inpaint_mask_end_seconds
+                if isinstance(inpaint_mask_end_seconds, list)
+                else [inpaint_mask_end_seconds]
             )
             inpaint_mask = torch.ones(1, audio_sample_size, device=device)
-            inpaint_mask[:, mask_start_samples:mask_end_samples] = 0
+            for start_sec, end_sec in zip(starts, ends):
+                mask_start_samples = min(
+                    int(start_sec * self.model.sample_rate),
+                    audio_sample_size,
+                )
+                mask_end_samples = min(
+                    int(end_sec * self.model.sample_rate),
+                    audio_sample_size,
+                )
+                inpaint_mask[:, mask_start_samples:mask_end_samples] = 0
 
         # If the caller passed a prebuilt mask sized to the un-adapted sample_size (or
         # anything longer than audio_sample_size), truncate to audio_sample_size so the

@@ -96,6 +96,20 @@ audio = model.generate(
 )
 ```
 
+To inpaint **multiple non-contiguous regions** in one pass, pass lists for both time parameters:
+
+```python
+audio = model.generate(
+    inpaint_audio=inpaint_audio,
+    inpaint_mask_start_seconds=[2.0, 14.0],
+    inpaint_mask_end_seconds=[6.0, 18.0],
+    prompt="punchy kick drum fill",
+    duration=30,
+)
+```
+
+Both lists must have the same length. Each `(start, end)` pair defines one region to regenerate; everything else is preserved.
+
 You can also *extend* an audio by performing continuation. Simply choose a duration that is longer than your `inpaint_audio` and set `mask_start_seconds` to be the length of your audio file.
 
 ```python
@@ -115,8 +129,8 @@ audio = model.generate(
 ## Controls
 
 - **`inpaint_audio`** — The source audio as a `(sample_rate, tensor)` tuple (e.g. from `torchaudio.load()`). The region outside the mask is preserved; only the masked region is regenerated.
-- **`inpaint_mask_start_seconds`** — Start of the region to regenerate, in seconds.
-- **`inpaint_mask_end_seconds`** — End of the region to regenerate, in seconds.
+- **`inpaint_mask_start_seconds`** — Start of the region to regenerate, in seconds. Pass a list of floats to regenerate multiple non-contiguous regions in one pass.
+- **`inpaint_mask_end_seconds`** — End of the region to regenerate, in seconds. Must be a list of the same length as `inpaint_mask_start_seconds` when using multiple regions.
 
 The other controls for text to audio are the same, however the `prompt` is now used to control how the audio will be inpainted. The [Prompt Guide](../guides/prompting.md) has some examples for this.
 
