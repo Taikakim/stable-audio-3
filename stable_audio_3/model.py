@@ -382,7 +382,7 @@ class StableAudioModel:
         ]
 
         negative_conditioning = None
-        if negative_prompt:
+        if negative_prompt is not None:
             neg_prompts = _to_list(negative_prompt, "negative_prompt")
             negative_conditioning = [
                 {"prompt": p, "seconds_total": d}
