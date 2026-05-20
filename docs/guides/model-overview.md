@@ -124,7 +124,7 @@ At inference time, the Diffusion Transformer iteratively denoises noise into SAM
 
 ## LoRA
 
-Stable Audio supports LoRA fine-tuning as an easy way to adapt models toward specific styles. See the [LoRA guide](docs/workflows/lora.md).
+Stable Audio supports LoRA fine-tuning as an easy way to adapt models toward specific styles. See the [LoRA guide](../workflows/lora.md).
 
 Note: LoRAs are trained on the base checkpoint. Once trained, they can be applied to the post-trained model and will work as expected.
 
