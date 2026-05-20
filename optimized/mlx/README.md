@@ -131,6 +131,36 @@ with the upstream models for memory. 8 GB M1 is fine for everything;
 disable with `--no-free-models` only if you have headroom and plan to
 batch multiple runs in one process.
 
+### Benchmark yourself
+
+Reproduce the table above on your own machine — sweeps both models across
+4 clip lengths (5 s / 30 s / 120 s / 380 s) and prints an ASCII summary.
+Each cell runs in its own subprocess so peak RAM is measured cleanly per
+run; weights are pre-warmed via `ensure_local()` so HF download time
+doesn't pollute the timings. Takes ~3-10 min depending on your chip.
+
+```bash
+uv run --no-project python scripts/benchmark.py
+```
+
+Sample run on **M4 Pro / 48 GB**:
+
+```
+┌───────────┬─────────┬─────────┬───────────┬───────────┬────────────┐
+│ model     │ decoder │ seconds │  wall (s) │ ×realtime │   peak RAM │
+├───────────┼─────────┼─────────┼───────────┼───────────┼────────────┤
+│ sm-music  │ same-s  │       5 │      0.80 │     6.27× │    1.62 GB │
+│ sm-music  │ same-s  │      30 │      1.53 │    19.61× │    1.94 GB │
+│ sm-music  │ same-s  │     120 │      4.12 │    29.13× │    2.38 GB │
+│ sm-music  │ same-s  │     380 │     13.46 │    28.24× │    2.58 GB │
+├───────────┼─────────┼─────────┼───────────┼───────────┼────────────┤
+│ medium    │ same-l  │       5 │      2.20 │     2.27× │    3.82 GB │
+│ medium    │ same-l  │      30 │      5.06 │     5.92× │    3.89 GB │
+│ medium    │ same-l  │     120 │     14.68 │     8.17× │    5.21 GB │
+│ medium    │ same-l  │     380 │     47.78 │     7.95× │    5.05 GB │
+└───────────┴─────────┴─────────┴───────────┴───────────┴────────────┘
+```
+
 ## Flag reference
 
 | Flag                  | Default  | Notes                                                                 |
@@ -166,7 +196,8 @@ sa3_mlx/
 │   ├── weights.py                 ← weights manifest + HF auto-download
 │   ├── examples.py                ← shared examples block (--help + post-install)
 │   ├── install.py                 ← install.sh's Python half (bundle picker)
-│   └── test_all_configs.py        ← npz + CLI config sanity tests
+│   ├── test_all_configs.py        ← npz + CLI config sanity tests
+│   └── benchmark.py               ← wall-time + peak-RAM matrix across model × duration
 └── models/
     ├── defs/
     │   ├── sa3_pipeline.py        ← sampler + conditioner + unpatch
