@@ -63,6 +63,59 @@ for _rel, _hf in SHARED:
     FLAT_MANIFEST[_rel] = _hf
 
 
+def _hf_token_configured() -> bool:
+    """True if any HF token is set — env var or cached login on disk."""
+    import os
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return True
+    try:
+        from huggingface_hub import get_token  # huggingface_hub ≥ 0.19
+        return bool(get_token())
+    except ImportError:
+        try:
+            from huggingface_hub import HfFolder
+            return bool(HfFolder.get_token())
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+_LOGIN_TIP_SHOWN = False
+
+def _show_hf_login_tip_once() -> None:
+    """Print a one-time login suggestion if no HF token is configured.
+
+    Anonymous downloads work but have a ~50 GB/day soft cap on HF's LFS CDN
+    and lower aggregate bandwidth — a free token effectively removes both.
+    Stays silent if a token is already in place.
+    """
+    global _LOGIN_TIP_SHOWN
+    if _LOGIN_TIP_SHOWN:
+        return
+    _LOGIN_TIP_SHOWN = True
+    if _hf_token_configured():
+        return
+    import sys
+    YEL  = "\033[1;33m" if sys.stdout.isatty() else ""
+    BOLD = "\033[1m"    if sys.stdout.isatty() else ""
+    DIM  = "\033[2m"    if sys.stdout.isatty() else ""
+    RST  = "\033[0m"    if sys.stdout.isatty() else ""
+    print()
+    print(f"  {YEL}⚠  not logged in to HuggingFace{RST} — anonymous downloads work but are")
+    print(f"     rate-limited (~50 GB/day cap on the LFS CDN). For faster, higher-limit")
+    print(f"     downloads, log in once with a free read-only token:")
+    print()
+    print(f"       1. create an account at {BOLD}https://huggingface.co/join{RST}")
+    print(f"       2. generate a token at {BOLD}https://huggingface.co/settings/tokens{RST}")
+    print(f"          {DIM}('Read' scope is enough){RST}")
+    print(f"       3. save it on this machine — pick one:")
+    print(f"            {BOLD}hf auth login{RST}              {DIM}# modern (huggingface_hub ≥ 1.0){RST}")
+    print(f"            {BOLD}huggingface-cli login{RST}      {DIM}# classic; still works{RST}")
+    print(f"            {BOLD}export HF_TOKEN=hf_xxx{RST}     {DIM}# one-off / scripts{RST}")
+    print()
+
+
 def ensure_local(local_rel_path: str, verbose: bool = True) -> Path:
     """Resolve a weight file to an absolute local path, downloading if missing.
 
@@ -78,6 +131,10 @@ def ensure_local(local_rel_path: str, verbose: bool = True) -> Path:
         raise FileNotFoundError(
             f"{local_rel_path} is not in the weights manifest — can't auto-download."
         )
+
+    # First-download tip: nudge users toward logging in to HF for better limits.
+    # No-op if a token is already configured.
+    _show_hf_login_tip_once()
 
     hf_filename = FLAT_MANIFEST[local_rel_path]
     if verbose:
