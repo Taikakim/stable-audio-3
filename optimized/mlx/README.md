@@ -6,7 +6,7 @@ transformers, or stable-audio-tools at runtime.
 ## Quick Install
 
 One line on a fresh Apple Silicon Mac — installs everything and plays
-back ~2 minutes of "Epic orchestral buildup":
+back ~2 minutes of "Impending tribal, epic orchestral buildup":
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash
@@ -16,7 +16,7 @@ Already cloned the repo? Run from inside `optimized/mlx/`:
 
 ```bash
 ./install.sh                                              # one-time setup
-./sa3 --prompt "Epic orchestral buildup" --play           # generates + plays
+./sa3 --prompt "Impending tribal, epic orchestral buildup" --play           # generates + plays
 ```
 
 ## Three models, three modes

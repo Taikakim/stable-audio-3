@@ -9,7 +9,7 @@
 #   curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash
 #   curl -LsSf https://raw.githubusercontent.com/Stability-AI/stable-audio-3/main/optimized/mlx/bootstrap.sh | bash -s -- --prompt "Death Metal" --dit medium --decoder same-l
 #
-# Default demo prompt is "Epic orchestral buildup".
+# Default demo prompt is "Impending tribal, epic orchestral buildup".
 #
 # What it does:
 #   1. Verifies you're on Apple Silicon.
@@ -19,7 +19,7 @@
 #        - If not → tarball pull via curl + tar, extracting only optimized/mlx/
 #          into ./sa3_mlx/ (no git, no Xcode CLT needed).
 #   3. Runs ./install.sh -y inside it (uv + Python 3.11 + venv + weight downloads).
-#   4. Runs ./sa3 with whatever args you passed (default: "Epic orchestral buildup" demo + --play).
+#   4. Runs ./sa3 with whatever args you passed (default: "Impending tribal, epic orchestral buildup" demo + --play).
 #
 set -euo pipefail
 
@@ -34,7 +34,7 @@ REPO_NAME="stable-audio-3"
 BRANCH="main"
 SUBDIR_IN_REPO="optimized/mlx"
 LOCAL_DIR="sa3_mlx"
-DEFAULT_ARGS=(--prompt "Epic orchestral buildup" --dit sm-music --decoder same-s --seconds 120 --play)
+DEFAULT_ARGS=(--prompt "Impending tribal, epic orchestral buildup" --dit sm-music --decoder same-s --seconds 120 --play)
 
 TAR_URL="https://github.com/$REPO_OWNER/$REPO_NAME/archive/refs/heads/$BRANCH.tar.gz"
 TAR_INNER="$REPO_NAME-$BRANCH/$SUBDIR_IN_REPO"

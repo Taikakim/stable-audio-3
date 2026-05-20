@@ -33,7 +33,7 @@ CONFIGS = [
     ("medium",   "same-l"),
 ]
 SECONDS = [5, 30, 120, 380]
-PROMPT = "Epic orchestral buildup"
+PROMPT = "Impending tribal, epic orchestral buildup"
 SEED = 42
 
 # Weights we need on disk before benchmarks start. T5Gemma is shared.
