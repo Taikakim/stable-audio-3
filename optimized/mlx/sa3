@@ -10,6 +10,11 @@
 #
 set -euo pipefail
 
+# Pre-emptively add the uv installer's default bin dir to PATH. The user's
+# shell profile only updates new shells; this lets us find uv in the current
+# process tree (matters right after a fresh `curl|sh` install).
+export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$HOME/.local/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ -t 1 ]]; then

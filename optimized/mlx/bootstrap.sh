@@ -21,6 +21,12 @@
 #
 set -euo pipefail
 
+# uv's curl installer drops the binary at $XDG_BIN_HOME (~/.local/bin by default)
+# and updates the user's shell profile — but that profile only takes effect in
+# *new* shells. We pre-emptively put both locations on PATH so the just-installed
+# uv (and anything else from this run) is findable in the current process tree.
+export PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$HOME/.local/bin:$PATH"
+
 REPO_OWNER="Stability-AI"
 REPO_NAME="stable-audio-3"
 BRANCH="main"
