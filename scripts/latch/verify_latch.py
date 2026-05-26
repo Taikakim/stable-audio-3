@@ -47,7 +47,8 @@ def measured_bass_rms(audio_np, sr, n_steps=256):
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = StableAudioModel.from_pretrained(args.model, device=device)
+    # fp32: TFG backprops through the model/head; fp16 grad dtypes clash and add noise.
+    model = StableAudioModel.from_pretrained(args.model, device=device, model_half=False)
     head, ckpt = load_head(args.ckpt, device)
     sr = model.model.sample_rate
 
@@ -74,8 +75,9 @@ def main(args):
                                 dist_shift=model.model.sampling_dist_shift,
                                 fallback_seq_len=latent_len, include_endpoint=True,
                                 device=device)
+        # (1, T) -> (1, 1, T) to match head output (B, out_channels, T)
         target = torch.from_numpy(
-            build_target("constant", level, latent_len, 1)).to(device).type(model_dtype)
+            build_target("constant", level, latent_len, 1)).unsqueeze(0).to(device).type(model_dtype)
         latents = sample_flow_euler_latch_guided(
             model.model.model, noise, sigmas, head=head, target=target,
             rho=args.gain, mu=args.gain, gamma=0.3, n_iter=6,
