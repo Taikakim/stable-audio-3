@@ -15,7 +15,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import torch
 import torchaudio
 
 from stable_audio_3 import AutoencoderModel

@@ -5,7 +5,6 @@ import argparse
 import os
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from scripts.latch.latch_dataset import LatCHDataset, collate_varlen
@@ -53,7 +52,9 @@ def train(args):
             z_t = forward_noise(latents, noise, t)
             preds = model(z_t, t)
             loss = masked_mse(preds, targets, mask)
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
             total += loss.item()
         print(f"epoch {epoch+1}/{args.epochs}  loss={total/len(loader):.4f}")
         torch.save({
