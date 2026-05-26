@@ -31,11 +31,18 @@ def load_head(ckpt_path, device):
     return head, ckpt
 
 
-def measured_bass_rms(audio_np, sr):
+def measured_bass_rms(audio_np, sr, n_steps=256):
+    """Mean bass-band RMS (dB) of a clip via mir's real extractor.
+
+    Requires scipy + the mir source on path. `_compute_multiband_rms_ts` expects a
+    1-D mono signal, takes n_steps, and returns a dict of 4 bands; we downmix to mono
+    and read the bass band.
+    """
     sys.path.insert(0, "/home/kim/Projects/mir/src")
     from spectral.timeseries_features import _compute_multiband_rms_ts
-    ts = _compute_multiband_rms_ts(audio_np, sr)  # dB series
-    return float(np.mean(ts))
+    mono = audio_np.mean(axis=0) if audio_np.ndim == 2 else audio_np
+    bands = _compute_multiband_rms_ts(mono, sr, n_steps)  # {band: [dB per step]}
+    return float(np.mean(bands["rms_energy_bass_ts"]))
 
 
 def main(args):
