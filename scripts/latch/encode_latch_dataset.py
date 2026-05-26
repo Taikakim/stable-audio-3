@@ -33,6 +33,8 @@ def main(args):
         if p.suffix.lower() in AUDIO_EXTS
         and not any(p.stem.endswith(s) for s in STEM_SUFFIXES)
     ]
+    if args.limit is not None:
+        audio_paths = audio_paths[: args.limit]
     print(f"Found {len(audio_paths)} audio files to encode with {args.model}.")
 
     for i, path in enumerate(audio_paths):
@@ -65,4 +67,6 @@ if __name__ == "__main__":
     p.add_argument("--audio-dir", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Encode only the first N full-mix crops (after sort/filter).")
     main(p.parse_args())
