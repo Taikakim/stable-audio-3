@@ -4,7 +4,7 @@
 Generates with guidance at several constant target levels, decodes, runs mir's real
 rms_energy_bass extractor, and reports correlation(requested, measured).
 
-INTEGRATION: requires a GPU, the small-base model, a trained head checkpoint, and the
+INTEGRATION: requires a GPU, the small-music-base model, a trained head checkpoint, and the
 mir extractor at /home/kim/Projects/mir/src. The conditioning preamble below mirrors
 StableAudioModel.generate(); reconcile against the live model.py if SA3's API changes.
 """
@@ -47,7 +47,7 @@ def measured_bass_rms(audio_np, sr, n_steps=256):
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = StableAudioModel.from_pretrained("small-base", device=device)
+    model = StableAudioModel.from_pretrained(args.model, device=device)
     head, ckpt = load_head(args.ckpt, device)
     sr = model.model.sample_rate
 
@@ -99,6 +99,8 @@ def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
+    p.add_argument("--model", default="small-music-base",
+                   help="SA3 base model to guide (flow-matching/Euler). same-s latent space.")
     p.add_argument("--levels", type=float, nargs="+", default=[-50, -30, -10])
     p.add_argument("--prompt", default="124BPM acid techno, dry snappy kick and bassline")
     p.add_argument("--duration", type=float, default=10.0)

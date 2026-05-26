@@ -1,9 +1,9 @@
-# LatCH for Stable Audio 3 — Phase 1 (small-base)
+# LatCH for Stable Audio 3 — Phase 1 (small-music-base)
 
 Latent-Control Heads: a lightweight transformer head predicts an MIR time-series
 (e.g. bass RMS) from noisy SAME latents and is used as Training-Free Guidance in a
 gradient-enabled Euler sampler to steer generation. Phase 1 targets the
-**`small-base`** flow-matching model (50-step Euler + CFG). Ping-pong / post-trained
+**`small-music-base`** flow-matching model (50-step Euler + CFG). Ping-pong / post-trained
 models and the Gradio UI are out of scope.
 
 See the plan at `docs/superpowers/plans/2026-05-26-latch-sa3-phase1.md`.
@@ -14,7 +14,7 @@ The unit tests run anywhere, but the three commands below need:
 
 - A ROCm GPU.
 - Mounted drives for the audio corpus and latent output.
-- HuggingFace access to download `same-s` (encode) and `small-base` (verify).
+- HuggingFace access to download `same-s` (encode) and `small-music-base` (verify).
 - `scipy` and `librosa` installed in this venv — required by the mir extractor used
   in `verify` (`uv pip install scipy librosa`). Note: a later `uv sync` may remove
   them since they aren't in `pyproject.toml`.
@@ -67,5 +67,5 @@ points transfer more predictably than the old step-index window.
   preamble via internal `model.model.*` APIs. If SA3's `model.py` has changed,
   reconcile the preamble against the live `generate()` before trusting the run.
 - The head is latent-space specific: a head trained on `same-s` latents is only
-  valid for `small`/`small-base`. `medium`/`large` use `same-l` and need their own
+  valid for `small`/`small-music-base`. `medium`/`large` use `same-l` and need their own
   head.
