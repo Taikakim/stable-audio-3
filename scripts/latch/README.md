@@ -15,8 +15,9 @@ The unit tests run anywhere, but the three commands below need:
 - A ROCm GPU.
 - Mounted drives for the audio corpus and latent output.
 - HuggingFace access to download `same-s` (encode) and `small-base` (verify).
-- `scipy` installed in this venv — required by the mir extractor used in `verify`
-  (`uv pip install scipy`); it is **not** currently installed.
+- `scipy` and `librosa` installed in this venv — required by the mir extractor used
+  in `verify` (`uv pip install scipy librosa`). Note: a later `uv sync` may remove
+  them since they aren't in `pyproject.toml`.
 - The MIR project at `/home/kim/Projects/mir` with `timeseries.db` (training targets
   + verification extractor). The DB is keyed by clip name, so each encoded `.npy`
   stem must equal its mir crop key.
