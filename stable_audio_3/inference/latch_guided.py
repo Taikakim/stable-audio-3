@@ -24,6 +24,8 @@ def sample_flow_euler_latch_guided(
     mu:  mean-guidance strength on the clean estimate x_hat0 (head queried at t=0).
     gamma: input-noise augmentation std for the clean head evaluation.
     window: (sigma_lo, sigma_hi) -- guidance active when sigma_lo <= t_curr <= sigma_hi.
+    Note: when gamma > 0 the mean-guidance evaluation is stochastic, so output is
+    not bit-reproducible across calls even with a fixed seed; set gamma=0 for determinism.
     """
     per_element = sigmas.dim() == 2
     sigmas = sigmas.to(x.device)
@@ -37,7 +39,9 @@ def sample_flow_euler_latch_guided(
     def head_loss(pred, tgt):
         if loss_type == "bce_logits":
             return torch.nn.functional.binary_cross_entropy_with_logits(pred, tgt)
-        return torch.nn.functional.mse_loss(pred, tgt)
+        if loss_type == "mse":
+            return torch.nn.functional.mse_loss(pred, tgt)
+        raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
     for i in tqdm(range(num_steps), disable=disable_tqdm):
         if per_element:
@@ -79,6 +83,7 @@ def sample_flow_euler_latch_guided(
 
         # --- Euler update reconstructed from the (possibly guided) clean estimate ---
         # v_eff = (x - x_hat0) / t_curr ; x_next = x + dt * v_eff
+        # clamp guards variation runs where t_curr can approach 0 in the final steps
         t_b = t_curr.view(-1, 1, 1).clamp(min=1e-6)
         v_eff = (x - x_hat0) / t_b
         x = (x + dt * v_eff).detach()

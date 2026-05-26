@@ -51,3 +51,38 @@ def test_positive_gain_moves_toward_target():
         rho=0.0, mu=5.0, window=(0.0, 1.0))
     # Mean guidance toward a negative target should lower the predicted mean.
     assert head(out_guided, torch.zeros(1)).mean() < head(out_unguided, torch.zeros(1)).mean()
+
+
+def test_variance_guidance_path_moves_toward_target():
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 8)
+    sigmas = _schedule(20)
+    head = _ConstHead()
+    target = torch.full((1, 1, 8), -5.0)
+    out_unguided = sample_flow_euler_latch_guided(
+        _toy_model, x.clone(), sigmas, head=head, target=target,
+        rho=0.0, mu=0.0, window=(0.0, 1.0))
+    out_var = sample_flow_euler_latch_guided(
+        _toy_model, x.clone(), sigmas, head=head, target=target,
+        rho=5.0, mu=0.0, window=(0.0, 1.0))
+    # Variance guidance (rho path) toward a negative target should lower the predicted mean.
+    assert head(out_var, torch.zeros(1)).mean() < head(out_unguided, torch.zeros(1)).mean()
+
+
+def test_per_element_schedule_zero_gain_matches_plain_euler():
+    torch.manual_seed(0)
+    x = torch.randn(2, 4, 8)
+    sigmas_1d = _schedule(6)
+    sigmas_2d = sigmas_1d.unsqueeze(0).expand(2, -1).contiguous()  # (2, steps+1)
+    head = _ConstHead()
+    target = torch.zeros(2, 1, 8)
+    guided = sample_flow_euler_latch_guided(
+        _toy_model, x.clone(), sigmas_2d, head=head, target=target,
+        rho=0.0, mu=0.0, window=(0.0, 1.0))
+    # Plain euler with per-element dt.
+    y = x.clone()
+    for i in range(6):
+        v = _toy_model(y, sigmas_2d[:, i])
+        dt = (sigmas_2d[:, i + 1] - sigmas_2d[:, i]).view(-1, 1, 1)
+        y = y + dt * v
+    assert torch.allclose(guided, y, atol=1e-5)
