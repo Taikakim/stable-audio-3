@@ -10,15 +10,19 @@ What's new vs Phase 1:
   --optimizer  {adamw, fusion}        FusionOpt = Muon(NS5)+MONA+KL-Shampoo+SF+
   --loss       {mse, smooth_l1, temporal}   temporal = TemporalShapeLoss
                                             (point + λ_d·deriv + λ_m·multi-scale)
-  --hot-dtype  {fp32, bf16, fp16_safe}      NS5 quintic dtype on RDNA4
-  --components mona,shampoo,ns5,normuon,sf  per-optimiser ablation
+  --hot-dtype  {fp32, bf16, fp16_safe}      NS5 quintic dtype on RDNA4 (bf16 default)
+  --components ns5,normuon,sf               default is SF-NorMuon (production target
+                                            per docs/FUSION_SHAREABLE.md); set to
+                                            mona,shampoo,ns5,normuon,sf for full Fusion.
   --fp32-audit-period N                drift logging vs fp32 NS5 every N steps
   --seed       N                       bit-reproducible (LATCH_RESULTS §16)
   --save-best-only                     save the Schedule-Free averaged iterate
+  --compile                            torch.compile the head (CRITICAL for FusionOpt
+                                       per the doc — spectral-path overhead otherwise
+                                       dominates the per-step cost)
 
 ROCm env (mode 6, TunableOp, Triton/MIOpen cache paths) comes from rocm_env.yaml
-via _apply_rocm_training_profile(); FusionOpt's persistent NS5 cache is part of
-that env, no extra config.
+via _apply_rocm_training_profile().
 """
 
 import argparse
@@ -173,7 +177,15 @@ def train(args):
 
     model = LatCH(in_channels=256, out_channels=out_channels,
                   dim=256, depth=6, num_heads=8).to(device)
-    opt, is_fusion = make_optimizer(args, model)
+    if args.compile:
+        # Build the optimiser on the un-compiled module so FusionOpt's
+        # build_fusion_param_groups can introspect param names cleanly; the
+        # underlying tensors are shared with the compiled callable.
+        opt, is_fusion = make_optimizer(args, model)
+        model = torch.compile(model)
+        print("torch.compile: on (1st-iter Triton autotune will spike)")
+    else:
+        opt, is_fusion = make_optimizer(args, model)
     criterion, loss_type = make_criterion(args)
 
     print(f"Loss: {loss_type}; Optimizer: {args.optimizer}")
@@ -253,15 +265,24 @@ if __name__ == "__main__":
     p.add_argument("--save-dir", default="latch_weights_sa3")
     p.add_argument("--save-best-only", action="store_true",
                    help="Save only when train-loss improves (Schedule-Free averaged iterate)")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the LatCH head. Per docs/FUSION_SHAREABLE.md this "
+                        "is CRITICAL for FusionOpt — without it the spectral-path overhead "
+                        "dominates the per-step cost; with it FusionOpt's wall-clock per step "
+                        "matches AdamW's on the same model size. Pays a one-time Triton "
+                        "autotune cost on the first epoch; the cache persists via rocm_env.")
     # Optimizer
     p.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw")
     p.add_argument("--hot-dtype", choices=["fp32", "bf16", "fp16_safe"], default="bf16",
                    help="FusionOpt NS5 dtype. bf16 = ~1.65x faster than fp32; "
                         "fp16_safe = ~1.3-1.5x faster than bf16 with fp32 polynomial accumulation. "
                         "fp16 plain will diverge — not exposed.")
-    p.add_argument("--components", default="",
+    p.add_argument("--components", default="ns5,normuon,sf",
                    help="FusionOpt comma-separated subset of {mona,shampoo,ns5,normuon,sf}. "
-                        "Empty = all (default Fusion).")
+                        "Default ns5,normuon,sf = SF-NorMuon, the production target per "
+                        "docs/FUSION_SHAREABLE.md: captures ~95%% of the quality lift over "
+                        "AdamW; adding mona+shampoo buys ~0.8%% for 50%% more wall-clock. "
+                        "Empty string = all components (full Fusion).")
     p.add_argument("--fp32-audit-period", type=int, default=0,
                    help="Every N steps recompute NS5 in fp32 alongside hot_dtype and log "
                         "relative-error stats. 0 = off. Useful for verifying fp16_safe/bf16 "
