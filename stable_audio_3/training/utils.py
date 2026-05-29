@@ -86,6 +86,13 @@ def create_optimizer_from_config(optimizer_config, parameters):
     elif optimizer_type == "MuonAdamW":
         from stable_audio_tools.training.optims import MuonAdamW
         optimizer = MuonAdamW(parameters, **optimizer_config["config"])
+    elif optimizer_type == "FusionOpt":
+        # Muon (NS5) + MONA + KL-Shampoo + ScheduleFree+ bifurcated optimiser.
+        # Expects `parameters` to already be the spectral/scalar groups produced
+        # by build_fusion_param_groups() — configure_optimizers handles that.
+        # See stable-audio-tools docs/superpowers/specs/2026-05-29-fusion-optimiser-design.md.
+        from stable_audio_tools.training.fusion_opt import FusionOpt
+        optimizer = FusionOpt(parameters, **optimizer_config["config"])
     else:
         optimizer_fn = getattr(torch.optim, optimizer_type)
         optimizer = optimizer_fn(parameters, **optimizer_config["config"])

@@ -222,12 +222,29 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
     def configure_optimizers(self):
         diffusion_opt_config = self.optimizer_configs['diffusion']
+        opt_type = diffusion_opt_config['optimizer'].get('type')
 
         if self.lora_config is not None:
             opt_params = [*get_lora_params(self.diffusion.model), *get_lora_params(self.diffusion.conditioner)]
-        elif diffusion_opt_config['optimizer'].get('type') == 'MuonAdamW':
+        elif opt_type == 'MuonAdamW':
             # Pass (name, param) tuples so MuonAdamW can match fused layer patterns
             opt_params = [(n, p) for n, p in self.diffusion.named_parameters() if p.requires_grad]
+        elif opt_type == 'FusionOpt':
+            # FusionOpt routes 2D matrices (min(shape) >= 128) to the spectral
+            # Muon+MONA+KL-Shampoo path and everything else to a ScheduleFree-AdamW
+            # scalar path. NOTE: the min(shape)>=128 threshold was designed for the
+            # 5M-param LatCH heads (design doc §2); SA3's diffusion backbone is
+            # much larger, but the threshold still partitions cleanly. Use the
+            # optimizer config's `force_scalar` (passed through `param_groups`) or
+            # `spectral_lr`/`scalar_lr` to tune per-group LR if desired.
+            from stable_audio_tools.training.fusion_groups import (
+                build_fusion_param_groups, summarise_groups,
+            )
+            pg_cfg = diffusion_opt_config['optimizer'].get('param_groups', {}) or {}
+            opt_params = build_fusion_param_groups(self.diffusion.model, **pg_cfg)
+            if get_rank() == 0:
+                print("FusionOpt param groups:")
+                print(summarise_groups(opt_params))
         else:
             # Only include parameters that require gradients (excludes frozen pretransform, conditioner, etc.)
             opt_params = [p for p in self.diffusion.parameters() if p.requires_grad]
@@ -502,6 +519,13 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self._staggered_logger.log(log_dict, self)
 
+        # FusionOpt: pipe the current loss into the optimiser BEFORE Lightning
+        # calls .step(); Polyak step size γ_t = γ_base·clamp(loss_ema / gnorm_ema)
+        # needs the on-device loss tensor. No-op for other optimisers.
+        opt = self._fusion_opt()
+        if opt is not None:
+            opt.set_loss(loss)
+
         #p.tick("log_dict")
         #print(f"Profiler: {p}")
         return loss
@@ -636,6 +660,39 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 **get_lora_state_dict(self.diffusion.conditioner)
             }
             checkpoint['lora_config'] = self.lora_config
+
+    # ------------------------------------------------------------------
+    # FusionOpt Schedule-Free lifecycle hooks
+    # ------------------------------------------------------------------
+    # Schedule-Free keeps a fast iterate z_t and an averaged iterate x_t. During
+    # training the live params hold y = (1-beta)*z + beta*x (the eval point used
+    # to compute gradients); for validation and checkpoint serialisation we want
+    # the averaged x_t in the live params (that's the deployable model). The
+    # pattern: switch to eval at val start, lazily switch back at the next train
+    # batch — so any checkpoint Lightning saves at the end of the val epoch
+    # captures the averaged x without us having to munge the state_dict keys.
+    def _fusion_opt(self):
+        from stable_audio_tools.training.fusion_opt import FusionOpt
+        opts = self.optimizers()
+        if opts is None:
+            return None
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts]
+        for o in opts:
+            inner = getattr(o, "optimizer", o)
+            if isinstance(inner, FusionOpt):
+                return inner
+        return None
+
+    def on_validation_epoch_start(self):
+        opt = self._fusion_opt()
+        if opt is not None and opt.uses_sf_averaging:
+            opt.eval()
+
+    def on_train_batch_start(self, batch, batch_idx):
+        opt = self._fusion_opt()
+        if opt is not None and opt.uses_sf_averaging:
+            opt.train()  # idempotent if already in train mode
 
 class DiffusionCondInpaintDemoCallback(pl.Callback):
     def __init__(
