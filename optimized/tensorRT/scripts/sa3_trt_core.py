@@ -118,9 +118,10 @@ ENCODER_FILES = {
     "same-l": ["same-l/enc_dynamic_triton_swa.trt"],
 }
 SHARED_FILES = [
-    # T5Gemma engine + its tokenizer travel together under models/t5gemma/.
+    # T5Gemma engine — downloaded from HF per-arch. (The tokenizer.json is
+    # arch-agnostic and ships bundled with the repo at scripts/tokenizer.json,
+    # so it's NOT in this list.)
     "t5gemma/t5gemma_fp16mixed.trt",
-    "t5gemma/tokenizer.json",
 ]
 
 DIT_CHOICES = {

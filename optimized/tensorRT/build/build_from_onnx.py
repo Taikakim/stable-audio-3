@@ -61,7 +61,8 @@ _DIT_PROFILE = {
 TARGETS = {
     "t5gemma": {
         "onnx_hf":     ["t5gemma/encoder.onnx"],
-        "tokenizer":    "t5gemma/tokenizer.json",  # also fetched from HF
+        # tokenizer.json ships bundled with the repo at scripts/tokenizer.json
+        # (arch-agnostic), so we don't fetch it here anymore.
         "trt_local":    "t5gemma/t5gemma_fp16mixed.trt",
         "flags":        set(),  # STRONGLY_TYPED carries the FP16/FP32 dtype hints
         "network":      "STRONGLY_TYPED",
@@ -156,22 +157,6 @@ def _ensure_onnx(rel_paths):
     return local_paths[0]
 
 
-def _fetch_tokenizer(rel, target_dir):
-    """T5Gemma engine needs its tokenizer.json next to it in models/<arch>/."""
-    import shutil
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        sys.exit("error: huggingface_hub not installed.")
-    hf_filename = f"tensorRT/{detect_arch()}/{rel}"
-    print(f"  hf_hub_download → {hf_filename}  (tokenizer)", flush=True)
-    cached = hf_hub_download(repo_id=HF_REPO, filename=hf_filename)
-    local = Path(target_dir) / Path(rel).name
-    local.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(cached, local)
-    return str(local)
-
-
 def build_one(name: str) -> str:
     recipe = TARGETS[name]
     print(f"\n━━━ build_from_onnx: {name} ━━━")
@@ -229,10 +214,6 @@ def build_one(name: str) -> str:
     with open(target, "wb") as f:
         f.write(serialized)
     print(f"  wrote {target}", flush=True)
-
-    # 5. Tokenizer co-location for t5gemma
-    if "tokenizer" in recipe:
-        _fetch_tokenizer(recipe["tokenizer"], target.parent)
 
     return str(target)
 

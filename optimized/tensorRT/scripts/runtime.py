@@ -50,10 +50,15 @@ class FastTokenizer:
 def load_tokenizer():
     """Load tokenizer using fast tokenizers lib (no HF transformers import).
 
-    tokenizer.json lives alongside the T5Gemma engine at models/<arch>/t5gemma/
-    so they download from HF together.
+    tokenizer.json is bundled in the repo next to this module (it's arch-
+    agnostic — same T5Gemma vocab whether you're on sm_90, sm_100, sm_120
+    etc.). Falls back to the legacy per-arch location if the bundled file
+    is somehow missing (e.g. older checkouts).
     """
-    return FastTokenizer(os.path.join(ARCH_DIR, "t5gemma", "tokenizer.json"))
+    bundled = os.path.join(os.path.dirname(__file__), "tokenizer.json")
+    legacy  = os.path.join(ARCH_DIR, "t5gemma", "tokenizer.json")
+    path = bundled if os.path.exists(bundled) else legacy
+    return FastTokenizer(path)
 
 
 class DistributionShift:

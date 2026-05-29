@@ -322,11 +322,9 @@ fi
 # ─── 3b. Download via huggingface_hub ──────────────────────────────────────
 
 SHARED=(
-    # T5Gemma engine + its tokenizer travel together under ${HF_SUBDIR}/t5gemma/.
-    # DiT engines bundle padding_embedding + seconds_total Linear as graph
-    # Constants, so no other shared files are needed.
+    # T5Gemma engine — arch-specific. (tokenizer.json is arch-agnostic and
+    # ships bundled with the repo at scripts/tokenizer.json — no download.)
     "${HF_SUBDIR}/t5gemma/t5gemma_fp16mixed.trt"
-    "${HF_SUBDIR}/t5gemma/tokenizer.json"
 )
 # Only TRT engines are downloaded from HF.
 MEDIUM=(
