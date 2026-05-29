@@ -59,6 +59,26 @@ GPU_INFO=$(nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader,nounits
 [[ -n "$GPU_INFO" ]] || fail "nvidia-smi ran but reported no GPUs."
 ok "GPU: $GPU_INFO"
 
+# ── 2b. shortcut: already inside a checkout? skip clone, run in place ──────
+# If the user ran bootstrap from inside optimized/tensorRT/ of an existing
+# clone (e.g. for a re-install or to pick up fresh code after a `git pull`),
+# don't try to clone the repo into a subdir — just use the current dir.
+if [[ -f ./install.sh && -x ./sa3 && -d ./build && -d ./scripts ]]; then
+    step "Already inside an optimized/tensorRT/ checkout — using ./ in place"
+    cd "$(pwd)"   # no-op; just makes the path absolute for later messages
+    [[ -x ./install.sh ]] || fail "install.sh not executable in $(pwd)."
+    ok "running install.sh in $(pwd)"
+    ./install.sh -y
+
+    if [[ $# -gt 0 ]]; then
+        step "Running ./sa3 $*"
+        exec ./sa3 "$@"
+    else
+        step "Running demo: ./sa3 ${DEFAULT_ARGS[*]}"
+        exec ./sa3 "${DEFAULT_ARGS[@]}"
+    fi
+fi
+
 # ── 3. ensure git (with tarball fallback) ──────────────────────────────────
 # Try every common Linux package manager; if all fail (no sudo, locked-down
 # container, exotic distro, network issue, etc.) fall back to a curl+tar
