@@ -176,7 +176,10 @@ def train(args):
                         persistent_workers=args.num_workers > 0)
 
     model = LatCH(in_channels=256, out_channels=out_channels,
-                  dim=256, depth=6, num_heads=8).to(device)
+                  dim=256, depth=6, num_heads=8,
+                  t_injection=args.t_injection).to(device)
+    print(f"LatCH head: t_injection={args.t_injection}, "
+          f"params={sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     if args.compile:
         # Build the optimiser on the un-compiled module so FusionOpt's
         # build_fusion_param_groups can introspect param names cleanly; the
@@ -241,6 +244,7 @@ def train(args):
                 "noise_schedule": "rectified_flow",
                 "loss_type": loss_type,
                 "optimizer": args.optimizer,
+                "t_injection": args.t_injection,
                 "in_channels": 256,
                 "out_channels": out_channels,
                 "seed": args.seed,
@@ -271,6 +275,12 @@ if __name__ == "__main__":
                         "dominates the per-step cost; with it FusionOpt's wall-clock per step "
                         "matches AdamW's on the same model size. Pays a one-time Triton "
                         "autotune cost on the first epoch; the cache persists via rocm_env.")
+    p.add_argument("--t-injection", choices=["concat", "film", "adaln_zero"], default="adaln_zero",
+                   help="How t is injected into the LatCH head. adaln_zero = DiT-style "
+                        "per-block (γ,β,α) modulators, T=256, the LATCH_RESULTS §17 winner "
+                        "(val 0.1682) and the precondition for TimeConditioningCache "
+                        "inference speedup. film = single (scale,shift) after latent_proj, "
+                        "T=256, FA-aligned. concat = legacy prepend-token, T=257.")
     # Optimizer
     p.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw")
     p.add_argument("--hot-dtype", choices=["fp32", "bf16", "fp16_safe"], default="bf16",
