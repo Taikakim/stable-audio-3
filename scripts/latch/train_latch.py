@@ -176,9 +176,10 @@ def train(args):
                         persistent_workers=args.num_workers > 0)
 
     model = LatCH(in_channels=256, out_channels=out_channels,
-                  dim=256, depth=6, num_heads=8,
+                  dim=args.dim, depth=args.depth, num_heads=args.num_heads,
                   t_injection=args.t_injection).to(device)
-    print(f"LatCH head: t_injection={args.t_injection}, "
+    print(f"LatCH head: dim={args.dim} depth={args.depth} heads={args.num_heads} "
+          f"t_injection={args.t_injection}, "
           f"params={sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     if args.compile:
         # Build the optimiser on the un-compiled module so FusionOpt's
@@ -281,6 +282,16 @@ if __name__ == "__main__":
                         "(val 0.1682) and the precondition for TimeConditioningCache "
                         "inference speedup. film = single (scale,shift) after latent_proj, "
                         "T=256, FA-aligned. concat = legacy prepend-token, T=257.")
+    # Architecture: defaults match the production winner per LATCH_RESULTS §21/§22.
+    p.add_argument("--dim", type=int, default=256,
+                   help="LatCH transformer hidden size. Production target: 256. §22 "
+                        "showed wider (d512) wastes throughput for no quality gain.")
+    p.add_argument("--depth", type=int, default=4,
+                   help="LatCH transformer depth. Production target: 4 (was 6 in Phase 1). "
+                        "§22 confirmed d256/dp4 is the smallest sensible architecture: "
+                        "matches d256/dp6 quality at ~67%% of the inference cost; depth past "
+                        "6 stops paying off. Use 8 for fast-prototyping niche only.")
+    p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
     p.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw")
     p.add_argument("--hot-dtype", choices=["fp32", "bf16", "fp16_safe"], default="bf16",
