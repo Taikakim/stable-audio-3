@@ -19,25 +19,64 @@ def _open_default_db():
 
 
 class LatCHDataset(Dataset):
+    """Latent + per-frame MIR target pairs.
+
+    target_source:
+      "db"  — targets from the legacy per-crop TimeseriesDB, keyed by latent stem
+              (small-music-base / phase-1 layout).
+      "npz" — targets from a <stem>.TIMESERIES.npz companion next to each .npy
+              (the beat-aligned latents_sa3 layout: SAME-L latents 256x4096 + a
+              21-field timeseries companion already sliced/resampled to T=4096).
+    """
+
     def __init__(self, latent_dir: str, target_feature: str = "rms_energy_bass",
-                 db=None, db_path: Optional[str] = None):
+                 db=None, db_path: Optional[str] = None, target_source: str = "db"):
         self.latent_dir = Path(latent_dir)
         self.bare_feature = target_feature.removesuffix("_ts")
         self.ts_feature = self.bare_feature + "_ts"
-        self.items = sorted(p for p in self.latent_dir.glob("*.npy"))
+        self.target_source = target_source
+        self.items = sorted(p for p in self.latent_dir.glob("*.npy")
+                            if p.stem != "silence")
         if not self.items:
             raise RuntimeError(f"No .npy latents in {latent_dir}")
-        if db is not None:
-            self._db = db
-        elif db_path is not None:
-            sys.path.insert(0, "/home/kim/Projects/mir/src")
-            from core.timeseries_db import TimeseriesDB
-            self._db = TimeseriesDB.open(db_path)
+        self._db = None
+        if target_source == "db":
+            if db is not None:
+                self._db = db
+            elif db_path is not None:
+                sys.path.insert(0, "/home/kim/Projects/mir/src")
+                from core.timeseries_db import TimeseriesDB
+                self._db = TimeseriesDB.open(db_path)
+            else:
+                self._db = _open_default_db()
+        elif target_source == "npz":
+            # Keep only items whose companion npz has the requested field.
+            kept = []
+            for p in self.items:
+                npz = p.with_suffix(".TIMESERIES.npz")
+                if npz.exists():
+                    kept.append(p)
+            if not kept:
+                raise RuntimeError(
+                    f"target_source='npz' but no *.TIMESERIES.npz companions in {latent_dir}")
+            self.items = kept
         else:
-            self._db = _open_default_db()
+            raise ValueError(f"unknown target_source={target_source!r}")
 
     def __len__(self):
         return len(self.items)
+
+    def _load_target(self, npy_path: Path, t_frames: int) -> np.ndarray:
+        if self.target_source == "npz":
+            with np.load(str(npy_path.with_suffix(".TIMESERIES.npz"))) as z:
+                if self.ts_feature not in z.files:
+                    raise ValueError(f"{self.ts_feature} not in {npy_path.stem}.TIMESERIES.npz")
+                arr = z[self.ts_feature]
+            return resample_target(arr, t_frames)
+        arrays = self._db.get(npy_path.stem)
+        if arrays is None or arrays.get(self.ts_feature) is None:
+            raise ValueError(f"{self.ts_feature} missing for {npy_path.stem}")
+        return resample_target(arrays[self.ts_feature], t_frames)
 
     def __getitem__(self, idx):
         start = idx
@@ -46,10 +85,7 @@ class LatCHDataset(Dataset):
             try:
                 latent = np.load(str(npy_path)).astype(np.float32)  # (256, T)
                 t_frames = latent.shape[1]
-                arrays = self._db.get(npy_path.stem)
-                if arrays is None or arrays.get(self.ts_feature) is None:
-                    raise ValueError(f"{self.ts_feature} missing for {npy_path.stem}")
-                target = resample_target(arrays[self.ts_feature], t_frames)  # (C, T)
+                target = self._load_target(npy_path, t_frames)  # (C, T)
                 return torch.from_numpy(latent), torch.from_numpy(target)
             except Exception:
                 idx = (idx + 1) % len(self.items)

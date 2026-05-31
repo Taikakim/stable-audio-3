@@ -51,6 +51,7 @@ _apply_rocm_training_profile()
 
 import random  # noqa: E402
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
@@ -168,7 +169,9 @@ def train(args):
         print(f"Seed: {args.seed}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = LatCHDataset(args.latent_dir, target_feature=args.feature, db_path=args.db_path)
+    ds = LatCHDataset(args.latent_dir, target_feature=args.feature,
+                      db_path=args.db_path, target_source=args.target_source)
+    print(f"Dataset: {len(ds)} crops, target_source={args.target_source}, feature={args.feature}")
     sample_latent, sample_target = ds[0]
     out_channels = sample_target.shape[0]
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -192,8 +195,20 @@ def train(args):
         opt, is_fusion = make_optimizer(args, model)
     criterion, loss_type = make_criterion(args)
 
-    print(f"Loss: {loss_type}; Optimizer: {args.optimizer}")
+    print(f"Loss: {loss_type}; Optimizer: {args.optimizer}; Precision: {args.precision}")
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # Target standardization stats (zero-mean/unit-std) from a sample of the dataset.
+    std_mean, std_std = 0.0, 1.0
+    if args.standardize:
+        rng = np.random.RandomState(0)
+        samp = [ds[int(i)][1].numpy().reshape(-1)
+                for i in rng.randint(0, len(ds), size=min(256, len(ds)))]
+        allv = np.concatenate(samp)
+        std_mean = float(allv.mean())
+        std_std = float(allv.std()) or 1.0
+        print(f"Standardize: mean={std_mean:.4f} std={std_std:.4f}")
+    use_bf16 = args.precision == "bf16"
 
     best_loss = float("inf")
     for epoch in range(args.epochs):
@@ -206,11 +221,14 @@ def train(args):
             latents = batch["latents"].to(device)
             targets = batch["targets"].to(device)
             mask = batch["mask"].to(device)
+            if args.standardize:
+                targets = (targets - std_mean) / std_std
             t = torch.rand(latents.shape[0], device=device)
             noise = torch.randn_like(latents)
             z_t = forward_noise(latents, noise, t)
-            preds = model(z_t, t)
-            loss = criterion(preds, targets, mask)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                preds = model(z_t, t)
+            loss = criterion(preds.float(), targets, mask)
             opt.zero_grad()
             loss.backward()
             if is_fusion:
@@ -248,6 +266,10 @@ def train(args):
                 "t_injection": args.t_injection,
                 "in_channels": 256,
                 "out_channels": out_channels,
+                "standardized": args.standardize,
+                "std_mean": std_mean,
+                "std_std": std_std,
+                "precision": args.precision,
                 "seed": args.seed,
                 "epoch": epoch + 1,
                 "avg_loss": avg_loss,
@@ -259,11 +281,21 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     # Data / target
     p.add_argument("--feature", default="rms_energy_bass")
-    p.add_argument("--latent-dir", default="/run/media/kim/Lehto/sa3-latch-latents")
+    p.add_argument("--latent-dir", default="/run/media/kim/Lehto/latents_sa3")
     p.add_argument("--db-path", default=None)
+    p.add_argument("--target-source", choices=["db", "npz"], default="npz",
+                   help="npz = <stem>.TIMESERIES.npz companions (latents_sa3, medium grid); "
+                        "db = legacy per-crop TimeseriesDB (small-music-base / phase 1).")
     # Training loop
     p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16",
+                   help="bf16 autocast on the head forward — ~6x throughput vs fp32 on "
+                        "RDNA4 at T=4096. Loss is computed in fp32. fp32 only for debugging.")
+    p.add_argument("--standardize", action="store_true",
+                   help="Zero-mean/unit-std the target (stats from a 256-sample draw, stored "
+                        "in the ckpt for inference de-standardization). Important for dB-scale "
+                        "rms and low-variance spectral features (LATCH_RESULTS §18).")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=None)
