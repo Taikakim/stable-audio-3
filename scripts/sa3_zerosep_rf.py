@@ -27,11 +27,16 @@ actual noise state, at the cost of inversion error on SAME-L's 256-d latent.
 Use a -base checkpoint (deterministic Euler velocity, live cfg). All inversion
 math runs in fp32; x is cast to the model dtype only for the velocity forward.
 
+The faithfulness controller (--eta) is what makes the re-denoise stay tied to the
+input: eta=0 = clean but unrelated, eta~=0.3-0.5 = the separation sweet spot
+(anchored to the actual part, still prompt-shaped), eta~=0.7 over-anchors and just
+rebuilds the mix. See rf_integrate() for the mechanism.
+
 Examples:
     python sa3_zerosep_rf.py -i mix.wav --start 400 --max-seconds 10 \
         --source-prompt "psychedelic goa trance full mix: drums, bass, acid lead" \
         --prompts "solo drum kit" "isolated bass synth" "lead synth alone" \
-        --steps 28 --cfg-tar 8.0
+        --steps 28 --cfg-tar 8.0 --eta 0 0.3 0.5 0.7   # sweep the fidelity dial
 """
 
 import argparse
@@ -73,17 +78,36 @@ def _vel(dit, x, t_scalar, mk, model_dtype):
     return dit(x.to(model_dtype), t_ten, **mk).float()
 
 
-def rf_integrate(dit, x, t_grid, mk, model_dtype, taylor, tqdm, desc):
+def rf_integrate(dit, x, t_grid, mk, model_dtype, taylor, tqdm, desc,
+                 anchor=None, eta=0.0, tau=0.0):
     """Integrate dx/dt = v(x,t) along t_grid (ascending => invert, descending =>
-    denoise). RF-Solver 2nd-order Taylor step when taylor=True. fp32 throughout."""
+    denoise). RF-Solver 2nd-order Taylor step when taylor=True. fp32 throughout.
+
+    Faithfulness controller (anchor/eta/tau, re-denoise only): on each high-noise
+    step (t >= tau) pull the predicted-clean latent z0 = x - t*v toward the source
+    latent `anchor`, then rebuild the velocity:
+        z0 <- (1-eta)*z0 + eta*anchor ;  v <- (x - z0)/t
+    `eta` is a continuous fidelity dial (0 = free prompt edit -> clean but far from
+    input; ->1 = predicted-clean forced to the source -> faithful). Releasing below
+    `tau` lets the prompt shape fine detail. This z0-anchor is the proven SA3
+    mean-guidance form (latch_guided / steer_chroma) and is stable, unlike the
+    RF-Inversion (anchor-x)/(1-t) field which has the wrong sign and blows up at
+    t->1 under SA3's descending-t Euler."""
     x = x.float().clone()
     n = t_grid.shape[-1] - 1
+    use_ctrl = anchor is not None and eta > 0.0
     for i in tqdm(range(n), desc=desc):
         t0 = float(t_grid[i])
         t1 = float(t_grid[i + 1])
         dt = t1 - t0
         v = _vel(dit, x, t0, mk, model_dtype)
-        if taylor:
+        if use_ctrl and t0 >= tau:
+            t_c = max(t0, 1e-3)
+            z0 = x - t_c * v                      # predicted-clean under target prompt
+            z0 = (1.0 - eta) * z0 + eta * anchor  # pull toward the source mixture
+            v = (x - z0) / t_c
+            x = x + dt * v                        # plain Euler under the controller
+        elif taylor:
             v_half = _vel(dit, x + 0.5 * dt * v, t0 + 0.5 * dt, mk, model_dtype)
             vp = (v_half - v) / (0.5 * dt)
             x = x + dt * v + 0.5 * dt * dt * vp
@@ -110,10 +134,17 @@ def main():
                         help="plain reverse-Euler inversion (cheaper, less accurate)")
     parser.add_argument("--cfg-invert", type=float, default=1.0,
                         help="MUST be ~1.0; >1 ruins recoverability (MusRec)")
-    parser.add_argument("--cfg-tar", type=float, nargs="+", default=[1.0, 2.0],
-                        help="target cfg(s) for the re-denoise pass; swept cheaply off "
-                             "the shared inversion. ZeroSep regime is ~1; >~4 drifts to "
-                             "the prompt-prior and loses the input.")
+    parser.add_argument("--cfg-tar", type=float, default=8.0,
+                        help="target cfg on the re-denoise pass (fixed; the controller "
+                             "now provides anchoring, so cfg can stay high for prompt "
+                             "selectivity)")
+    parser.add_argument("--eta", type=float, nargs="+", default=[0.0, 0.3, 0.5, 0.7],
+                        help="RF-Inversion controller strength sweep: 0 = free prompt "
+                             "edit (clean but far from input), higher = pulled toward the "
+                             "mixture. Swept cheaply off the shared inversion.")
+    parser.add_argument("--tau", type=float, default=0.3,
+                        help="controller hand-off: active for t>=tau (high noise), "
+                             "released below so the prompt shapes fine detail")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--out_dir", type=str, default="zerosep_rf_results")
     args = parser.parse_args()
@@ -197,26 +228,31 @@ def main():
 
         # 4. Separate: re-denoise under each target prompt.
         # The inversion (eps_inv) is shared; only the re-denoise repeats per
-        # (prompt, cfg), and cond is independent of cfg -> build it once per prompt.
+        # (prompt, eta). cond is independent of eta -> build it once per prompt.
         results = [{"reconstruction_rel_error": rel}]
         for prompt in args.prompts:
-            base = prompt.replace(" ", "_").replace(",", "")[:40]
+            base = prompt.replace(" ", "_").replace(",", "")[:36]
             cond = build_cond_inputs(sam, prompt, duration, 1, L, device)
-            for cfg in args.cfg_tar:
-                tag = f"{base}_cfg{cfg:g}"
-                logger.info(f"--- separating: '{prompt}' (cfg_tar={cfg}) ---")
-                tgt_mk = make_model_kwargs(cond, cfg)
+            tgt_mk = make_model_kwargs(cond, args.cfg_tar)
+            for eta in args.eta:
+                tag = f"{base}_eta{eta:g}"
+                logger.info(f"--- separating: '{prompt}' (cfg_tar={args.cfg_tar}, "
+                            f"eta={eta}, tau={args.tau}) ---")
                 x0_edit = rf_integrate(dit, eps_inv, sig_desc, tgt_mk, model_dtype,
-                                       taylor, tqdm, f"denoise {tag[:16]}")
+                                       taylor, tqdm, f"denoise {tag[:16]}",
+                                       anchor=x0, eta=eta, tau=args.tau)
                 decode_save(x0_edit, f"{tag}.wav")
-                results.append({"prompt": prompt, "cfg_tar": cfg, "file": f"{tag}.wav"})
+                results.append({"prompt": prompt, "cfg_tar": args.cfg_tar,
+                                "eta": eta, "tau": args.tau, "file": f"{tag}.wav"})
 
     (out_dir / "params.json").write_text(json.dumps(
         {"args": vars(args), "results": results}, indent=2))
     logger.info(f"done -> {out_dir}")
-    logger.info("LISTEN: reconstruction.wav first (the inversion fidelity ceiling), "
-                "then each <target>.wav. If reconstruction is already poor, raise "
-                "--steps before trusting separations.")
+    logger.info("LISTEN: reconstruction.wav (inversion ceiling) first, then each "
+                "<target>_eta*.wav in order of eta. eta=0 is the free prompt edit "
+                "(clean but far from input); faithfulness to the actual source should "
+                "increase with eta. Pick the eta that keeps the source's notes/timing "
+                "while staying clean.")
 
 
 if __name__ == "__main__":
