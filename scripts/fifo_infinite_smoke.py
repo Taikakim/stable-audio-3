@@ -94,9 +94,11 @@ def run_fifo(model, device, args):
 
     _positional_drift_report(audio, sr)
 
-    import torchaudio
-    wav = audio[0] if audio.dim() == 3 else audio
-    torchaudio.save(args.out, wav, sample_rate=int(sr))
+    wav = audio[0] if audio.dim() == 3 else audio  # (C, T)
+    # soundfile is portable across both venvs; torchaudio.save on torch 2.12 routes
+    # through torchcodec, which the ROCm-7.14 test venv doesn't have.
+    import soundfile as sf
+    sf.write(args.out, wav.transpose(0, 1).cpu().numpy(), int(sr))  # (T, C)
     print(f"[fifo] saved -> {args.out}")
 
 
