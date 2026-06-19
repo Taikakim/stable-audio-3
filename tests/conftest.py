@@ -1,9 +1,13 @@
 import re
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 import torchaudio
+
+# Make scripts/ importable from tests (e.g. from scripts.longform_render import parse_schedule)
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from stable_audio_3 import AutoencoderModel, StableAudioModel
 from stable_audio_3.model_configs import ae_models, base_models

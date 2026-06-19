@@ -113,6 +113,12 @@ def test_renderer_transition_zero_crossfade_floored():
     assert torch.isfinite(lat).all()
 
 
+def test_parse_schedule_single_and_list():
+    from scripts.longform_render import parse_schedule  # noqa
+    assert parse_schedule("acid techno") == "acid techno"
+    assert parse_schedule("0:acid techno|30:breakdown pad") == [(0.0, "acid techno"), (30.0, "breakdown pad")]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
 def test_sdedit_reanchor_preserves_shape():
     from stable_audio_3 import StableAudioModel
