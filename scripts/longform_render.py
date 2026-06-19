@@ -6,18 +6,23 @@ import argparse
 
 
 def parse_schedule(arg: str) -> str | list[tuple[float, str]]:
-    """Parse a prompt or a '0:A|30:B' timestamp schedule string.
+    """Single prompt -> str; 't:prompt|t:prompt' -> [(float, str), ...].
 
-    Returns the raw string for a single prompt, or a list of (time_sec, prompt)
-    tuples for a schedule.
+    Treated as a schedule only if EVERY '|'-separated segment begins with a float
+    timestamp followed by ':'. Otherwise returned as a single prompt, so prompts
+    that contain a colon (e.g. '120bpm: deep techno') are handled safely.
     """
-    if "|" not in arg and ":" not in arg.split(" ")[0]:
-        return arg
-    entries = []
-    for part in arg.split("|"):
-        t, _, prompt = part.partition(":")
-        entries.append((float(t), prompt))
-    return entries
+    parsed = []
+    for seg in arg.split("|"):
+        head, sep, prompt = seg.partition(":")
+        if not sep:
+            return arg
+        try:
+            t = float(head.strip())
+        except ValueError:
+            return arg
+        parsed.append((t, prompt))
+    return parsed
 
 
 def main() -> None:

@@ -119,6 +119,15 @@ def test_parse_schedule_single_and_list():
     assert parse_schedule("0:acid techno|30:breakdown pad") == [(0.0, "acid techno"), (30.0, "breakdown pad")]
 
 
+def test_parse_schedule_single_prompt_with_colon():
+    from scripts.longform_render import parse_schedule  # noqa
+    # a single prompt whose first word contains a colon must NOT parse as a schedule
+    assert parse_schedule("120bpm: deep techno") == "120bpm: deep techno"
+    assert parse_schedule("") == ""
+    # inner colons in a real schedule's prompt are preserved
+    assert parse_schedule("0:tense: strings|60:drop") == [(0.0, "tense: strings"), (60.0, "drop")]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
 def test_sdedit_reanchor_preserves_shape():
     from stable_audio_3 import StableAudioModel
