@@ -15,7 +15,7 @@ def slerp(a: torch.Tensor, b: torch.Tensor, t):
     Ref: mir scripts/latent_crossfader.py. a,b: (..., D)-ish; here used on (1,C,T)
     frame-wise.
     """
-    t = torch.as_tensor(t, dtype=a.dtype, device=a.device)
+    t = torch.as_tensor(t, dtype=torch.float32, device=a.device)
     a32, b32 = a.float(), b.float()
     na = a32 / (a32.norm(dim=1, keepdim=True) + 1e-8)
     nb = b32 / (b32.norm(dim=1, keepdim=True) + 1e-8)
@@ -23,8 +23,9 @@ def slerp(a: torch.Tensor, b: torch.Tensor, t):
     omega = torch.acos(dot)
     so = torch.sin(omega)
     near = so.abs() < 1e-4
-    w_a = torch.where(near, 1.0 - t, torch.sin((1.0 - t) * omega) / (so + 1e-8))
-    w_b = torch.where(near, t, torch.sin(t * omega) / (so + 1e-8))
+    so_safe = torch.where(near, torch.ones_like(so), so)  # exact denom off the near path
+    w_a = torch.where(near, 1.0 - t, torch.sin((1.0 - t) * omega) / so_safe)
+    w_b = torch.where(near, t, torch.sin(t * omega) / so_safe)
     return (w_a * a32 + w_b * b32).to(a.dtype)
 
 
