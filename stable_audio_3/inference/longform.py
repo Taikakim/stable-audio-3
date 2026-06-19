@@ -226,3 +226,39 @@ class InpaintContinuationGenerator(ChunkGenerator):
             mask_padding_attention=True, dist_shift=self.inner.sampling_dist_shift,
             decode=False)
         return latents.float()
+
+
+class SDEditReanchor:
+    """Triangular re-noise->denoise (audio2audio in latent space) to pull back on-manifold."""
+
+    def __init__(self, model, steps: int = 50, cfg_scale: float = 6.0):
+        self.model = model
+        self.inner = model.model
+        self.steps = steps
+        self.cfg_scale = cfg_scale
+        self.fps = model.model.sample_rate / model.model.pretransform.downsampling_ratio
+
+    @torch.no_grad()
+    def reanchor(self, latents, sigma_peak, prompt, seed):
+        from stable_audio_3.inference.sampling import sample_diffusion
+        device = next(self.inner.model.parameters()).device
+        dtype = next(self.inner.model.parameters()).dtype
+        n_frames = latents.shape[-1]
+        win_seconds = n_frames / self.fps
+        conditioning, _ = self.model._build_conditioning_dicts(prompt, None, win_seconds, 1)
+        ct = self.inner.conditioner(conditioning, device)
+        ct["inpaint_mask"] = [torch.zeros((1, 1, n_frames), device=device)]
+        ct["inpaint_masked_input"] = [torch.zeros((1, self.inner.io_channels, n_frames), device=device)]
+        ci = self.inner.get_conditioning_inputs(ct)
+        ci = {k: (v.type(dtype) if torch.is_tensor(v) else v) for k, v in ci.items()}
+        torch.manual_seed(seed)
+        noise = torch.randn_like(latents.to(device=device, dtype=dtype))
+        out = sample_diffusion(
+            model=self.inner.model, noise=noise, cond_inputs=ci,
+            diffusion_objective=self.inner.diffusion_objective, steps=self.steps,
+            cfg_scale=self.cfg_scale, conditioning=conditioning,
+            sample_rate=self.inner.sample_rate, pretransform=self.inner.pretransform,
+            mask_padding_attention=True, dist_shift=self.inner.sampling_dist_shift,
+            init_data=latents.to(device=device, dtype=dtype), init_noise_level=float(sigma_peak),
+            decode=False)
+        return out.float()

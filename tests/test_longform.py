@@ -114,6 +114,18 @@ def test_renderer_transition_zero_crossfade_floored():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
+def test_sdedit_reanchor_preserves_shape():
+    from stable_audio_3 import StableAudioModel
+    from stable_audio_3.inference.longform import SDEditReanchor
+    m = StableAudioModel.from_pretrained("small-music-base", model_half=False)
+    r = SDEditReanchor(m)
+    C = m.model.io_channels
+    z = torch.randn(1, C, 128, device="cuda")
+    out = r.reanchor(z, sigma_peak=0.5, prompt="acid techno", seed=0)
+    assert out.shape == z.shape and torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
 def test_inpaint_continuation_shape_and_clamp():
     from stable_audio_3 import StableAudioModel
     m = StableAudioModel.from_pretrained("small-music-base", model_half=False)
