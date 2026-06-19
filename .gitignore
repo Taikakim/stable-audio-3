@@ -168,3 +168,7 @@ wandb/*
 .DS_Store
 *.safetensors
 .claude
+# Exported SAME ONNX artifacts (regenerate via scripts/export_same_onnx.py)
+same_*.onnx
+same_*.onnx.data
+*.onnx.data
