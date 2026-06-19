@@ -70,3 +70,10 @@ def test_fake_generator_honors_prefix_and_shape():
 def test_chunkgenerator_is_abstract():
     with pytest.raises(TypeError):
         ChunkGenerator()
+
+
+def test_fake_generator_no_prefix_returns_constant():
+    g = FakeChunkGenerator(channels=4)
+    out = g.generate("p", prefix_latents=None, prefix_frames=0, n_frames=6, seed=0)
+    assert out.shape == (1, 4, 6)
+    assert torch.allclose(out, torch.ones(1, 4, 6))  # first call -> fill value 1.0

@@ -102,7 +102,8 @@ class DriftMonitor:
 
 class ChunkGenerator(ABC):
     @abstractmethod
-    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed) -> torch.Tensor:
+    def generate(self, prompt: str, prefix_latents: torch.Tensor | None,
+                 prefix_frames: int, n_frames: int, seed: int) -> torch.Tensor:
         """Generate latents for a chunk.
 
         Args:
@@ -126,7 +127,8 @@ class FakeChunkGenerator(ChunkGenerator):
         self.channels = channels
         self._call = 0
 
-    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+    def generate(self, prompt: str, prefix_latents: torch.Tensor | None,
+                 prefix_frames: int, n_frames: int, seed: int) -> torch.Tensor:
         self._call += 1
         out = torch.full((1, self.channels, n_frames), float(self._call))
         if prefix_latents is not None and prefix_frames > 0:
