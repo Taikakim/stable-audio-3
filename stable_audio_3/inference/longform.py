@@ -6,6 +6,8 @@ Approach C (bounded FIFO). slerp is reimplemented locally (ref: mir latent_cross
 """
 from __future__ import annotations
 
+import statistics
+
 import torch
 
 
@@ -74,3 +76,24 @@ class PromptSchedule:
         is_transition = idx != self._last_index and self._last_index != -1
         self._last_index = idx
         return prompt, is_transition, self._crossfade_sec
+
+
+class DriftMonitor:
+    def __init__(self, rms_drop_frac: float = 0.6):
+        self.rms_drop_frac = float(rms_drop_frac)
+        self._rms_history: list[float] = []
+
+    def observe(self, latents: torch.Tensor) -> dict:
+        x = latents.float()
+        rms = float(x.pow(2).mean().sqrt())
+        # cheap spectral proxy: mean abs first-difference along time / rms
+        diff = (x[..., 1:] - x[..., :-1]).abs().mean()
+        centroid_proxy = float(diff / (rms + 1e-8))
+        self._rms_history.append(rms)
+        return {"rms": rms, "centroid_proxy": centroid_proxy}
+
+    def should_reanchor(self, stats: dict) -> bool:
+        if len(self._rms_history) < 3:
+            return False
+        med = statistics.median(self._rms_history[:-1])
+        return stats["rms"] < self.rms_drop_frac * med
