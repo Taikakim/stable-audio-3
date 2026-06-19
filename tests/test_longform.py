@@ -90,3 +90,24 @@ def test_renderer_length_and_continuity():
     assert lat.shape == (1, 8, 50)                    # exact requested length
     assert torch.isfinite(lat).all()
     assert len(r.drift_log) >= 3                      # one entry per chunk
+
+
+def test_renderer_transition_branch_exact_length():
+    g = FakeChunkGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    sched = PromptSchedule([(0.0, "A"), (2.0, "B")], crossfade_sec=0.4)  # transition fires
+    lat = r.render_latents(sched, total_frames=60)
+    assert lat.shape == (1, 8, 60)
+    assert torch.isfinite(lat).all()
+
+
+def test_renderer_transition_zero_crossfade_floored():
+    # crossfade_sec rounds to 0 frames -> n must floor to >=1, not crash
+    g = FakeChunkGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    sched = PromptSchedule([(0.0, "A"), (2.0, "B")], crossfade_sec=0.02)
+    lat = r.render_latents(sched, total_frames=60)
+    assert lat.shape == (1, 8, 60)
+    assert torch.isfinite(lat).all()

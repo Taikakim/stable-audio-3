@@ -172,7 +172,7 @@ class LongFormRenderer:
             if out is None:
                 out = chunk
             elif is_transition:
-                n = min(int(round(xf_sec * self.fps)), self.overlap)
+                n = max(1, min(int(round(xf_sec * self.fps)), self.overlap))
                 joined = self.stitcher.transition_join(out, chunk, n)
                 out = torch.cat([out[..., :-n], joined, chunk[..., n:]], dim=-1)
             else:
