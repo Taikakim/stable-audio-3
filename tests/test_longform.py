@@ -5,6 +5,16 @@ from stable_audio_3.inference.longform import (
     InpaintContinuationGenerator, LongFormRenderer, PromptSchedule, slerp,
 )
 
+
+def _gpu_has_free_vram(min_gb=6.0):
+    if not torch.cuda.is_available():
+        return False
+    try:
+        free, _ = torch.cuda.mem_get_info()
+    except Exception:
+        return False
+    return free / 1e9 >= min_gb
+
 def test_single_prompt_no_transitions():
     s = PromptSchedule("acid techno")
     assert s.total_entries() == 1
@@ -128,7 +138,7 @@ def test_parse_schedule_single_prompt_with_colon():
     assert parse_schedule("0:tense: strings|60:drop") == [(0.0, "tense: strings"), (60.0, "drop")]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
+@pytest.mark.skipif(not _gpu_has_free_vram(), reason="needs GPU with >=6GB free VRAM")
 def test_sdedit_reanchor_preserves_shape():
     from stable_audio_3 import StableAudioModel
     from stable_audio_3.inference.longform import SDEditReanchor
@@ -140,7 +150,7 @@ def test_sdedit_reanchor_preserves_shape():
     assert out.shape == z.shape and torch.isfinite(out).all()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
+@pytest.mark.skipif(not _gpu_has_free_vram(), reason="needs GPU with >=6GB free VRAM")
 def test_inpaint_continuation_shape_and_clamp():
     from stable_audio_3 import StableAudioModel
     m = StableAudioModel.from_pretrained("small-music-base", model_half=False)
@@ -153,3 +163,74 @@ def test_inpaint_continuation_shape_and_clamp():
     # clamp-hardness probe (informational): how close is the clamp region to the prefix?
     err = (out[..., :16].cpu() - prefix.cpu()).abs().mean().item()
     print(f"[clamp] mean abs err in clamp region = {err:.4e}")
+
+
+# ---------------------------------------------------------------------------
+# CPU tests: NaN-retry, fail-fast, drift canary
+# ---------------------------------------------------------------------------
+
+class _NanOnFirstCallGenerator(ChunkGenerator):
+    """Returns NaN-filled chunk on the very first call, finite constant chunks after."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+        self._call = 0
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        self._call += 1
+        if self._call == 1:
+            return torch.full((1, self.channels, n_frames), float("nan"))
+        return torch.full((1, self.channels, n_frames), float(self._call))
+
+
+class _AlwaysNanGenerator(ChunkGenerator):
+    """Always returns NaN-filled chunks."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        return torch.full((1, self.channels, n_frames), float("nan"))
+
+
+class _CollapsingGenerator(ChunkGenerator):
+    """Returns unit-scale randn for the first 3 calls, then ~0 amplitude."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+        self._call = 0
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        self._call += 1
+        if self._call <= 3:
+            return torch.randn(1, self.channels, n_frames)
+        return torch.randn(1, self.channels, n_frames) * 0.01
+
+
+def test_renderer_nan_chunk_retries_then_succeeds():
+    """A NaN on the first chunk call triggers a retry; render completes all-finite."""
+    g = _NanOnFirstCallGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    lat = r.render_latents(PromptSchedule("x"), total_frames=40, base_seed=0)
+    assert lat.shape == (1, 8, 40)
+    assert torch.isfinite(lat).all()
+
+
+def test_renderer_nan_chunk_exhausts_retries_raises():
+    """A generator that always returns NaN should cause render_latents to raise RuntimeError."""
+    g = _AlwaysNanGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    with pytest.raises(RuntimeError, match="non-finite after"):
+        r.render_latents(PromptSchedule("x"), total_frames=40, base_seed=0)
+
+
+def test_renderer_drift_canary_warns():
+    """A collapsing generator should trigger a RuntimeWarning from the drift canary."""
+    # Use 4 chunks: window=20, overlap=5, total_frames=65 -> ceil((65)/(20-5))+1 >= 4 chunks
+    g = _CollapsingGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    with pytest.warns(RuntimeWarning, match="DriftMonitor canary"):
+        r.render_latents(PromptSchedule("x"), total_frames=65, base_seed=0)

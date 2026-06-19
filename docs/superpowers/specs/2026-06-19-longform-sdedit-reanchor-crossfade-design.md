@@ -53,7 +53,8 @@ LongFormRenderer ── walks PromptSchedule, requests one chunk at a time,
   `continuation_join` (short slerp over the overlap — smooths soft-clamp seam, near-identity
   if hard); `transition_join` (longer slerp over `crossfade_sec`, or `SDEditReanchor` morph
   under a blended prompt).
-- **`DriftMonitor`** — `observe(chunk)→stats` (RMS/centroid/tempo) + `should_reanchor(stats)`.
+- **`DriftMonitor`** — `observe(chunk)→stats` (RMS + centroid-proxy; tempo needs audio-domain
+  analysis not available in the latent-space monitor, so it is excluded) + `should_reanchor(stats)`.
   A: telemetry (drift not expected — a canary if it fires). C: gates chunk boundaries.
 - **`LongFormRenderer`** — the loop; holds `prev_tail`, accumulates latents, chunked-decodes,
   writes one `.wav` via soundfile.

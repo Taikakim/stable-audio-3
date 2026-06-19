@@ -7,6 +7,7 @@ Approach C (bounded FIFO). slerp is reimplemented locally (ref: mir latent_cross
 from __future__ import annotations
 
 import statistics
+import warnings
 from abc import ABC, abstractmethod
 
 import torch
@@ -164,11 +165,26 @@ class LongFormRenderer:
         while out is None or out.shape[-1] < total_frames:
             t_sec = (out.shape[-1] / self.fps) if out is not None else 0.0
             prompt, is_transition, xf_sec = schedule.resolve(t_sec)
-            prefix_frames = 0 if prev_tail is None else self.overlap
+            prefix_frames = 0 if (prev_tail is None or is_transition) else self.overlap
             chunk = self.gen.generate(
                 prompt, prefix_latents=prev_tail, prefix_frames=prefix_frames,
                 n_frames=self.window, seed=base_seed + k)
-            self.drift_log.append(self.monitor.observe(chunk))
+            tries = 0
+            while not torch.isfinite(chunk).all() and tries < 3:
+                tries += 1
+                chunk = self.gen.generate(
+                    prompt, prefix_latents=prev_tail, prefix_frames=prefix_frames,
+                    n_frames=self.window, seed=base_seed + k + 1000 * tries)
+            if not torch.isfinite(chunk).all():
+                raise RuntimeError(
+                    f"LongFormRenderer: chunk {k} (prompt={prompt!r}) non-finite after {tries} retries")
+            stats = self.monitor.observe(chunk)
+            self.drift_log.append(stats)
+            if self.monitor.should_reanchor(stats):
+                warnings.warn(
+                    f"DriftMonitor canary: RMS collapse at chunk {k} (t={t_sec:.1f}s, "
+                    f"rms={stats['rms']:.4f}) — clamp may not be holding (Approach A)",
+                    RuntimeWarning, stacklevel=2)
             if out is None:
                 out = chunk
             elif is_transition:
@@ -229,7 +245,12 @@ class InpaintContinuationGenerator(ChunkGenerator):
 
 
 class SDEditReanchor:
-    """Triangular re-noise->denoise (audio2audio in latent space) to pull back on-manifold."""
+    """Triangular re-noise->denoise (audio2audio in latent space) to pull back on-manifold.
+
+    Note: Approach A ships slerp-only transitions; SDEditReanchor is available for an opt-in
+    transition morph and is the drift-refresh used by Approach C — it is intentionally not
+    wired into the default renderer path.
+    """
 
     def __init__(self, model, steps: int = 50, cfg_scale: float = 6.0):
         self.model = model
