@@ -72,14 +72,13 @@ def main() -> None:
     print(f"[longform] latents {tuple(lat.shape)} finite={bool(torch.isfinite(lat).all())}")
     print(f"[longform] drift_log rms: {[round(d['rms'], 3) for d in r.drift_log]}")
 
-    # NOTE (verify-at-impl): for multi-minute renders, replace the single
-    # pretransform.decode call below with overlapped chunked decode — decode
-    # ~30 s latent chunks with a few-second overlap, crossfade the decoded audio.
-    # The SAME decoder is convolutional and naïve chunk boundaries seam.
-    # Check sample_diffusion(chunked_decode=...) first.
+    # AutoencoderPretransform.decode accepts chunked=True (verified: pretransforms.py:23).
+    # chunked=True delegates to model.decode_audio(chunked=True) which processes in chunks
+    # internally, avoiding OOM on multi-minute latents.
     with torch.no_grad():
         pt_dtype = next(inner.pretransform.parameters()).dtype
-        audio = inner.pretransform.decode(lat.to(pt_dtype)).float().cpu()
+        audio = inner.pretransform.decode(lat.to(pt_dtype), chunked=True).float().cpu()
+    audio = audio.clamp(-1, 1)
     wav = audio[0] if audio.dim() == 3 else audio
     sf.write(args.out, wav.transpose(0, 1).numpy(), int(sr))
     print(f"[longform] saved -> {args.out}")
