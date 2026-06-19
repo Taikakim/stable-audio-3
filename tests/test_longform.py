@@ -1,6 +1,6 @@
 import pytest
 import torch
-from stable_audio_3.inference.longform import PromptSchedule, slerp, CrossfadeStitcher, DriftMonitor
+from stable_audio_3.inference.longform import PromptSchedule, slerp, CrossfadeStitcher, DriftMonitor, ChunkGenerator, FakeChunkGenerator
 
 def test_single_prompt_no_transitions():
     s = PromptSchedule("acid techno")
@@ -56,3 +56,17 @@ def test_drift_monitor_flags_collapse():
         assert m.should_reanchor(st) is False
     collapsed = m.observe(torch.randn(1, 8, 16) * 0.05)  # RMS collapse
     assert m.should_reanchor(collapsed) is True
+
+
+def test_fake_generator_honors_prefix_and_shape():
+    g = FakeChunkGenerator(channels=8)
+    prefix = torch.full((1, 8, 4), 0.5)
+    out = g.generate("p", prefix_latents=prefix, prefix_frames=4, n_frames=10, seed=0)
+    assert out.shape == (1, 8, 10)
+    assert torch.allclose(out[..., :4], prefix)        # clamp region preserved
+    assert torch.allclose(out[..., 4:], out[..., 4:5].expand(1, 8, 6))  # constant tail
+
+
+def test_chunkgenerator_is_abstract():
+    with pytest.raises(TypeError):
+        ChunkGenerator()
