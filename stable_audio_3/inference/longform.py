@@ -182,3 +182,47 @@ class LongFormRenderer:
             prev_tail = out[..., -self.overlap:]
             k += 1
         return out[..., :total_frames]
+
+
+class InpaintContinuationGenerator(ChunkGenerator):
+    """Approach A: clamp the prefix in latent space, generate the rest in-distribution."""
+
+    def __init__(self, model, steps: int = 50, cfg_scale: float = 6.0):
+        self.model = model            # StableAudioModel
+        self.inner = model.model      # ConditionedDiffusionModelWrapper
+        self.steps = steps
+        self.cfg_scale = cfg_scale
+        self.fps = model.model.sample_rate / model.model.pretransform.downsampling_ratio
+
+    def _cond(self, prompt, prefix_latents, prefix_frames, n_frames, device, dtype, batch=1):
+        win_seconds = n_frames / self.fps
+        conditioning, _ = self.model._build_conditioning_dicts(prompt, None, win_seconds, batch)
+        ct = self.inner.conditioner(conditioning, device)
+        C = self.inner.io_channels
+        mask = torch.zeros((batch, 1, n_frames), device=device)
+        masked_input = torch.zeros((batch, C, n_frames), device=device)
+        if prefix_latents is not None and prefix_frames > 0:
+            mask[:, :, :prefix_frames] = 1.0
+            masked_input[:, :, :prefix_frames] = prefix_latents[..., :prefix_frames].to(device)
+        ct["inpaint_mask"] = [mask]
+        ct["inpaint_masked_input"] = [masked_input]
+        ci = self.inner.get_conditioning_inputs(ct)
+        return {k: (v.type(dtype) if torch.is_tensor(v) else v) for k, v in ci.items()}, conditioning
+
+    @torch.no_grad()
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        from stable_audio_3.inference.sampling import sample_diffusion
+        device = next(self.inner.model.parameters()).device
+        dtype = next(self.inner.model.parameters()).dtype
+        cond_inputs, conditioning = self._cond(
+            prompt, prefix_latents, prefix_frames, n_frames, device, dtype)
+        torch.manual_seed(seed)
+        noise = torch.randn(1, self.inner.io_channels, n_frames, device=device, dtype=dtype)
+        latents = sample_diffusion(
+            model=self.inner.model, noise=noise, cond_inputs=cond_inputs,
+            diffusion_objective=self.inner.diffusion_objective, steps=self.steps,
+            cfg_scale=self.cfg_scale, conditioning=conditioning,
+            sample_rate=self.inner.sample_rate, pretransform=self.inner.pretransform,
+            mask_padding_attention=True, dist_shift=self.inner.sampling_dist_shift,
+            decode=False)
+        return latents.float()
