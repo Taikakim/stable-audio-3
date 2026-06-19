@@ -1,5 +1,6 @@
 import pytest
-from stable_audio_3.inference.longform import PromptSchedule
+import torch
+from stable_audio_3.inference.longform import PromptSchedule, slerp, CrossfadeStitcher
 
 def test_single_prompt_no_transitions():
     s = PromptSchedule("acid techno")
@@ -20,3 +21,29 @@ def test_missing_t0_entry_raises():
         PromptSchedule([(5.0, "A"), (10.0, "B")])      # no t=0 entry
     with pytest.raises(ValueError):
         PromptSchedule([(-1.0, "A"), (5.0, "B")])      # negative first time, still no t=0
+
+
+def test_slerp_endpoints():
+    a = torch.randn(1, 8, 4)
+    b = torch.randn(1, 8, 4)
+    assert torch.allclose(slerp(a, b, 0.0), a, atol=1e-5)
+    assert torch.allclose(slerp(a, b, 1.0), b, atol=1e-5)
+
+
+def test_continuation_join_length_and_seam():
+    st = CrossfadeStitcher(blend_frames=3)
+    cur_tail = torch.zeros(1, 8, 3)          # end of current output
+    new_region = torch.ones(1, 8, 10)        # start of next chunk's new region
+    out = st.continuation_join(cur_tail, new_region)
+    assert out.shape == (1, 8, 10)           # same length as new_region
+    # first frame blended toward cur_tail (0), last frames untouched (1)
+    assert out[..., 0].abs().mean() < 1.0
+    assert torch.allclose(out[..., -1], torch.ones(1, 8))
+
+
+def test_transition_join_length():
+    st = CrossfadeStitcher(blend_frames=3)
+    out = st.transition_join(torch.zeros(1, 8, 5), torch.ones(1, 8, 5), n=5)
+    assert out.shape == (1, 8, 5)
+    assert torch.allclose(out[..., 0], torch.zeros(1, 8), atol=1e-5)
+    assert torch.allclose(out[..., -1], torch.ones(1, 8), atol=1e-5)

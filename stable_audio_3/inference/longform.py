@@ -6,6 +6,49 @@ Approach C (bounded FIFO). slerp is reimplemented locally (ref: mir latent_cross
 """
 from __future__ import annotations
 
+import torch
+
+
+def slerp(a: torch.Tensor, b: torch.Tensor, t):
+    """Spherical interpolation per last-dim vector; falls back to lerp when near-collinear.
+
+    Ref: mir scripts/latent_crossfader.py. a,b: (..., D)-ish; here used on (1,C,T)
+    frame-wise.
+    """
+    t = torch.as_tensor(t, dtype=a.dtype, device=a.device)
+    a32, b32 = a.float(), b.float()
+    na = a32 / (a32.norm(dim=1, keepdim=True) + 1e-8)
+    nb = b32 / (b32.norm(dim=1, keepdim=True) + 1e-8)
+    dot = (na * nb).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
+    omega = torch.acos(dot)
+    so = torch.sin(omega)
+    near = so.abs() < 1e-4
+    w_a = torch.where(near, 1.0 - t, torch.sin((1.0 - t) * omega) / (so + 1e-8))
+    w_b = torch.where(near, t, torch.sin(t * omega) / (so + 1e-8))
+    return (w_a * a32 + w_b * b32).to(a.dtype)
+
+
+class CrossfadeStitcher:
+    def __init__(self, blend_frames: int = 3):
+        self.blend_frames = int(blend_frames)
+
+    def _ramp(self, n, device, dtype):
+        # ramp t over n frames, shape (1,1,n) for broadcast over (1,C,n)
+        return torch.linspace(0.0, 1.0, n, device=device, dtype=dtype).view(1, 1, n)
+
+    def continuation_join(self, current_tail, new_region):
+        b = min(self.blend_frames, current_tail.shape[-1], new_region.shape[-1])
+        if b == 0:
+            return new_region
+        t = self._ramp(b, new_region.device, new_region.dtype)
+        head = slerp(current_tail[..., -b:], new_region[..., :b], t)
+        return torch.cat([head, new_region[..., b:]], dim=-1)
+
+    def transition_join(self, out_tail, in_head, n):
+        n = min(n, out_tail.shape[-1], in_head.shape[-1])
+        t = self._ramp(n, in_head.device, in_head.dtype)
+        return slerp(out_tail[..., -n:], in_head[..., :n], t)
+
 
 class PromptSchedule:
     def __init__(self, spec: str | list[tuple[float, str]], crossfade_sec: float = 4.0):
