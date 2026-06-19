@@ -7,6 +7,7 @@ Approach C (bounded FIFO). slerp is reimplemented locally (ref: mir latent_cross
 from __future__ import annotations
 
 import statistics
+from abc import ABC, abstractmethod
 
 import torch
 
@@ -97,3 +98,37 @@ class DriftMonitor:
             return False
         med = statistics.median(self._rms_history[:-1])
         return stats["rms"] < self.rms_drop_frac * med
+
+
+class ChunkGenerator(ABC):
+    @abstractmethod
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed) -> torch.Tensor:
+        """Generate latents for a chunk.
+
+        Args:
+            prompt: Text prompt (str)
+            prefix_latents: Prior latents to clamp to, shape (1, C, prefix_frames) or None
+            prefix_frames: Number of frames from prefix_latents to preserve
+            n_frames: Total number of frames to generate
+            seed: Random seed for reproducibility
+
+        Returns:
+            Latent tensor of shape (1, C, n_frames) where the first prefix_frames
+            are clamped to prefix_latents if provided.
+        """
+        ...
+
+
+class FakeChunkGenerator(ChunkGenerator):
+    """Model-free generator for CPU bookkeeping tests. Honors the clamp exactly."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+        self._call = 0
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        self._call += 1
+        out = torch.full((1, self.channels, n_frames), float(self._call))
+        if prefix_latents is not None and prefix_frames > 0:
+            out[..., :prefix_frames] = prefix_latents[..., :prefix_frames]
+        return out
