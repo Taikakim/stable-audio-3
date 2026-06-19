@@ -1,6 +1,9 @@
 import pytest
 import torch
-from stable_audio_3.inference.longform import PromptSchedule, slerp, CrossfadeStitcher, DriftMonitor, ChunkGenerator, FakeChunkGenerator
+from stable_audio_3.inference.longform import (
+    ChunkGenerator, CrossfadeStitcher, DriftMonitor, FakeChunkGenerator,
+    LongFormRenderer, PromptSchedule, slerp,
+)
 
 def test_single_prompt_no_transitions():
     s = PromptSchedule("acid techno")
@@ -77,3 +80,13 @@ def test_fake_generator_no_prefix_returns_constant():
     out = g.generate("p", prefix_latents=None, prefix_frames=0, n_frames=6, seed=0)
     assert out.shape == (1, 4, 6)
     assert torch.allclose(out, torch.ones(1, 4, 6))  # first call -> fill value 1.0
+
+
+def test_renderer_length_and_continuity():
+    g = FakeChunkGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    lat = r.render_latents(PromptSchedule("x"), total_frames=50, base_seed=0)
+    assert lat.shape == (1, 8, 50)                    # exact requested length
+    assert torch.isfinite(lat).all()
+    assert len(r.drift_log) >= 3                      # one entry per chunk
