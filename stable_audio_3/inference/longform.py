@@ -8,12 +8,12 @@ from __future__ import annotations
 
 
 class PromptSchedule:
-    def __init__(self, spec, crossfade_sec: float = 4.0):
+    def __init__(self, spec: str | list[tuple[float, str]], crossfade_sec: float = 4.0):
         if isinstance(spec, str):
             self._entries = [(0.0, spec)]
         else:
             self._entries = sorted(((float(t), p) for t, p in spec), key=lambda e: e[0])
-            if not self._entries or self._entries[0][0] > 0.0:
+            if not self._entries or self._entries[0][0] != 0.0:
                 raise ValueError("schedule must have an entry at t=0.0")
         self._crossfade_sec = float(crossfade_sec)
         self._last_index = -1  # which entry resolve() last reported, for transition edge
