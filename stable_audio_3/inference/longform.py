@@ -134,3 +134,51 @@ class FakeChunkGenerator(ChunkGenerator):
         if prefix_latents is not None and prefix_frames > 0:
             out[..., :prefix_frames] = prefix_latents[..., :prefix_frames]
         return out
+
+
+class LongFormRenderer:
+    """Walks a PromptSchedule, generating one window at a time via ChunkGenerator.
+
+    Stitches windows via CrossfadeStitcher (continuation_join for same-prompt;
+    transition_join for prompt changes), logs DriftMonitor.observe per chunk into
+    drift_log, and returns assembled (1, C, total_frames) latent.
+    """
+
+    def __init__(self, generator, channels, fps, window_frames, overlap_frames,
+                 blend_frames=3, stitcher=None, monitor=None):
+        self.gen = generator
+        self.channels = channels
+        self.fps = float(fps)
+        self.window = int(window_frames)
+        self.overlap = int(overlap_frames)
+        self.stitcher = stitcher or CrossfadeStitcher(blend_frames=blend_frames)
+        self.monitor = monitor or DriftMonitor()
+        self.drift_log: list[dict] = []
+        if self.overlap >= self.window:
+            raise ValueError("overlap_frames must be < window_frames")
+
+    def render_latents(self, schedule, total_frames, base_seed=0):
+        out = None
+        prev_tail = None
+        k = 0
+        while out is None or out.shape[-1] < total_frames:
+            t_sec = (out.shape[-1] / self.fps) if out is not None else 0.0
+            prompt, is_transition, xf_sec = schedule.resolve(t_sec)
+            prefix_frames = 0 if prev_tail is None else self.overlap
+            chunk = self.gen.generate(
+                prompt, prefix_latents=prev_tail, prefix_frames=prefix_frames,
+                n_frames=self.window, seed=base_seed + k)
+            self.drift_log.append(self.monitor.observe(chunk))
+            if out is None:
+                out = chunk
+            elif is_transition:
+                n = min(int(round(xf_sec * self.fps)), self.overlap)
+                joined = self.stitcher.transition_join(out, chunk, n)
+                out = torch.cat([out[..., :-n], joined, chunk[..., n:]], dim=-1)
+            else:
+                new_region = chunk[..., prefix_frames:]
+                new_region = self.stitcher.continuation_join(out, new_region)
+                out = torch.cat([out, new_region], dim=-1)
+            prev_tail = out[..., -self.overlap:]
+            k += 1
+        return out[..., :total_frames]
