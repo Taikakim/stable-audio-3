@@ -2,7 +2,7 @@ import pytest
 import torch
 from stable_audio_3.inference.longform import (
     ChunkGenerator, CrossfadeStitcher, DriftMonitor, FakeChunkGenerator,
-    LongFormRenderer, PromptSchedule, slerp,
+    InpaintContinuationGenerator, LongFormRenderer, PromptSchedule, slerp,
 )
 
 def test_single_prompt_no_transitions():
@@ -111,3 +111,18 @@ def test_renderer_transition_zero_crossfade_floored():
     lat = r.render_latents(sched, total_frames=60)
     assert lat.shape == (1, 8, 60)
     assert torch.isfinite(lat).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU + model")
+def test_inpaint_continuation_shape_and_clamp():
+    from stable_audio_3 import StableAudioModel
+    m = StableAudioModel.from_pretrained("small-music-base", model_half=False)
+    g = InpaintContinuationGenerator(m)
+    C = m.model.io_channels
+    prefix = torch.randn(1, C, 16, device="cuda")
+    out = g.generate("acid techno", prefix_latents=prefix, prefix_frames=16,
+                     n_frames=128, seed=0)
+    assert out.shape == (1, C, 128) and torch.isfinite(out).all()
+    # clamp-hardness probe (informational): how close is the clamp region to the prefix?
+    err = (out[..., :16].cpu() - prefix.cpu()).abs().mean().item()
+    print(f"[clamp] mean abs err in clamp region = {err:.4e}")
