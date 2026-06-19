@@ -26,8 +26,8 @@ def test_missing_t0_entry_raises():
 def test_slerp_endpoints():
     a = torch.randn(1, 8, 4)
     b = torch.randn(1, 8, 4)
-    assert torch.allclose(slerp(a, b, 0.0), a, atol=1e-5)
-    assert torch.allclose(slerp(a, b, 1.0), b, atol=1e-5)
+    assert torch.allclose(slerp(a, b, 0.0), a, atol=1e-6)
+    assert torch.allclose(slerp(a, b, 1.0), b, atol=1e-6)
 
 
 def test_continuation_join_length_and_seam():
@@ -37,7 +37,7 @@ def test_continuation_join_length_and_seam():
     out = st.continuation_join(cur_tail, new_region)
     assert out.shape == (1, 8, 10)           # same length as new_region
     # first frame blended toward cur_tail (0), last frames untouched (1)
-    assert out[..., 0].abs().mean() < 1.0
+    assert out[..., 0].abs().mean() < 0.1
     assert torch.allclose(out[..., -1], torch.ones(1, 8))
 
 
