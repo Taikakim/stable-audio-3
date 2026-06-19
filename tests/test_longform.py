@@ -1,6 +1,6 @@
 import pytest
 import torch
-from stable_audio_3.inference.longform import PromptSchedule, slerp, CrossfadeStitcher
+from stable_audio_3.inference.longform import PromptSchedule, slerp, CrossfadeStitcher, DriftMonitor
 
 def test_single_prompt_no_transitions():
     s = PromptSchedule("acid techno")
@@ -47,3 +47,12 @@ def test_transition_join_length():
     assert out.shape == (1, 8, 5)
     assert torch.allclose(out[..., 0], torch.zeros(1, 8), atol=1e-5)
     assert torch.allclose(out[..., -1], torch.ones(1, 8), atol=1e-5)
+
+
+def test_drift_monitor_flags_collapse():
+    m = DriftMonitor(rms_drop_frac=0.6)
+    for _ in range(5):
+        st = m.observe(torch.randn(1, 8, 16))   # ~unit RMS
+        assert m.should_reanchor(st) is False
+    collapsed = m.observe(torch.randn(1, 8, 16) * 0.05)  # RMS collapse
+    assert m.should_reanchor(collapsed) is True
