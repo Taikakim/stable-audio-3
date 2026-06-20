@@ -41,6 +41,10 @@ MIGraphX-GPU vs torch-CPU:  max|Δ|=2.8e-4  mean|Δ|=4.5e-5  cos=0.999998
 
 Scripts: `scripts/export_same_onnx.py` (export+validate, CPU-only),
 `scripts/decode_onnx.py` (host chunk-loop runner over the exported decoder).
+**Deployment:** `mir/scripts/latent_server_onnx.py` is a low-VRAM decode server (mir
+venv, ~2 GB GPU) that compiles the ONNX once at boot then serves `/decode /mix /source`
+— a drop-in alternative to the torch player `latent_server_sa3.py` for the explorer
+(point the viewer at it with `SA3_PLAYER_PORT=7893`).
 
 ## Why fixed-chunk, not a dynamic-length graph
 
