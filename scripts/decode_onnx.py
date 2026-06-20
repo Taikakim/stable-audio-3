@@ -112,6 +112,51 @@ def decode_chunked_onnx(sess, latents: np.ndarray, chunk_size: int,
     return out
 
 
+def summarize_placement(profile_path: str, requested: list[str]) -> None:
+    """Parse an ORT profiling JSON and report which execution provider actually
+    ran each node — the definitive check for silent CPU fallback. ORT emits one
+    `cat:"Node"` kernel event per executed node with `args.provider`."""
+    import json
+    from collections import defaultdict
+    with open(profile_path) as f:
+        events = json.load(f)
+
+    by_provider_dur = defaultdict(float)     # provider -> total kernel us
+    by_provider_ops = defaultdict(set)       # provider -> {op_name}
+    cpu_op_dur = defaultdict(float)          # op_name -> us on CPU
+    for e in events:
+        if e.get("cat") != "Node":
+            continue
+        args = e.get("args") or {}
+        prov, op = args.get("provider"), args.get("op_name")
+        if not prov or not op:
+            continue
+        dur = float(e.get("dur", 0))
+        by_provider_dur[prov] += dur
+        by_provider_ops[prov].add(op)
+        if "CPU" in prov:
+            cpu_op_dur[op] += dur
+
+    total = sum(by_provider_dur.values()) or 1.0
+    print("\n[placement] node execution time by provider:")
+    for prov in sorted(by_provider_dur, key=by_provider_dur.get, reverse=True):
+        pct = 100 * by_provider_dur[prov] / total
+        print(f"  {prov:32s} {by_provider_dur[prov]/1000:9.2f} ms  {pct:5.1f}%  "
+              f"({len(by_provider_ops[prov])} op types)")
+
+    gpu_eps = [p for p in requested if "CPU" not in p]
+    if gpu_eps and cpu_op_dur:
+        print(f"\n[placement] ⚠ ops that FELL BACK to CPU (coverage gaps on {gpu_eps[0]}):")
+        for op, dur in sorted(cpu_op_dur.items(), key=lambda kv: kv[1], reverse=True):
+            print(f"    {op:28s} {dur/1000:8.2f} ms")
+        cpu_share = 100 * sum(cpu_op_dur.values()) / total
+        print(f"[placement] {cpu_share:.1f}% of node time ran on CPU — "
+              + ("mostly GPU, minor fallback" if cpu_share < 15 else
+                 "SIGNIFICANT fallback; MIGraphX op coverage is the bottleneck"))
+    elif gpu_eps:
+        print(f"[placement] ✅ no CPU fallback — every node ran on {gpu_eps[0]}")
+
+
 def save_wav(path: Path, audio: np.ndarray, sr: int) -> None:
     """audio [1, 2, samples] or [2, samples] -> int16 WAV via soundfile PCM_16
     (never torchaudio.save — MASTER §5: torchcodec clips fp16)."""
@@ -138,6 +183,8 @@ def main():
     ap.add_argument("--compare-torch", action="store_true",
                     help="also run AudioAutoencoder.decode_audio and diff (needs torch+model)")
     ap.add_argument("--model", default="same-l")
+    ap.add_argument("--report-placement", action="store_true",
+                    help="dump which EP actually ran each node (detects silent CPU fallback)")
     args = ap.parse_args()
 
     import onnxruntime as ort
@@ -146,6 +193,7 @@ def main():
     providers = pick_providers(args.provider)
     print(f"[ort] providers: {providers}")
     so = ort.SessionOptions()
+    so.enable_profiling = args.report_placement
     sess = ort.InferenceSession(str(args.onnx), sess_options=so, providers=providers)
     used = sess.get_providers()
     print(f"[ort] active: {used[0]}")
@@ -161,6 +209,10 @@ def main():
 
     save_wav(args.out, audio, SAMPLE_RATE)
     print(f"[out] wrote {args.out}")
+
+    if args.report_placement:
+        prof = sess.end_profiling()
+        summarize_placement(prof, providers)
 
     if args.compare_torch:
         print("[compare] decoding with torch AudioAutoencoder.decode_audio ...")

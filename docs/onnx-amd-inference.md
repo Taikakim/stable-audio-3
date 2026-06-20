@@ -87,7 +87,23 @@ python scripts/decode_onnx.py --onnx same_decoder_L128.onnx \
 # verify the overlap-add seam vs torch (needs the model; sets a safe --overlap):
 python scripts/decode_onnx.py --onnx same_decoder_L128.onnx --npy <latent.npy> \
     --chunk-latents 128 --overlap 16 --provider cpu --compare-torch
+# AMD coverage check: which EP actually ran each node (detects silent CPU fallback):
+python scripts/decode_onnx.py --onnx same_decoder_L128.onnx --crop 000000 \
+    --provider migraphx --report-placement --compare-torch
+
+# benchmark vs the stock torch decode (latency/RTF, VRAM, quality):
+python scripts/bench_same_onnx.py --crop 000000 \
+    --onnx-fp32 same_decoder_L128.onnx --onnx-fp16 same_decoder_L128_fp16.onnx \
+    --backends torch,onnx-migraphx,onnx-migraphx-fp16 \
+    --lengths 128,512,1024,4096 --chunk-latents 128 --overlap 16
 ```
+
+**EP availability:** the plain PyPI `onnxruntime` is CPU-only. For the MIGraphX/ROCm
+EP run `decode_onnx.py`/`bench_same_onnx.py` from a venv that has it (mir's
+`onnxruntime_migraphx`) or `uv pip install onnxruntime-rocm`. `decode_onnx.py` is
+pure numpy/ORT/soundfile, so it runs in the mir venv (only `--compare-torch` needs
+the model). "ONNX inference on AMD" is verified only when `--report-placement` shows
+the heavy ops on the GPU EP (not CPU fallback) AND `--compare-torch` cos ≈ 0.9999.
 
 ## Caveats / open items
 
