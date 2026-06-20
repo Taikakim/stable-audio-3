@@ -73,6 +73,37 @@ def pick_providers(choice: str | None) -> list[str]:
     return [p for p in order if p in available] or ["CPUExecutionProvider"]
 
 
+def _augment_migraphx(providers: list[str], args) -> list:
+    """Attach MIGraphX provider options for compile-caching / fp16 when requested.
+    Caching makes the multi-minute AOT compile a one-time cost: first run compiles
+    and saves the program, later runs load it. Returns a providers list where the
+    MIGraphX entry may be a (name, options) tuple."""
+    if not (args.cache_dir or args.ep_fp16):
+        return providers
+    out = []
+    for p in providers:
+        if p != "MIGraphXExecutionProvider":
+            out.append(p)
+            continue
+        opts: dict[str, str] = {}
+        if args.ep_fp16:
+            opts["migraphx_fp16_enable"] = "1"
+        if args.cache_dir:
+            args.cache_dir.mkdir(parents=True, exist_ok=True)
+            tag = "fp16" if args.ep_fp16 else "fp32"
+            cache = args.cache_dir / f"{Path(args.onnx).stem}_L{args.chunk_latents}_{tag}.migx"
+            opts.update({
+                "migraphx_save_compiled_model": "1",
+                "migraphx_save_model_name": str(cache),
+                "migraphx_load_compiled_model": "1",
+                "migraphx_load_model_name": str(cache),
+            })
+            print(f"[ort] MIGraphX compile cache: {cache}"
+                  + ("  (exists — will load)" if cache.exists() else "  (will compile+save)"))
+        out.append(("MIGraphXExecutionProvider", opts))
+    return out
+
+
 def decode_chunked_onnx(sess, latents: np.ndarray, chunk_size: int,
                         overlap: int, ds: int = DOWNSAMPLING_RATIO) -> np.ndarray:
     """Port of AudioAutoencoder.decode_audio(chunked=True) using an ORT session
@@ -185,18 +216,38 @@ def main():
     ap.add_argument("--model", default="same-l")
     ap.add_argument("--report-placement", action="store_true",
                     help="dump which EP actually ran each node (detects silent CPU fallback)")
+    ap.add_argument("--cache-dir", type=Path, default=None,
+                    help="cache the compiled MIGraphX program here so the ~min AOT "
+                         "compile is one-time (first run compiles+saves, later runs load)")
+    ap.add_argument("--ep-fp16", action="store_true",
+                    help="run the MIGraphX EP in fp16 (faster/less VRAM; slight precision loss)")
     args = ap.parse_args()
 
     import onnxruntime as ort
 
     latents = load_latents(args)
     providers = pick_providers(args.provider)
-    print(f"[ort] providers: {providers}")
+    providers = _augment_migraphx(providers, args)
+    print(f"[ort] providers: {[p[0] if isinstance(p, tuple) else p for p in providers]}")
     so = ort.SessionOptions()
     so.enable_profiling = args.report_placement
+    req = args.provider and _PROVIDER_ALIASES.get(args.provider.lower(), args.provider)
+    plain = [p[0] if isinstance(p, tuple) else p for p in providers]
+
     sess = ort.InferenceSession(str(args.onnx), sess_options=so, providers=providers)
-    used = sess.get_providers()
-    print(f"[ort] active: {used[0]}")
+    # ORT silently falls back to CPU when a requested GPU EP errors (e.g. an
+    # unsupported provider option in this build) — so a "CPU pretending to be the
+    # GPU run" never gets mistaken for verified AMD inference. If we asked for a
+    # GPU EP, got CPU, and had passed extra options, retry on the bare GPU EP.
+    if req and "CPU" not in req and "CPU" in sess.get_providers()[0]:
+        if providers != plain:
+            print(f"[ort] ⚠ provider options rejected by this build → silent CPU fallback; "
+                  f"retrying on bare {req} (compile caching unavailable here)")
+            sess = ort.InferenceSession(str(args.onnx), sess_options=so, providers=plain)
+        if "CPU" in sess.get_providers()[0]:
+            print(f"[ort] ⚠ WARNING: requested {req} but ACTIVE EP is CPU — "
+                  f"this is NOT an AMD-GPU run (check EP availability).")
+    print(f"[ort] active: {sess.get_providers()[0]}")
 
     L = latents.shape[-1]
     print(f"[run] latents {latents.shape}  chunk={args.chunk_latents}  overlap={args.overlap}")

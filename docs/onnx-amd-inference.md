@@ -6,8 +6,37 @@ low-VRAM inference path that doesn't need the full torch/ROCm stack and can run
 alongside a training job. Motivated by the cgisky `stable-audio-3-rs` MNN port
 (which proves SAME exports cleanly, but is CUDA/Windows-only).
 
-**Status (2026-06-20):** decoder **and** encoder export + CPU validation pass.
-GPU/MIGraphX deployment + the overlap-stitch seam test are the remaining items.
+**Status (2026-06-20):** **GPU-VERIFIED.** Decoder runs 100% on the MIGraphX EP
+(zero CPU fallback), numerically identical to torch (cos=0.999998), RTF ~39×
+post-compile → ONNX inference on AMD works. Operational catch: a ~9-min MIGraphX
+AOT compile per session (caching not exposed in this ORT build — compile once in a
+long-lived server). Multi-chunk overlap-add **seam** test still TODO.
+
+## GPU verification (RX 9070 XT, mir venv onnxruntime_migraphx 1.23.2)
+
+```
+[ort] active: MIGraphXExecutionProvider
+[run] -> audio (1,2,131072)  in 0.08s   RTF=38.6x          # L32, post-compile
+[placement] MIGraphXExecutionProvider 100.0%  ✅ no CPU fallback
+MIGraphX-GPU vs torch-CPU:  max|Δ|=2.8e-4  mean|Δ|=4.5e-5  cos=0.999998
+```
+
+- **EP availability:** only the **mir venv** has the MIGraphX EP (`onnxruntime_migraphx`
+  1.23.2). The SA3 venv's `onnxruntime` (1.27, PyPI) is **CPU-only** (`['Azure','CPU']`).
+  `decode_onnx.py` needs no torch (unless `--compare-torch`), so run it from the mir venv.
+- **The ~9-min AOT compile is the only real catch.** It is CPU-bound (pegs all cores;
+  GPU just holds the 1.7 GB of weights until kernels are built). It is NOT exhaustive
+  tuning (tried `MIGRAPHX_DISABLE_EXHAUSTIVE_TUNE=1`) and NOT chunk size (same at L32 and
+  L128) — MIGraphX is simply slow to compile the masked-SDPA-heavy graph. **Caching:** ORT's
+  compiled-model cache options (`migraphx_save/load_compiled_model`, `_model_name`,
+  `_model_path`) are **all rejected by this `onnxruntime_migraphx` 1.23.2 build** (`Unknown
+  provider option`), and ORT then silently falls back to CPU — `decode_onnx.py --cache-dir`
+  detects that and retries on the bare GPU EP, so caching is effectively a no-op here. The
+  practical mitigation is **a long-lived server that compiles once at boot** (the
+  `latent_server_sa3.py` pattern — per-request cost is then nil), or a newer ORT-ROCm build
+  that exposes the cache options. `--ep-fp16` (`migraphx_fp16_enable`) IS supported.
+- **Placement reports "1 op type" at 100%** because MIGraphX fuses the entire graph into a
+  single compiled program — that IS full-graph GPU execution, not a one-op model.
 
 Scripts: `scripts/export_same_onnx.py` (export+validate, CPU-only),
 `scripts/decode_onnx.py` (host chunk-loop runner over the exported decoder).
