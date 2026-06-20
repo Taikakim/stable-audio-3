@@ -1,0 +1,236 @@
+import pytest
+import torch
+from stable_audio_3.inference.longform import (
+    ChunkGenerator, CrossfadeStitcher, DriftMonitor, FakeChunkGenerator,
+    InpaintContinuationGenerator, LongFormRenderer, PromptSchedule, slerp,
+)
+
+
+def _gpu_has_free_vram(min_gb=6.0):
+    if not torch.cuda.is_available():
+        return False
+    try:
+        free, _ = torch.cuda.mem_get_info()
+    except Exception:
+        return False
+    return free / 1e9 >= min_gb
+
+def test_single_prompt_no_transitions():
+    s = PromptSchedule("acid techno")
+    assert s.total_entries() == 1
+    p, is_tr, xf = s.resolve(0.0)
+    assert p == "acid techno" and is_tr is False
+    assert s.resolve(99.0)[0] == "acid techno"
+
+def test_schedule_transitions_fire_once():
+    s = PromptSchedule([(0.0, "A"), (10.0, "B")], crossfade_sec=4.0)
+    assert s.resolve(0.0) == ("A", False, 4.0)
+    assert s.resolve(5.0) == ("A", False, 4.0)
+    assert s.resolve(10.0) == ("B", True, 4.0)   # boundary crossed -> transition
+    assert s.resolve(12.0) == ("B", False, 4.0)  # already in B -> no repeat
+
+def test_missing_t0_entry_raises():
+    with pytest.raises(ValueError):
+        PromptSchedule([(5.0, "A"), (10.0, "B")])      # no t=0 entry
+    with pytest.raises(ValueError):
+        PromptSchedule([(-1.0, "A"), (5.0, "B")])      # negative first time, still no t=0
+
+
+def test_slerp_endpoints():
+    a = torch.randn(1, 8, 4)
+    b = torch.randn(1, 8, 4)
+    assert torch.allclose(slerp(a, b, 0.0), a, atol=1e-6)
+    assert torch.allclose(slerp(a, b, 1.0), b, atol=1e-6)
+
+
+def test_continuation_join_length_and_seam():
+    st = CrossfadeStitcher(blend_frames=3)
+    cur_tail = torch.zeros(1, 8, 3)          # end of current output
+    new_region = torch.ones(1, 8, 10)        # start of next chunk's new region
+    out = st.continuation_join(cur_tail, new_region)
+    assert out.shape == (1, 8, 10)           # same length as new_region
+    # first frame blended toward cur_tail (0), last frames untouched (1)
+    assert out[..., 0].abs().mean() < 0.1
+    assert torch.allclose(out[..., -1], torch.ones(1, 8))
+
+
+def test_transition_join_length():
+    st = CrossfadeStitcher(blend_frames=3)
+    out = st.transition_join(torch.zeros(1, 8, 5), torch.ones(1, 8, 5), n=5)
+    assert out.shape == (1, 8, 5)
+    assert torch.allclose(out[..., 0], torch.zeros(1, 8), atol=1e-5)
+    assert torch.allclose(out[..., -1], torch.ones(1, 8), atol=1e-5)
+
+
+def test_drift_monitor_flags_collapse():
+    m = DriftMonitor(rms_drop_frac=0.6)
+    for _ in range(5):
+        st = m.observe(torch.randn(1, 8, 16))   # ~unit RMS
+        assert m.should_reanchor(st) is False
+    collapsed = m.observe(torch.randn(1, 8, 16) * 0.05)  # RMS collapse
+    assert m.should_reanchor(collapsed) is True
+
+
+def test_fake_generator_honors_prefix_and_shape():
+    g = FakeChunkGenerator(channels=8)
+    prefix = torch.full((1, 8, 4), 0.5)
+    out = g.generate("p", prefix_latents=prefix, prefix_frames=4, n_frames=10, seed=0)
+    assert out.shape == (1, 8, 10)
+    assert torch.allclose(out[..., :4], prefix)        # clamp region preserved
+    assert torch.allclose(out[..., 4:], out[..., 4:5].expand(1, 8, 6))  # constant tail
+
+
+def test_chunkgenerator_is_abstract():
+    with pytest.raises(TypeError):
+        ChunkGenerator()
+
+
+def test_fake_generator_no_prefix_returns_constant():
+    g = FakeChunkGenerator(channels=4)
+    out = g.generate("p", prefix_latents=None, prefix_frames=0, n_frames=6, seed=0)
+    assert out.shape == (1, 4, 6)
+    assert torch.allclose(out, torch.ones(1, 4, 6))  # first call -> fill value 1.0
+
+
+def test_renderer_length_and_continuity():
+    g = FakeChunkGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    lat = r.render_latents(PromptSchedule("x"), total_frames=50, base_seed=0)
+    assert lat.shape == (1, 8, 50)                    # exact requested length
+    assert torch.isfinite(lat).all()
+    assert len(r.drift_log) >= 3                      # one entry per chunk
+
+
+def test_renderer_transition_branch_exact_length():
+    g = FakeChunkGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    sched = PromptSchedule([(0.0, "A"), (2.0, "B")], crossfade_sec=0.4)  # transition fires
+    lat = r.render_latents(sched, total_frames=60)
+    assert lat.shape == (1, 8, 60)
+    assert torch.isfinite(lat).all()
+
+
+def test_renderer_transition_zero_crossfade_floored():
+    # crossfade_sec rounds to 0 frames -> n must floor to >=1, not crash
+    g = FakeChunkGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    sched = PromptSchedule([(0.0, "A"), (2.0, "B")], crossfade_sec=0.02)
+    lat = r.render_latents(sched, total_frames=60)
+    assert lat.shape == (1, 8, 60)
+    assert torch.isfinite(lat).all()
+
+
+def test_parse_schedule_single_and_list():
+    from scripts.longform_render import parse_schedule  # noqa
+    assert parse_schedule("acid techno") == "acid techno"
+    assert parse_schedule("0:acid techno|30:breakdown pad") == [(0.0, "acid techno"), (30.0, "breakdown pad")]
+
+
+def test_parse_schedule_single_prompt_with_colon():
+    from scripts.longform_render import parse_schedule  # noqa
+    # a single prompt whose first word contains a colon must NOT parse as a schedule
+    assert parse_schedule("120bpm: deep techno") == "120bpm: deep techno"
+    assert parse_schedule("") == ""
+    # inner colons in a real schedule's prompt are preserved
+    assert parse_schedule("0:tense: strings|60:drop") == [(0.0, "tense: strings"), (60.0, "drop")]
+
+
+@pytest.mark.skipif(not _gpu_has_free_vram(), reason="needs GPU with >=6GB free VRAM")
+def test_sdedit_reanchor_preserves_shape():
+    from stable_audio_3 import StableAudioModel
+    from stable_audio_3.inference.longform import SDEditReanchor
+    m = StableAudioModel.from_pretrained("small-music-base", model_half=False)
+    r = SDEditReanchor(m)
+    C = m.model.io_channels
+    z = torch.randn(1, C, 128, device="cuda")
+    out = r.reanchor(z, sigma_peak=0.5, prompt="acid techno", seed=0)
+    assert out.shape == z.shape and torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not _gpu_has_free_vram(), reason="needs GPU with >=6GB free VRAM")
+def test_inpaint_continuation_shape_and_clamp():
+    from stable_audio_3 import StableAudioModel
+    m = StableAudioModel.from_pretrained("small-music-base", model_half=False)
+    g = InpaintContinuationGenerator(m)
+    C = m.model.io_channels
+    prefix = torch.randn(1, C, 16, device="cuda")
+    out = g.generate("acid techno", prefix_latents=prefix, prefix_frames=16,
+                     n_frames=128, seed=0)
+    assert out.shape == (1, C, 128) and torch.isfinite(out).all()
+    # clamp-hardness probe (informational): how close is the clamp region to the prefix?
+    err = (out[..., :16].cpu() - prefix.cpu()).abs().mean().item()
+    print(f"[clamp] mean abs err in clamp region = {err:.4e}")
+
+
+# ---------------------------------------------------------------------------
+# CPU tests: NaN-retry, fail-fast, drift canary
+# ---------------------------------------------------------------------------
+
+class _NanOnFirstCallGenerator(ChunkGenerator):
+    """Returns NaN-filled chunk on the very first call, finite constant chunks after."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+        self._call = 0
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        self._call += 1
+        if self._call == 1:
+            return torch.full((1, self.channels, n_frames), float("nan"))
+        return torch.full((1, self.channels, n_frames), float(self._call))
+
+
+class _AlwaysNanGenerator(ChunkGenerator):
+    """Always returns NaN-filled chunks."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        return torch.full((1, self.channels, n_frames), float("nan"))
+
+
+class _CollapsingGenerator(ChunkGenerator):
+    """Returns unit-scale randn for the first 3 calls, then ~0 amplitude."""
+
+    def __init__(self, channels: int):
+        self.channels = channels
+        self._call = 0
+
+    def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
+        self._call += 1
+        if self._call <= 3:
+            return torch.randn(1, self.channels, n_frames)
+        return torch.randn(1, self.channels, n_frames) * 0.01
+
+
+def test_renderer_nan_chunk_retries_then_succeeds():
+    """A NaN on the first chunk call triggers a retry; render completes all-finite."""
+    g = _NanOnFirstCallGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    lat = r.render_latents(PromptSchedule("x"), total_frames=40, base_seed=0)
+    assert lat.shape == (1, 8, 40)
+    assert torch.isfinite(lat).all()
+
+
+def test_renderer_nan_chunk_exhausts_retries_raises():
+    """A generator that always returns NaN should cause render_latents to raise RuntimeError."""
+    g = _AlwaysNanGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    with pytest.raises(RuntimeError, match="non-finite after"):
+        r.render_latents(PromptSchedule("x"), total_frames=40, base_seed=0)
+
+
+def test_renderer_drift_canary_warns():
+    """A collapsing generator should trigger a RuntimeWarning from the drift canary."""
+    # Use 4 chunks: window=20, overlap=5, total_frames=65 -> ceil((65)/(20-5))+1 >= 4 chunks
+    g = _CollapsingGenerator(channels=8)
+    r = LongFormRenderer(g, channels=8, fps=10.0, window_frames=20,
+                         overlap_frames=5, blend_frames=2)
+    with pytest.warns(RuntimeWarning, match="DriftMonitor canary"):
+        r.render_latents(PromptSchedule("x"), total_frames=65, base_seed=0)
