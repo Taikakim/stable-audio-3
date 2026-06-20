@@ -8,9 +8,10 @@ alongside a training job. Motivated by the cgisky `stable-audio-3-rs` MNN port
 
 **Status (2026-06-20):** **GPU-VERIFIED.** Decoder runs 100% on the MIGraphX EP
 (zero CPU fallback), numerically identical to torch (cos=0.999998), RTF ~39×
-post-compile → ONNX inference on AMD works. Operational catch: a ~9-min MIGraphX
-AOT compile per session (caching not exposed in this ORT build — compile once in a
-long-lived server). Multi-chunk overlap-add **seam** test still TODO.
+post-compile → ONNX inference on AMD works. Multi-chunk overlap-add **seam test
+passes** (overlap=16: ONNX-chunked vs torch-unchunked cos=0.999997, no boundary
+spikes). Operational catch: a ~9-min MIGraphX AOT compile per session (caching not
+exposed in this ORT build — compile once in a long-lived server).
 
 ## GPU verification (RX 9070 XT, mir venv onnxruntime_migraphx 1.23.2)
 
@@ -136,10 +137,12 @@ the heavy ops on the GPU EP (not CPU fallback) AND `--compare-torch` cos ≈ 0.9
 
 ## Caveats / open items
 
-- **Seam not yet validated.** Single-chunk graphs match torch; the overlap-add
-  stitch across chunks (`decode_onnx.py`) needs a `--compare-torch` run to set
-  `--overlap` ≥ the decoder's receptive field (raise it until the seam diff is
-  negligible).
+- **Seam validated (2026-06-20, overlap=16, 512-latent/4-chunk, CPU).** torch's own
+  chunked≈unchunked (cos=1.000004, max|Δ|=6.7e-4) confirms overlap=16 ≥ receptive field;
+  ONNX-chunked vs torch-unchunked cos=0.999997; per-boundary local max|Δ| (1.5e-4…3.5e-4)
+  is the same order as everywhere else → no seam artefacts. The stitch is EP-independent,
+  so this also covers the MIGraphX path (per-chunk already cos=0.999998). Raise `--overlap`
+  only if a future export changes the decoder's receptive field.
 - **Encoder parity.** The export wrapper calls `AudioAutoencoder.encode` directly
   and skips the auto-resample/length-pad that `AutoencoderModel.encode` does to
   produce the stored `latents_sa3/*.npy`. Cross-check encoder output against a
