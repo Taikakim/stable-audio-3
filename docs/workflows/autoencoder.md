@@ -53,6 +53,10 @@ audio_out = ae.decode(latents, chunked=True, chunk_size=128, overlap=32)
 
 The overlap should be at least as large as the model's receptive field. A value of 32 is a reasonable default.
 
+> **Low-VRAM AMD decode.** This same fixed-chunk decode is what makes the autoencoder exportable to
+> ONNX for AMD (ORT + MIGraphX) — export one fixed chunk, loop + overlap-add on the host. See
+> [`docs/onnx-amd-inference.md`](../onnx-amd-inference.md) (GPU-verified; overlap=16 validated seam-free for `same-l`).
+
 ## Saving and loading latents
 
 ```python

@@ -313,6 +313,9 @@ This is intentional to avoid false positives on complex numerical code.
 - **Inference methods**: `docs/workflows/inference.md` — detailed guide to all generation modes
 - **LoRA training**: `docs/workflows/lora.md` — fine-tuning setup and best practices
 - **Autoencoder workflows**: `docs/workflows/autoencoder.md` — encoding/decoding and batch processing
+- **ONNX / AMD inference**: `docs/onnx-amd-inference.md` — exporting the SAME autoencoder to ONNX
+  for low-VRAM AMD decode (ORT + MIGraphX); the FlexAttention/opset-18 export gotchas, GPU-verified
+  results (cos 0.999998, RTF ~39×), and the low-VRAM decode server (`mir/scripts/latent_server_onnx.py`)
 - **Prompting guide**: `docs/guides/prompting.md` — prompt engineering tips
 - **Model overview**: `docs/guides/model-overview.md` — architecture deep dive
 
