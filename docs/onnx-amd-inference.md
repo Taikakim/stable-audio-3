@@ -236,9 +236,14 @@ each holding the **assembled DiT conditioning** so the runtime is pure numpy/ORT
 - `cross_attn_mask` `[seq]` (bool/int)
 - `global_embed` `float32 [768]` — NumberConditioner over `seconds_start`/`seconds_total`
 
-## Open items
-- GPU: MIGraphX compile (likely > the AE's 9 min at 1.4B) + end-to-end **audio vs torch
-  `generate()`** correctness (the real check). Per-length compile = use a long-lived server.
-- **fp16 export** to cut the 5.5 GB/rung (and the ladder is 5×).
-- Confirm `medium-base` has no active `prepend_cond`/`input_concat` (the wrapper only feeds
-  cross_attn + global; if a model adds them, extend `DiTCore`).
+## Performance + open items
+- **DiT-only RTF ≈ 7.8×** (L256: 16 calls × 191 ms = 3.1 s for 23.8 s audio, batch=1 / 2-calls-per-step
+  CFG). A **batch=2 export** (one call/step) would ~halve it.
+- **⚠ Don't co-resident fp32 DiT + fp32 decoder on the 16 GB card.** The DiT weights are ~5.8 GB; with
+  it resident, compiling the decoder pushes VRAM to ~16.5 GB (spills to GTT) and the decoder compile
+  **thrashes — 31 min+ vs 9 min standalone**. Fix: run them as **separate processes** (gen with the
+  DiT, free it, then decode — or two long-lived servers like `latent_server_onnx.py`), or **fp16**
+  (`migraphx_fp16_enable`, no re-export, halves both). Per-rung compile is ~13 min → long-lived server.
+- **fp16** to cut the 5.8 GB/rung (ladder is 5× = ~29 GB; weights also aren't shared across rungs — dedup TODO).
+- `medium-base` conditioning confirmed = cross_attn + global + **local_add_cond (257, must be fed)**; no
+  active prepend/input_concat. If a variant adds them, extend `DiTCore`.
