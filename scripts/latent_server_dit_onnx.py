@@ -25,11 +25,14 @@ text-to-audio, but the DiT projects it with a bias so it MUST be fed, not omitte
 Boot
 ----
 Runs in the **mir venv** (`onnxruntime_migraphx`; the SA3 venv's ORT is CPU-only).
-At startup it AOT-compiles BOTH the DiT (~5.8 GB fp32) and the decoder on the
-MIGraphX **fp16 EP** by default (`migraphx_fp16_enable`) — critical so the two fit
-together on the 16 GB card (fp32-both saturates VRAM and the decoder compile
-thrashes). The compile is a one-time per-session cost (~min); it prints the active
-EP and warns loudly on silent CPU fallback. Pass `--no-fp16` to force fp32.
+At startup it AOT-compiles BOTH the DiT and the decoder once (~min each).
+
+**Low-VRAM = pass fp16-EXPORTED onnx files** (export_dit_onnx.py --fp16 + an fp16
+decoder). fp16 weights load directly as ~2.9 GB (DiT) + ~0.9 GB (decoder) so both
+co-reside on the 16 GB card. Do NOT use the `migraphx_fp16_enable` EP option for
+this — it loads the fp32 weights and quantizes at init, so DiT+decoder co-residency
+**OOMs** (measured). `--ep-fp16` is kept only for single-model fp16 speed where VRAM
+is ample; it is OFF by default. Prints the active EP, warns on silent CPU fallback.
 
 `--frames` (T) MUST match the DiT export's length rung (the DiT can't be chunked —
 full-sequence attention — so each length is its own compiled graph).
@@ -214,24 +217,24 @@ def main():
     ap.add_argument("--decode-chunk", type=int, default=128, help="MUST match the decoder export L")
     ap.add_argument("--decode-overlap", type=int, default=16, help=">= decoder receptive field")
     ap.add_argument("--provider", default="migraphx", help="migraphx | rocm | cpu")
-    ap.add_argument("--no-fp16", action="store_true",
-                    help="force the fp32 MIGraphX EP (default is fp16 so the DiT + decoder "
-                         "co-resident on the 16 GB card; fp32-both thrashes VRAM)")
+    ap.add_argument("--ep-fp16", action="store_true",
+                    help="opt-in migraphx_fp16_enable (single-model fp16 speed only; OOMs "
+                         "DiT+decoder co-residency — for low VRAM pass fp16-EXPORTED files instead)")
     ap.add_argument("--port", type=int, default=7894)
     args = ap.parse_args()
 
     _cond_dir = Path(args.cond_dir)
     _frames = args.frames
     _chunk, _overlap = args.decode_chunk, args.decode_overlap
-    _fp16 = not args.no_fp16
+    _fp16 = args.ep_fp16
     _model_name = args.dit_onnx.name
 
     import onnxruntime as ort
     providers = _make_providers(args.provider, _fp16)
     plain = [p[0] if isinstance(p, tuple) else p for p in providers]
-    print(f"[ort] providers: {plain}" + ("  (fp16 EP)" if _fp16 else "  (fp32 EP)"))
-    print(f"[ort] compiling DiT + decoder (one-time MIGraphX AOT here, ~min; "
-          f"fp16 so both fit on 16 GB) ...")
+    print(f"[ort] providers: {plain}" + ("  (fp16 EP — OOM-prone for co-residency)" if _fp16
+                                          else "  (plain EP; pass fp16 onnx files for low VRAM)"))
+    print(f"[ort] compiling DiT + decoder (one-time MIGraphX AOT here, ~min each) ...")
     t0 = time.time()
     _dit = ort.InferenceSession(str(args.dit_onnx), providers=providers)
     _dec = ort.InferenceSession(str(args.decoder_onnx), providers=providers)

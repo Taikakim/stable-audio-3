@@ -208,11 +208,18 @@ def main():
                   "(uv pip install onnxconverter-common onnx)")
         else:
             fp16_out = out.with_name(out.stem + "_fp16.onnx")
-            m = float16.convert_float_to_float16(onnx.load(str(out)), keep_io_types=True)
-            onnx.save(m, str(fp16_out))
-            sz = fp16_out.stat().st_size + Path(str(fp16_out) + ".data").stat().st_size \
-                if Path(str(fp16_out) + ".data").exists() else fp16_out.stat().st_size
-            print(f"[fp16] wrote {fp16_out} (~{sz / 1e9:.1f} GB; delete the fp32 to reclaim disk)")
+            # Path-based conversion + external-data save: the fp16 DiT is ~2.9 GB, over
+            # the 2 GB protobuf serialize limit, so the in-memory convert_float_to_float16
+            # raises "Failed to serialize proto". The *_model_path variant streams from disk.
+            m = float16.convert_float_to_float16_model_path(str(out), keep_io_types=True)
+            onnx.save_model(m, str(fp16_out), save_as_external_data=True,
+                            all_tensors_to_one_file=True, location=fp16_out.name + ".data",
+                            size_threshold=1024)
+            sz = fp16_out.stat().st_size + (Path(str(fp16_out) + ".data").stat().st_size
+                 if Path(str(fp16_out) + ".data").exists() else 0)
+            print(f"[fp16] wrote {fp16_out} (~{sz / 1e9:.1f} GB; ~cos 0.99999 vs fp32; "
+                  f"delete the fp32 onnx to reclaim disk). Load these for low-VRAM co-residency "
+                  f"— NOT migraphx_fp16_enable (which OOMs).")
 
     print("\n[next] one .onnx per ladder rung (256/512/1024/2048/4096); compile each once on\n"
           "MIGraphX (long-lived server at boot). Host loop = dit_onnx_infer.py:\n"

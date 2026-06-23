@@ -238,12 +238,20 @@ each holding the **assembled DiT conditioning** so the runtime is pure numpy/ORT
 
 ## Performance + open items
 - **DiT-only RTF ≈ 7.8×** (L256: 16 calls × 191 ms = 3.1 s for 23.8 s audio, batch=1 / 2-calls-per-step
-  CFG). A **batch=2 export** (one call/step) would ~halve it.
-- **⚠ Don't co-resident fp32 DiT + fp32 decoder on the 16 GB card.** The DiT weights are ~5.8 GB; with
-  it resident, compiling the decoder pushes VRAM to ~16.5 GB (spills to GTT) and the decoder compile
-  **thrashes — 31 min+ vs 9 min standalone**. Fix: run them as **separate processes** (gen with the
-  DiT, free it, then decode — or two long-lived servers like `latent_server_onnx.py`), or **fp16**
-  (`migraphx_fp16_enable`, no re-export, halves both). Per-rung compile is ~13 min → long-lived server.
-- **fp16** to cut the 5.8 GB/rung (ladder is 5× = ~29 GB; weights also aren't shared across rungs — dedup TODO).
+  CFG). A **batch=2 export** (one call/step, cos 1.0) would ~halve it — `export_dit_onnx.py --batch 2`.
+- **⚠ VRAM: don't co-resident fp32 DiT + fp32 decoder on the 16 GB card.** The DiT weights are ~5.8 GB;
+  with it resident, compiling the decoder pushes VRAM to ~16.5 GB (spills to GTT) and the decoder compile
+  **thrashes — 31 min+ vs 9 min standalone**.
+- **The fix is fp16-EXPORTED onnx files, NOT the `migraphx_fp16_enable` EP option.** Export fp16 with
+  `export_dit_onnx.py --fp16` (uses `convert_float_to_float16_model_path` + external-data save — the
+  >2 GB fp16 DiT overflows the in-memory protobuf path). fp16 files load directly: **DiT 2.9 GB + decoder
+  0.9 GB = 3.8 GB resident**, both co-reside easily. Validated: fp16 DiT vs fp32 cos = **0.999992** (0.5 %
+  rel). The `migraphx_fp16_enable` EP option does the **opposite** of helping — it loads the fp32 weights
+  then quantizes at session init, so DiT+decoder co-residency **OOMs harder** (HIP out-of-memory, measured).
+  Use it only for single-model fp16 speed where VRAM is ample. (Or run the two as **separate processes**.)
+- **Tools added:** `bench_dit_onnx.py` (ONNX-vs-torch generation benchmark — same seed/schedule/cond/cfg,
+  warm-median latency, device VRAM, z0 cosine; fairness-reviewed) and `latent_server_dit_onnx.py`
+  (low-VRAM gen server: compile DiT+decoder once at boot, `/generate?cond=&uncond=` → WAV; pass fp16 files).
+- The fp16 ladder halves the 5.8 GB/rung; weights also aren't shared across rungs (dedup TODO).
 - `medium-base` conditioning confirmed = cross_attn + global + **local_add_cond (257, must be fed)**; no
   active prepend/input_concat. If a variant adds them, extend `DiTCore`.
