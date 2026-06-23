@@ -252,6 +252,23 @@ each holding the **assembled DiT conditioning** so the runtime is pure numpy/ORT
 - **Tools added:** `bench_dit_onnx.py` (ONNX-vs-torch generation benchmark — same seed/schedule/cond/cfg,
   warm-median latency, device VRAM, z0 cosine; fairness-reviewed) and `latent_server_dit_onnx.py`
   (low-VRAM gen server: compile DiT+decoder once at boot, `/generate?cond=&uncond=` → WAV; pass fp16 files).
+  Server **end-to-end smoke-tested on the CPU EP** (boot → `/status` → `/generate` → valid 23.8 s WAV).
+
+  **Running the benchmark (needs a FREE GPU — each onnx backend AOT-compiles ~13 min and the torch
+  baseline needs VRAM; co-residency with a training run OOMs):** one backend per run, in its venv —
+  ```
+  # torch baseline (SA3 venv):
+  .venv/bin/python scripts/bench_dit_onnx.py --backend torch \
+    --dit-onnx dit_medium-base_L256.onnx --decoder-onnx same_decoder_L128.onnx \
+    --cond /tmp/real.cond.npz --uncond /tmp/real.uncond.npz --frames 256 --json /tmp/bench_torch.json
+  # ONNX fp16 on MIGraphX (mir venv) — point at the fp16 FILES, plain EP (NOT --backend onnx-migraphx-fp16,
+  # whose migraphx_fp16_enable OOMs): use the corrected runner / bench onnx-migraphx backend with fp16 onnx.
+  /home/kim/Projects/mir/mir/bin/python scripts/bench_dit_onnx.py --backend onnx-migraphx \
+    --dit-onnx dit_medium-base_L256_fp16.onnx --decoder-onnx same_decoder_L128_fp16.onnx \
+    --cond /tmp/real.cond.npz --uncond /tmp/real.uncond.npz --frames 256 --json /tmp/bench_onnx_fp16.json
+  ```
+  Then compare the `vram_warm_gb` / `gen_s` / `rtf` rows and the saved `*.z0.npy` cosine. (z0-vs-torch is
+  already cos 0.9999 on CPU; the benchmark adds the device latency/VRAM head-to-head.)
 - The fp16 ladder halves the 5.8 GB/rung; weights also aren't shared across rungs (dedup TODO).
 - `medium-base` conditioning confirmed = cross_attn + global + **local_add_cond (257, must be fed)**; no
   active prepend/input_concat. If a variant adds them, extend `DiTCore`.
