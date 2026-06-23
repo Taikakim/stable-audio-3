@@ -164,11 +164,13 @@ The autoencoder is the cheap end; the **DiT** is the per-step hot loop. With tex
 generation can run on MIGraphX. Tooling: `scripts/export_dit_onnx.py` (export) +
 `scripts/dit_onnx_infer.py` (host sampler/runner, mir venv).
 
-**Status (2026-06-23):** DiT end-to-end **VALIDATED vs torch** for a real prompt.
-`medium-base` L256: ONNX vs torch `_forward` cos=1.000000; **full 8-step generation
-(real t5gemma conditioning) ONNX z0 vs torch z0 cos=0.999944** → the ONNX text→audio
-pipeline reproduces torch. Earlier MIGraphX run (the pre-fix export) hit cos=1.0,
-100% on-EP, 233 ms/call, ~12-min compile — re-verify on GPU after the local_add fix.
+**Status (2026-06-23):** DiT **GPU-VERIFIED end-to-end** for a real prompt.
+`medium-base` L256: ONNX vs torch `_forward` cos=1.000000; **corrected DiT on MIGraphX
+vs CPU cos=1.000000, 100% on-EP (no CPU fallback), 191 ms/call, ~13-min compile**;
+**full 8-step generation (real t5gemma conditioning) ONNX z0 vs torch z0 cos=0.999944**
+→ the ONNX text→audio pipeline reproduces torch on the AMD GPU. Real audio produced
+(structured/low-heavy, not noise). Ladder exported: L∈{256,512,1024,2048,4096} (each
+8.8 MB graph + 5.8 GB weights — they don't share weights yet, ~29 GB total; dedup TODO).
 
 **Critical correctness fix — `local_add_cond` must be fed, not omitted.** medium-base's
 DiT takes a 257-ch `local_add_cond` = cat(`inpaint_mask`[1], `inpaint_masked_input`[256]);
