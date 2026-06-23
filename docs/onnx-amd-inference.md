@@ -154,3 +154,73 @@ the heavy ops on the GPU EP (not CPU fallback) AND `--compare-torch` cos ≈ 0.9
 - **INT8 is a stretch on MIGraphX** (coverage is uneven). FP16 is the safe target.
 - These are `same-l` exports (the `latents_sa3` AE). `--model same-s` for the
   Small/CPU variant.
+
+---
+
+# DiT → ONNX (full text→audio on AMD)
+
+The autoencoder is the cheap end; the **DiT** is the per-step hot loop. With text
+**precached** (T5-Gemma run offline) the DiT export is clean and the whole
+generation can run on MIGraphX. Tooling: `scripts/export_dit_onnx.py` (export) +
+`scripts/dit_onnx_infer.py` (host sampler/runner, mir venv).
+
+**Status (2026-06-21):** DiT export **CPU-validated** — `medium-base` at L256,
+ONNX vs torch `_forward` **cos=1.000000** (max|Δ|=1.8e-4). The 1.4B DiT
+(rotary + adaLN + cross-attention) exports with the *same* recipe as the AE
+(flash-off + opset 18); it was structurally friendlier (no chunk-folding, global
+self-attention → plain SDPA). GPU/MIGraphX run + end-to-end audio-vs-torch still TODO.
+
+## Why a ladder of fixed lengths
+
+The DiT does full-sequence self-attention every step → can't be chunked; the whole
+`T` is one graph. It has no length-dependent control flow, so a *dynamic-axis*
+export would trace — but MIGraphX compiles per static shape and this build can't
+cache, so dynamic = a fresh ~min compile per distinct T. So: export a **ladder**
+`T ∈ {256, 512, 1024, 2048, 4096}` (= 23.8/47.5/95/190/380 s, power-of-2, matches
+the `latents_sa3` grid), compile each once, pad requests up to the smallest rung.
+
+## Export target + recipe
+
+Export `DiffusionTransformer._forward` — the **CFG-free core**. The export builds
+the **DiT only** (`DiTWrapper(**diffusion.config)` + the `model.model.*` weights
+from the cached `medium-base` safetensors) — **no T5-Gemma** (precached, and it
+isn't even downloaded). Inputs (B=1, two fixed dims `T` and text `seq`):
+`x[1,256,T]`, `t[1]`, `cross_attn_cond[1,seq,768]`, `cross_attn_cond_mask[1,seq]`,
+`global_embed[1,768]`. Output: velocity `[1,256,T]`. Runs on CPU (RAM);
+artefact ≈ 8 MB graph + ~5.5 GB `.onnx.data` fp32 per rung (**export fp16 to halve**).
+
+```bash
+for L in 256 512 1024 2048 4096; do
+  python scripts/export_dit_onnx.py --model medium-base --frames $L --text-seq 128 --validate
+done
+```
+
+## Host loop (rectified-flow, CFG)
+
+CFG collapses to velocity space (rectified-flow, vanilla): per step, one DiT call on
+the stacked `[cond; uncond]` batch, then `v = v_uncond + cfg·(v_cond − v_uncond)`;
+`x += dt·v`. Schedule = `linspace(1,0,steps+1)` warped by the SD3/Flux time-shift —
+**identity for medium-base** (`alpha_min=alpha_max=1.0`). Final `z0 → same_decoder
+ONNX (chunk-loop) → wav`. All numpy + ORT; no `stable_audio_3` at runtime.
+
+```bash
+python scripts/dit_onnx_infer.py --dit-onnx dit_medium-base_L256.onnx \
+    --decoder-onnx same_decoder_L128.onnx --cond cond.npz --uncond uncond.npz \
+    --frames 256 --steps 8 --cfg-scale 6.0 --provider migraphx --out gen.wav
+```
+
+## Precache contract (produced offline in the SA3 venv)
+
+Per (prompt, duration), emit a `cond.npz` and an `uncond.npz` (negative/empty prompt)
+each holding the **assembled DiT conditioning** so the runtime is pure numpy/ORT:
+- `cross_attn_cond` `float32 [seq,768]` — T5-Gemma `b-b-ul2` embeddings, **padded to a
+  fixed `seq`** (matching `--text-seq`)
+- `cross_attn_mask` `[seq]` (bool/int)
+- `global_embed` `float32 [768]` — NumberConditioner over `seconds_start`/`seconds_total`
+
+## Open items
+- GPU: MIGraphX compile (likely > the AE's 9 min at 1.4B) + end-to-end **audio vs torch
+  `generate()`** correctness (the real check). Per-length compile = use a long-lived server.
+- **fp16 export** to cut the 5.5 GB/rung (and the ladder is 5×).
+- Confirm `medium-base` has no active `prepend_cond`/`input_concat` (the wrapper only feeds
+  cross_attn + global; if a model adds them, extend `DiTCore`).

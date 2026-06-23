@@ -172,3 +172,5 @@ wandb/*
 same_*.onnx
 same_*.onnx.data
 *.onnx.data
+dit_*.onnx
+dit_*.onnx.data
