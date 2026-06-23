@@ -79,6 +79,9 @@ def main():
     ap.add_argument("--decode-chunk", type=int, default=128, help="MUST match the decoder export L")
     ap.add_argument("--decode-overlap", type=int, default=16)
     ap.add_argument("--provider", default="migraphx")
+    ap.add_argument("--ep-fp16", action="store_true",
+                    help="run the MIGraphX EP in fp16 — halves VRAM so the fp32 DiT (~5.8GB) "
+                         "and decoder fit together on 16GB without thrashing, and is faster")
     ap.add_argument("--alpha-min", type=float, default=1.0)
     ap.add_argument("--alpha-max", type=float, default=1.0)
     ap.add_argument("--out", type=Path, default=Path("dit_gen.wav"))
@@ -88,7 +91,11 @@ def main():
     import soundfile as sf
 
     providers = pick_providers(args.provider)
-    print(f"[ort] providers: {providers}")
+    if args.ep_fp16:
+        providers = [("MIGraphXExecutionProvider", {"migraphx_fp16_enable": "1"})
+                     if p == "MIGraphXExecutionProvider" else p for p in providers]
+    print(f"[ort] providers: {[p[0] if isinstance(p, tuple) else p for p in providers]}"
+          + (" (fp16 EP)" if args.ep_fp16 else ""))
     print("[ort] compiling DiT + decoder (one-time MIGraphX AOT here) ...")
     t0 = time.time()
     dit = ort.InferenceSession(str(args.dit_onnx), providers=providers)

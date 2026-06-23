@@ -125,6 +125,10 @@ def main():
     ap.add_argument("--global-dim", type=int, default=768, help="global_cond_dim")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--batch", type=int, default=1,
+                    help="export batch size; 2 = stack cond+uncond so CFG is one DiT call/step")
+    ap.add_argument("--fp16", action="store_true",
+                    help="also write an fp16 copy (halves the ~5.8GB/rung on disk; needs onnxconverter-common)")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
@@ -142,20 +146,20 @@ def main():
     args.global_dim = int(diff_cfg.get("global_cond_dim", args.global_dim))
     args.local_add_dim = int(diff_cfg.get("local_add_cond_dim", 0))
 
-    T, seq = args.frames, args.text_seq
-    print(f"[info] export shapes: x[1,{LATENT_DIM},{T}] t[1] "
-          f"cross_attn[1,{seq},{args.cond_dim}] mask[1,{seq}] global[1,{args.global_dim}] "
-          f"local_add[1,{args.local_add_dim},{T}]")
+    T, seq, B = args.frames, args.text_seq, args.batch
+    print(f"[info] export shapes (batch={B}): x[{B},{LATENT_DIM},{T}] t[{B}] "
+          f"cross_attn[{B},{seq},{args.cond_dim}] mask[{B},{seq}] global[{B},{args.global_dim}] "
+          f"local_add[{B},{args.local_add_dim},{T}]")
 
     wrap = DiTCore(dit).eval()
     dev = args.device
     dummy = (
-        torch.randn(1, LATENT_DIM, T, device=dev),
-        torch.rand(1, device=dev),                                   # t in [0,1]
-        torch.randn(1, seq, args.cond_dim, device=dev),              # cross_attn_cond
-        torch.ones(1, seq, dtype=torch.bool, device=dev),            # cross_attn_cond_mask
-        torch.randn(1, args.global_dim, device=dev),                 # global_embed
-        torch.randn(1, args.local_add_dim, T, device=dev),           # local_add_cond (zeros at runtime)
+        torch.randn(B, LATENT_DIM, T, device=dev),
+        torch.rand(B, device=dev),                                   # t in [0,1]
+        torch.randn(B, seq, args.cond_dim, device=dev),              # cross_attn_cond
+        torch.ones(B, seq, dtype=torch.bool, device=dev),            # cross_attn_cond_mask
+        torch.randn(B, args.global_dim, device=dev),                 # global_embed
+        torch.randn(B, args.local_add_dim, T, device=dev),           # local_add_cond (zeros at runtime)
     )
     in_names = ["x", "t", "cross_attn_cond", "cross_attn_cond_mask", "global_embed", "local_add_cond"]
 
@@ -165,7 +169,8 @@ def main():
         ref = wrap(*dummy)
     print(f"[torch] -> {tuple(ref.shape)} in {time.time() - t0:.1f}s")
 
-    out = args.out or Path(f"dit_{args.model}_L{T}.onnx")
+    bsuf = f"_b{B}" if B != 1 else ""
+    out = args.out or Path(f"dit_{args.model}_L{T}{bsuf}.onnx")
     print(f"[onnx] exporting opset {args.opset} -> {out}")
     t0 = time.time()
     with torch.no_grad():
@@ -193,6 +198,21 @@ def main():
             print(f"[validate] max|Δ|={np.abs(r - o).max():.3e} (rel {rel:.2%})  cos={cos:.6f}")
             print("[validate] ok" if cos > 0.9999 and rel < 0.05 else
                   "[validate] WARNING: larger diff than expected")
+
+    if args.fp16:
+        try:
+            from onnxconverter_common import float16
+            import onnx
+        except ImportError:
+            print("[fp16] onnxconverter-common/onnx not installed — skipping "
+                  "(uv pip install onnxconverter-common onnx)")
+        else:
+            fp16_out = out.with_name(out.stem + "_fp16.onnx")
+            m = float16.convert_float_to_float16(onnx.load(str(out)), keep_io_types=True)
+            onnx.save(m, str(fp16_out))
+            sz = fp16_out.stat().st_size + Path(str(fp16_out) + ".data").stat().st_size \
+                if Path(str(fp16_out) + ".data").exists() else fp16_out.stat().st_size
+            print(f"[fp16] wrote {fp16_out} (~{sz / 1e9:.1f} GB; delete the fp32 to reclaim disk)")
 
     print("\n[next] one .onnx per ladder rung (256/512/1024/2048/4096); compile each once on\n"
           "MIGraphX (long-lived server at boot). Host loop = dit_onnx_infer.py:\n"
