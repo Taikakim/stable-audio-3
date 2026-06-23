@@ -164,11 +164,16 @@ The autoencoder is the cheap end; the **DiT** is the per-step hot loop. With tex
 generation can run on MIGraphX. Tooling: `scripts/export_dit_onnx.py` (export) +
 `scripts/dit_onnx_infer.py` (host sampler/runner, mir venv).
 
-**Status (2026-06-21):** DiT export **CPU-validated** — `medium-base` at L256,
-ONNX vs torch `_forward` **cos=1.000000** (max|Δ|=1.8e-4). The 1.4B DiT
-(rotary + adaLN + cross-attention) exports with the *same* recipe as the AE
-(flash-off + opset 18); it was structurally friendlier (no chunk-folding, global
-self-attention → plain SDPA). GPU/MIGraphX run + end-to-end audio-vs-torch still TODO.
+**Status (2026-06-23):** DiT **GPU-VERIFIED** on MIGraphX. `medium-base` L256:
+export vs torch `_forward` cos=1.000000; **MIGraphX vs CPU/torch cos=1.000000, 100%
+on the MIGraphX EP (zero CPU fallback), 233 ms/call** (warm, batch=1); ~12-min one-time
+AOT compile. The full pipeline (sampler + CFG + decode → WAV) runs end-to-end. The 1.4B
+DiT exports with the *same* recipe as the AE (flash-off + opset 18) and was structurally
+friendlier (no chunk-folding, global self-attn → plain SDPA). **Only a real-prompt
+audio-vs-torch comparison remains — it needs the cached T5-Gemma embeddings** (t5gemma
+not downloaded; prompts ARE in the `latents_sa3` json). The DiT is exported static
+**batch=1** → CFG runs as two batch-1 calls/step; a batch=2 export would make CFG one
+call/step (efficiency option).
 
 ## Why a ladder of fixed lengths
 

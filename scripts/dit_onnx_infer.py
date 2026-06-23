@@ -7,11 +7,12 @@ Pipeline (text precached offline in the SA3 venv → pure numpy/ORT at runtime):
 
     cond/uncond .npz {cross_attn_cond[seq,768], cross_attn_mask[seq], global_embed[768]}
         │
-        ▼  rectified-flow Euler, CFG batch-2
+        ▼  rectified-flow Euler, CFG (two batch-1 DiT calls/step)
     DiT-onnx[L]  ×steps   →  z0[1,256,T]  →  same_decoder ONNX (chunk-loop)  →  wav
 
-CFG simplifies (rectified-flow, vanilla): per step one DiT call on the stacked
-[cond;uncond] batch, then  v = v_uncond + cfg·(v_cond − v_uncond);  x += dt·v.
+CFG simplifies (rectified-flow, vanilla): per step a cond + uncond DiT call, then
+v = v_uncond + cfg·(v_cond − v_uncond);  x += dt·v. (The DiT is exported static
+batch=1; a batch=2 export would let CFG be one call/step — an efficiency option.)
 
 Runs in the **mir venv** (onnxruntime_migraphx). Reuses decode_onnx's validated
 decoder chunk-loop. `--frames` (T) MUST match the DiT export's length rung.
@@ -99,11 +100,14 @@ def main():
     u_cross, u_mask, u_glob = load_cond(args.uncond)
     T = args.frames
 
-    # Stacked [cond; uncond] conditioning — constant across steps.
-    cross = np.concatenate([c_cross[None], u_cross[None]], 0)              # [2,seq,768]
-    mask = np.concatenate([c_mask[None], u_mask[None]], 0)
-    glob = np.concatenate([c_glob[None], u_glob[None]], 0)                 # [2,768]
-    names = [i.name for i in dit.get_inputs()]
+    # CFG = two batch-1 DiT calls/step (cond, then uncond). The DiT is exported
+    # static batch=1; batched CFG would need a batch=2 export (one call/step) — an
+    # efficiency optimization, not required for correctness.
+    def dit_v(cross1, mask1, glob1, t_cur):
+        return dit.run(None, {
+            "x": x, "t": np.full((1,), t_cur, np.float32),
+            "cross_attn_cond": cross1[None], "cross_attn_cond_mask": mask1[None],
+            "global_embed": glob1[None]})[0]
 
     rng = np.random.default_rng(args.seed)
     x = rng.standard_normal((1, LATENT_DIM, T)).astype(np.float32)         # sigma_max=1.0
@@ -113,16 +117,12 @@ def main():
     t0 = time.time()
     for i in range(args.steps):
         t_cur, dt = float(sig[i]), float(sig[i + 1] - sig[i])
-        xb = np.concatenate([x, x], 0)                                    # [2,256,T]
-        feeds = {
-            names[0]: xb,
-            "t": np.full((2,), t_cur, np.float32),
-            "cross_attn_cond": cross,
-            "cross_attn_cond_mask": mask,
-            "global_embed": glob,
-        }
-        vb = dit.run(None, feeds)[0]                                      # [2,256,T]
-        v = vb[1:2] + args.cfg_scale * (vb[0:1] - vb[1:2])               # CFG (vel space)
+        v_cond = dit_v(c_cross, c_mask, c_glob, t_cur)
+        if args.cfg_scale == 1.0:
+            v = v_cond
+        else:
+            v_unc = dit_v(u_cross, u_mask, u_glob, t_cur)
+            v = v_unc + args.cfg_scale * (v_cond - v_unc)                  # CFG (velocity space)
         x = x + dt * v
     print(f"[gen] {args.steps} steps in {time.time() - t0:.2f}s -> z0 {x.shape}")
 
