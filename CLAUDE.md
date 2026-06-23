@@ -251,22 +251,23 @@ uv sync --no-install-package torch --no-install-package torchaudio
 
 See the README for available CUDA variants and their requirements.
 
-### Flash Attention 2
+### Flash Attention 2 — RDNA4 / Composable-Kernel (NOT the CUDA wheel)
 
-**Required for the Medium model** (automatically detected in tests via `test_flash_attention_available`).
+**Required for the Medium model.** On our hardware (AMD RDNA4, gfx1201, RX 9070 XT) the CUDA prebuilt
+wheels are useless — we use the **CK-backend `flash_attn 2.8.4`** built for gfx1201, already present in
+`.venv` (torch 2.10/2.12 ROCm).
 
-Flash Attention is **not** listed in `pyproject.toml` because it's not published on PyPI with wide platform coverage. Install manually:
+**Activation — do it for every run; it's 30–100% faster than the fallback:**
 
 ```bash
-# Pre-built wheel (recommended)
-uv pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.6.3+cu126torch2.7-cp310-cp310-linux_x86_64.whl
-
-# Or build from source (slow)
-uv pip install ninja
-FLASH_ATTENTION_SKIP_CUDA_BUILD=FALSE TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=8 uv pip install flash-attn --no-build-isolation ...
+export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE   # MUST be set before `import torch` / `flash_attn`
 ```
 
-Note: `uv sync --inexact` preserves flash-attn without the lockfile.
+Without it the wrapper auto-routes to the `aiter` Triton-AMD backend → `No module named 'aiter'` +
+`flash_attn not installed, disabling Flash Attention` → SDPA/flex fallback (the slow path). FA
+**training** (LoRA / control-adapter backprop through the DiT) is safe — the `FlashAttnFunc.backward`
+13-gradient patch is applied. Build + verify recipe: **`../docs/flash-attn-ck-rdna4.md`** (canonical
+cross-repo note: `SAO/MASTER.md` §5). `uv sync --inexact` preserves the built flash-attn.
 
 ### ROCm Support
 
