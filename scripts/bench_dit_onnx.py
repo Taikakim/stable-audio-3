@@ -202,8 +202,9 @@ def make_onnx_backend(args, inp, fp16: bool):
             "global_embed": glob1[None], "local_add_cond": local_add})[0]
 
     def generate():
-        """One full generation: rectified-flow Euler loop (CFG) + decode -> (z0, audio)."""
+        """One full generation: rectified-flow Euler loop (CFG) + decode -> (z0, audio, dit_s)."""
         x = inp["x0"].copy()
+        t_dit = time.time()
         for i in range(args.steps):
             t_cur, dt = float(sig[i]), float(sig[i + 1] - sig[i])
             v_cond = dit_v(x, inp["c_cross"], inp["c_mask"], inp["c_glob"], t_cur)
@@ -213,8 +214,9 @@ def make_onnx_backend(args, inp, fp16: bool):
                 v_unc = dit_v(x, inp["u_cross"], inp["u_mask"], inp["u_glob"], t_cur)
                 v = v_unc + cfg * (v_cond - v_unc)                     # CFG (velocity space)
             x = x + dt * v
+        dit_s = time.time() - t_dit            # DiT loop only — the fair ONNX-vs-torch number
         audio = decode_chunked_onnx(dec, x, args.decode_chunk, args.decode_overlap, DS)
-        return x.astype(np.float32), audio
+        return x.astype(np.float32), audio, dit_s
 
     return generate
 
@@ -273,6 +275,7 @@ def make_torch_backend(args, inp):
     def generate():
         """SAME loop as ONNX, in torch fp16 on cuda; decode via the shared ONNX decoder."""
         x = torch.from_numpy(inp["x0"]).to(dev, DTYPE)
+        torch.cuda.synchronize(); t_dit = time.time()
         with torch.no_grad():
             for i in range(args.steps):
                 t_cur, dt = float(sig[i]), float(sig[i + 1] - sig[i])
@@ -283,9 +286,10 @@ def make_torch_backend(args, inp):
                     v_unc = dit_v(x, u_cross, u_mask, u_glob, t_cur)
                     v = v_unc + cfg * (v_cond - v_unc)                # CFG (velocity space)
                 x = x + dt * v
+        torch.cuda.synchronize(); dit_s = time.time() - t_dit   # DiT loop only (cuda-synced)
         z0 = x.float().cpu().numpy()
         audio = decode_chunked_onnx(dec, z0, args.decode_chunk, args.decode_overlap, DS)
-        return z0.astype(np.float32), audio
+        return z0.astype(np.float32), audio, dit_s
 
     return generate
 
@@ -344,7 +348,7 @@ def main():
     # warmup of kernels (torch). Track peak across the whole process (incl. compile).
     with VramSampler(baseline_bytes=_PROCESS_BASELINE_BYTES) as vram_full:
         t0 = time.time()
-        z0, audio = generate()                                        # cold
+        z0, audio, _ = generate()                                     # cold
         if _torch is not None:
             _torch.cuda.synchronize()                                 # sync before timing cold_s
         cold_s = time.time() - t0
@@ -352,16 +356,23 @@ def main():
         # WARM: median over --runs of the full generation (DiT loop + decode).
         # Track VRAM separately so the steady-state number excludes compile transients.
         with VramSampler(baseline_bytes=_PROCESS_BASELINE_BYTES) as vram_warm:
-            times = []
+            times, dit_times = [], []
             for _ in range(args.runs):
                 t0 = time.time()
-                z0, audio = generate()
+                z0, audio, dit_s = generate()
                 if _torch is not None:
                     _torch.cuda.synchronize()
                 times.append(time.time() - t0)
+                dit_times.append(dit_s)
 
     gen_s = float(np.median(times))
+    # dit_loop_s = the DiT sampling loop ONLY (decode excluded). This is the fair
+    # ONNX-vs-torch number: gen_s includes the shared ONNX decode, whose EP differs by
+    # venv (CPU-ORT for torch in the SA3 venv vs MIGraphX for the onnx backends), so
+    # gen_s is NOT comparable across backends — dit_loop_s is.
+    dit_loop_s = float(np.median(dit_times))
     rtf = audio_s / gen_s if gen_s > 0 else float("inf")
+    dit_rtf = audio_s / dit_loop_s if dit_loop_s > 0 else float("inf")
 
     if _torch is not None:
         torch_max_alloc_gb = round(_torch.cuda.max_memory_allocated() / 1e9, 3)
@@ -376,6 +387,7 @@ def main():
         backend=args.backend, model=args.model, frames=T, steps=args.steps,
         cfg_scale=args.cfg_scale, seed=args.seed, runs=args.runs,
         audio_s=round(audio_s, 2), cold_s=round(cold_s, 3), gen_s=round(gen_s, 3),
+        dit_loop_s=round(dit_loop_s, 3), dit_rtf=round(dit_rtf, 2),
         gen_runs_s=[round(t, 3) for t in times], rtf=round(rtf, 2),
         vram_warm_gb=round(vram_warm.peak_delta_gb, 3),   # steady-state: warm runs only
         vram_peak_gb=round(vram_full.peak_delta_gb, 3),   # incl. compile/load transients
@@ -390,6 +402,8 @@ def main():
         args.json.write_text(json.dumps(result, indent=2))
         print(f"[json] wrote {args.json}")
 
+    print(f"[done] {args.backend}: DiT-loop {dit_loop_s:.3f}s (RTF {dit_rtf:.1f}x)  "
+          f"[the fair ONNX-vs-torch number]")
     extra = f"  torch_max_alloc {torch_max_alloc_gb}GB" if torch_max_alloc_gb is not None else ""
     print(f"[done] {args.backend}: gen {gen_s:.3f}s (median/{args.runs})  RTF {rtf:.2f}x  "
           f"VRAM(warm) {vram_warm.peak_delta_gb:.2f}GB  VRAM(peak/incl-compile) {vram_full.peak_delta_gb:.2f}GB"
