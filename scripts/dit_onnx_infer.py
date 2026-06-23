@@ -103,11 +103,17 @@ def main():
     # CFG = two batch-1 DiT calls/step (cond, then uncond). The DiT is exported
     # static batch=1; batched CFG would need a batch=2 export (one call/step) — an
     # efficiency optimization, not required for correctness.
+    # local_add_cond = cat(inpaint_mask[1], inpaint_masked_input[256]) = 257ch; all
+    # zeros for text-to-audio (no inpaint). NOT a no-op (the DiT projects it with a
+    # bias) so it must be fed, not omitted.
+    LOCAL_ADD_DIM = 257
+    local_add = np.zeros((1, LOCAL_ADD_DIM, T), np.float32)
+
     def dit_v(cross1, mask1, glob1, t_cur):
         return dit.run(None, {
             "x": x, "t": np.full((1,), t_cur, np.float32),
             "cross_attn_cond": cross1[None], "cross_attn_cond_mask": mask1[None],
-            "global_embed": glob1[None]})[0]
+            "global_embed": glob1[None], "local_add_cond": local_add})[0]
 
     rng = np.random.default_rng(args.seed)
     x = rng.standard_normal((1, LATENT_DIM, T)).astype(np.float32)         # sigma_max=1.0
@@ -124,7 +130,9 @@ def main():
             v_unc = dit_v(u_cross, u_mask, u_glob, t_cur)
             v = v_unc + args.cfg_scale * (v_cond - v_unc)                  # CFG (velocity space)
         x = x + dt * v
-    print(f"[gen] {args.steps} steps in {time.time() - t0:.2f}s -> z0 {x.shape}")
+    print(f"[gen] {args.steps} steps in {time.time() - t0:.2f}s -> z0 {x.shape} "
+          f"range[{x.min():.2f},{x.max():.2f}]")
+    np.save(str(args.out) + ".z0.npy", x)
 
     audio = decode_chunked_onnx(dec, x, args.decode_chunk, args.decode_overlap, DS)
     a = np.clip(audio[0], -1.0, 1.0).T

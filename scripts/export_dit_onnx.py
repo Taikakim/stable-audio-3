@@ -95,17 +95,21 @@ def load_dit_only(model_name: str, device: str):
 
 class DiTCore(nn.Module):
     """CFG-free DiT forward: (x, t, cross_attn_cond, cross_attn_cond_mask,
-    global_embed) -> velocity. CFG batching/combine + sampling stay on the host."""
+    global_embed, local_add_cond) -> velocity. CFG batching/combine + sampling
+    stay on the host. local_add_cond [B,257,T] = cat(inpaint_mask, inpaint_masked
+    _input); for text-to-audio (no inpaint) it's all-zeros, but the DiT projects it
+    with a bias so it is NOT a no-op — must be fed (zeros), not omitted."""
     def __init__(self, dit):
         super().__init__()
         self.dit = dit
 
-    def forward(self, x, t, cross_attn_cond, cross_attn_cond_mask, global_embed):
+    def forward(self, x, t, cross_attn_cond, cross_attn_cond_mask, global_embed, local_add_cond):
         return self.dit._forward(
             x, t,
             cross_attn_cond=cross_attn_cond,
             cross_attn_cond_mask=cross_attn_cond_mask,
             global_embed=global_embed,
+            local_add_cond=local_add_cond,
         )
 
 
@@ -136,10 +140,12 @@ def main():
     # Pull conditioning dims from the config so the dummy inputs match exactly.
     args.cond_dim = int(diff_cfg.get("cond_token_dim", args.cond_dim))
     args.global_dim = int(diff_cfg.get("global_cond_dim", args.global_dim))
+    args.local_add_dim = int(diff_cfg.get("local_add_cond_dim", 0))
 
     T, seq = args.frames, args.text_seq
     print(f"[info] export shapes: x[1,{LATENT_DIM},{T}] t[1] "
-          f"cross_attn[1,{seq},{args.cond_dim}] mask[1,{seq}] global[1,{args.global_dim}]")
+          f"cross_attn[1,{seq},{args.cond_dim}] mask[1,{seq}] global[1,{args.global_dim}] "
+          f"local_add[1,{args.local_add_dim},{T}]")
 
     wrap = DiTCore(dit).eval()
     dev = args.device
@@ -149,8 +155,9 @@ def main():
         torch.randn(1, seq, args.cond_dim, device=dev),              # cross_attn_cond
         torch.ones(1, seq, dtype=torch.bool, device=dev),            # cross_attn_cond_mask
         torch.randn(1, args.global_dim, device=dev),                 # global_embed
+        torch.randn(1, args.local_add_dim, T, device=dev),           # local_add_cond (zeros at runtime)
     )
-    in_names = ["x", "t", "cross_attn_cond", "cross_attn_cond_mask", "global_embed"]
+    in_names = ["x", "t", "cross_attn_cond", "cross_attn_cond_mask", "global_embed", "local_add_cond"]
 
     print(f"[torch] reference forward at T={T} ...")
     t0 = time.time()
@@ -177,13 +184,7 @@ def main():
             print("[validate] onnxruntime not installed — skipping")
         else:
             sess = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
-            feeds = {
-                "x": dummy[0].cpu().numpy(),
-                "t": dummy[1].cpu().numpy(),
-                "cross_attn_cond": dummy[2].cpu().numpy(),
-                "cross_attn_cond_mask": dummy[3].cpu().numpy(),
-                "global_embed": dummy[4].cpu().numpy(),
-            }
+            feeds = {n: dummy[i].cpu().numpy() for i, n in enumerate(in_names)}
             o = sess.run(None, feeds)[0].astype(np.float32)
             r = ref.cpu().numpy().astype(np.float32)
             rel = float(np.abs(r - o).max() / (np.abs(r).max() or 1.0))

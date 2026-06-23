@@ -164,16 +164,27 @@ The autoencoder is the cheap end; the **DiT** is the per-step hot loop. With tex
 generation can run on MIGraphX. Tooling: `scripts/export_dit_onnx.py` (export) +
 `scripts/dit_onnx_infer.py` (host sampler/runner, mir venv).
 
-**Status (2026-06-23):** DiT **GPU-VERIFIED** on MIGraphX. `medium-base` L256:
-export vs torch `_forward` cos=1.000000; **MIGraphX vs CPU/torch cos=1.000000, 100%
-on the MIGraphX EP (zero CPU fallback), 233 ms/call** (warm, batch=1); ~12-min one-time
-AOT compile. The full pipeline (sampler + CFG + decode → WAV) runs end-to-end. The 1.4B
-DiT exports with the *same* recipe as the AE (flash-off + opset 18) and was structurally
-friendlier (no chunk-folding, global self-attn → plain SDPA). **Only a real-prompt
-audio-vs-torch comparison remains — it needs the cached T5-Gemma embeddings** (t5gemma
-not downloaded; prompts ARE in the `latents_sa3` json). The DiT is exported static
-**batch=1** → CFG runs as two batch-1 calls/step; a batch=2 export would make CFG one
-call/step (efficiency option).
+**Status (2026-06-23):** DiT end-to-end **VALIDATED vs torch** for a real prompt.
+`medium-base` L256: ONNX vs torch `_forward` cos=1.000000; **full 8-step generation
+(real t5gemma conditioning) ONNX z0 vs torch z0 cos=0.999944** → the ONNX text→audio
+pipeline reproduces torch. Earlier MIGraphX run (the pre-fix export) hit cos=1.0,
+100% on-EP, 233 ms/call, ~12-min compile — re-verify on GPU after the local_add fix.
+
+**Critical correctness fix — `local_add_cond` must be fed, not omitted.** medium-base's
+DiT takes a 257-ch `local_add_cond` = cat(`inpaint_mask`[1], `inpaint_masked_input`[256]);
+`local_add_cond_ids` in the config. For text-to-audio (no inpaint) it's all-zeros — but
+the DiT **projects it with a bias**, so `local_add_cond=None ≠ zeros` (measured cos 0.98,
+max|Δ| 0.74). The first export omitted it (and falsely validated cos=1.0 None-vs-None);
+the export now takes `local_add_cond[1,257,T]` as an input and the runner feeds zeros.
+
+**T5-Gemma:** `google/t5gemma-b-b-ul2` (0.6B, gated). It's referenced by SA3 (not bundled)
+and downloaded on demand; the HF Xet protocol stalled, so fetch via plain HTTPS
+(`HF_HUB_DISABLE_XET=1`) or `curl -C -` the resolve URL. Precache tool: `scripts/precache_dit_cond.py`
+(prompt+duration → cond/uncond npz). Build the DiT itself with only the cached safetensors
+(no t5gemma needed for export).
+
+DiT exported static **batch=1** → CFG runs as two batch-1 calls/step; a batch=2 export
+would make CFG one call/step (efficiency option).
 
 ## Why a ladder of fixed lengths
 
