@@ -236,9 +236,31 @@ each holding the **assembled DiT conditioning** so the runtime is pure numpy/ORT
 - `cross_attn_mask` `[seq]` (bool/int)
 - `global_embed` `float32 [768]` — NumberConditioner over `seconds_start`/`seconds_total`
 
+## Benchmark — ONNX (MIGraphX) vs native torch (2026-06-24, GPU free)
+
+L256, 8 steps, CFG 6, medium-base, identical seed/conditioning. `dit_loop_s` = the DiT
+sampling loop only (decode excluded — the shared ONNX decode runs on CPU-ORT in the torch
+SA3 venv vs MIGraphX in the onnx mir venv, so full `gen_s` isn't comparable; the loop is).
+
+| Metric | torch (cuda fp16, eager/SDPA) | ONNX fp16 (MIGraphX) |
+|---|---|---|
+| **DiT loop (16 calls)** | **0.707 s** (44 ms/call, RTF 33.6×) | **2.314 s** (144 ms/call, RTF 10.3×) |
+| Resident VRAM | 3.1 GB working set (full StableAudioModel load ~9.6 GB) | **3.8 GB, no torch stack** |
+| z0 vs torch | — | **cos 0.999308** |
+| AOT compile | none | ~14 min DiT + ~24 min decoder (one-time/session) |
+
+**Verdict: the ONNX→MIGraphX port is a VRAM / deployment win, NOT a speed win.** Eager torch
+is **~3.3× faster** per DiT call (MIGraphX's compiled graph doesn't beat torch's tuned
+rocBLAS/MIOpen kernels here; torch + CK flash-attn would widen it). Quality is identical
+(z0 cos 0.9993). What ONNX buys: **3.8 GB in a lightweight ORT process with zero torch/
+ROCm-torch dependency** — low-VRAM inference that coexists with a training run, one portable
+graph. fp16 MIGraphX is ~25 % faster than fp32 (144 vs 191 ms/call). (The bench's auto VRAM
+column reads 0.00 — `_rocm_used_bytes` CSV-parse quirk, reviewer Minor; the resident figures
+above are from `torch.cuda.max_memory_allocated` and the fp16 file sizes.)
+
 ## Performance + open items
-- **DiT-only RTF ≈ 7.8×** (L256: 16 calls × 191 ms = 3.1 s for 23.8 s audio, batch=1 / 2-calls-per-step
-  CFG). A **batch=2 export** (one call/step, cos 1.0) would ~halve it — `export_dit_onnx.py --batch 2`.
+- **DiT-only RTF ≈ 7.8×** (L256: 16 calls × 191 ms fp32 / 144 ms fp16 MIGraphX; torch eager 44 ms,
+  RTF 33.6×). A **batch=2 export** (one call/step, cos 1.0) halves the call count — `export_dit_onnx.py --batch 2`.
 - **⚠ VRAM: don't co-resident fp32 DiT + fp32 decoder on the 16 GB card.** The DiT weights are ~5.8 GB;
   with it resident, compiling the decoder pushes VRAM to ~16.5 GB (spills to GTT) and the decoder compile
   **thrashes — 31 min+ vs 9 min standalone**.
