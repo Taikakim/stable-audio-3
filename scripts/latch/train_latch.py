@@ -210,6 +210,27 @@ def train(args):
         print(f"Standardize: mean={std_mean:.4f} std={std_std:.4f}")
     use_bf16 = args.precision == "bf16"
 
+    # --- Full tiered telemetry -> wandb. STANDING REQUIREMENT (SAO/MASTER.md): every
+    #     control-head run logs per-layer norms / dist-from-init / weight-space trajectory
+    #     via avp_sa3's TrainTelemetry (RF loss is blind to control; the per-layer + trajectory
+    #     signals are the real diagnostics, and the cross-run fingerprint builds the
+    #     DiT-block x feature controllability map — only reconstructable if logged every run). ---
+    import time as _time
+    telem = wb = None
+    step = 0
+    _t_prev = _time.perf_counter()
+    if args.wandb:
+        import sys as _sys
+        _sat = "/home/kim/Projects/SAO/stable-audio-tools"
+        if _sat not in _sys.path:
+            _sys.path.insert(0, _sat)
+        import wandb as wb        # telemetry.py expects the wandb MODULE (wb.log / wb.Histogram), not the run
+        from avp_sa3.sa3_control.telemetry import TrainTelemetry
+        run_name = args.run_name or f"latch_{args.feature}_{args.t_injection}_d{args.depth}_{args.optimizer}"
+        wb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        telem = TrainTelemetry(model, wb, scalar_every=args.log_every, layer_every=args.layer_every)
+        print(f"[wandb] full telemetry -> project={args.wandb_project} run={run_name}", flush=True)
+
     best_loss = float("inf")
     for epoch in range(args.epochs):
         model.train()
@@ -234,7 +255,17 @@ def train(args):
             if is_fusion:
                 # Polyak γ_t = γ_base·clamp(loss_ema / gnorm_ema) needs the loss tensor
                 opt.set_loss(loss)
+            if telem is not None:
+                gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))  # measure only, no real clip
+                if hasattr(opt, "_telem_on"):       # FusionOpt: instrument the step we're about to log
+                    opt._telem_on = (step % args.log_every == 0)
             opt.step()
+            if telem is not None:
+                _now = _time.perf_counter()
+                _rate = 1.0 / max(_now - _t_prev, 1e-6); _t_prev = _now
+                telem.log(step, loss=loss.item(), gnorm=gnorm, it_s=_rate,
+                          lr=opt.param_groups[0]["lr"], epoch=epoch)
+            step += 1
             total += loss.item()
             nbatches += 1
         avg_loss = total / max(nbatches, 1)
@@ -275,6 +306,9 @@ def train(args):
                 "avg_loss": avg_loss,
             }, ckpt_path)
             print(f"  -> saved {ckpt_path}{' (new best)' if is_best else ''}")
+
+    if wb is not None:
+        wb.finish()
 
 
 if __name__ == "__main__":
@@ -353,4 +387,11 @@ if __name__ == "__main__":
     p.add_argument("--curriculum-steps", type=int, default=0,
                    help="TemporalShapeLoss: linear warmup of lambda_deriv/lambda_multi from "
                         "0 over N steps. 0 = constant from step 1.")
+    p.add_argument("--wandb", action="store_true",
+                   help="log full tiered telemetry (avp_sa3/sa3_control/telemetry.py) to wandb — "
+                        "STANDING REQUIREMENT per SAO/MASTER.md for every control-head run")
+    p.add_argument("--wandb-project", default="sa3-latch")
+    p.add_argument("--run-name", default=None)
+    p.add_argument("--log-every", type=int, default=20, help="telemetry scalar_every (per-step scalars)")
+    p.add_argument("--layer-every", type=int, default=200, help="telemetry layer_every (per-layer norms/trajectory)")
     train(p.parse_args())
