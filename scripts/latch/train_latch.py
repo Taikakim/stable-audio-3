@@ -117,6 +117,16 @@ def make_criterion(args):
             m = mask.unsqueeze(1).to(pred.dtype)
             return crit(pred * m, target * m)
         return _temporal, "temporal_shape"
+    if args.loss == "cosine":
+        # Chroma is a DIRECTION, not a magnitude (handoff §5): per-frame cosine over the
+        # 384 = 3×128 channels, masked-averaged. Scale-invariant ⟹ don't standardize chroma.
+        def _cosine(pred, target, mask):
+            num = (pred * target).sum(1)                                # (B, T)
+            den = (pred.norm(dim=1) * target.norm(dim=1)).clamp_min(1e-8)
+            cos = num / den
+            m = mask.to(cos.dtype)
+            return ((1.0 - cos) * m).sum() / m.sum().clamp_min(1.0)
+        return _cosine, "cosine"
     raise ValueError(f"Unknown --loss {args.loss!r}")
 
 
@@ -170,7 +180,8 @@ def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ds = LatCHDataset(args.latent_dir, target_feature=args.feature,
-                      db_path=args.db_path, target_source=args.target_source)
+                      db_path=args.db_path, target_source=args.target_source,
+                      chroma_dir=args.chroma_dir, chroma_key=args.chroma_key)
     print(f"Dataset: {len(ds)} crops, target_source={args.target_source}, feature={args.feature}")
     sample_latent, sample_target = ds[0]
     out_channels = sample_target.shape[0]
@@ -317,7 +328,10 @@ if __name__ == "__main__":
     p.add_argument("--feature", default="rms_energy_bass")
     p.add_argument("--latent-dir", default="/run/media/kim/Lehto/latents_sa3")
     p.add_argument("--db-path", default=None)
-    p.add_argument("--target-source", choices=["db", "npz"], default="npz",
+    p.add_argument("--chroma-dir", default=None,
+                   help="dir of per-crop <stem>.npz SAME-chroma (3,128,T); enables --target-source chroma")
+    p.add_argument("--chroma-key", default="other", help="which stem's chroma: other / bass / full_mix")
+    p.add_argument("--target-source", choices=["db", "npz", "chroma"], default="npz",
                    help="npz = <stem>.TIMESERIES.npz companions (latents_sa3, medium grid); "
                         "db = legacy per-crop TimeseriesDB (small-music-base / phase 1).")
     # Training loop
@@ -377,7 +391,7 @@ if __name__ == "__main__":
     p.add_argument("--mona-alpha", type=float, default=0.2,
                    help="FusionOpt MONA curvature-injection strength (default 0.2).")
     # Loss
-    p.add_argument("--loss", choices=["mse", "smooth_l1", "temporal"], default="mse")
+    p.add_argument("--loss", choices=["mse", "smooth_l1", "temporal", "cosine"], default="mse")
     p.add_argument("--huber-beta", type=float, default=1.0,
                    help="SmoothL1 knee. Also used by TemporalShapeLoss for deriv/multi-scale.")
     p.add_argument("--lambda-deriv", type=float, default=1.0,

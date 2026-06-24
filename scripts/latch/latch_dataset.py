@@ -30,11 +30,14 @@ class LatCHDataset(Dataset):
     """
 
     def __init__(self, latent_dir: str, target_feature: str = "rms_energy_bass",
-                 db=None, db_path: Optional[str] = None, target_source: str = "db"):
+                 db=None, db_path: Optional[str] = None, target_source: str = "db",
+                 chroma_dir: Optional[str] = None, chroma_key: str = "other"):
         self.latent_dir = Path(latent_dir)
         self.bare_feature = target_feature.removesuffix("_ts")
         self.ts_feature = self.bare_feature + "_ts"
         self.target_source = target_source
+        self.chroma_dir = Path(chroma_dir) if chroma_dir else None
+        self.chroma_key = chroma_key   # which stem's SAME-chroma: other / bass / full_mix
         self.items = sorted(p for p in self.latent_dir.glob("*.npy")
                             if p.stem != "silence")
         if not self.items:
@@ -60,6 +63,15 @@ class LatCHDataset(Dataset):
                 raise RuntimeError(
                     f"target_source='npz' but no *.TIMESERIES.npz companions in {latent_dir}")
             self.items = kept
+        elif target_source == "chroma":
+            # SAME-compatible (3,128,T) chroma from a separate per-crop npz (stem-resolved).
+            if self.chroma_dir is None:
+                raise ValueError("target_source='chroma' requires chroma_dir")
+            kept = [p for p in self.items if (self.chroma_dir / (p.stem + ".npz")).exists()]
+            if not kept:
+                raise RuntimeError(
+                    f"target_source='chroma' but no <stem>.npz in {self.chroma_dir}")
+            self.items = kept
         else:
             raise ValueError(f"unknown target_source={target_source!r}")
 
@@ -67,6 +79,13 @@ class LatCHDataset(Dataset):
         return len(self.items)
 
     def _load_target(self, npy_path: Path, t_frames: int) -> np.ndarray:
+        if self.target_source == "chroma":
+            with np.load(str(self.chroma_dir / (npy_path.stem + ".npz"))) as z:
+                if self.chroma_key not in z.files:
+                    raise ValueError(f"{self.chroma_key} not in chroma npz for {npy_path.stem}")
+                arr = z[self.chroma_key].astype(np.float32)              # (3, 128, T)
+            arr = arr.reshape(arr.shape[0] * arr.shape[1], arr.shape[2])  # (384, T) band-major
+            return resample_target(arr, t_frames)
         if self.target_source == "npz":
             with np.load(str(npy_path.with_suffix(".TIMESERIES.npz"))) as z:
                 if self.ts_feature not in z.files:
