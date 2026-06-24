@@ -204,6 +204,15 @@ def sample_flow_euler_latch_guided(
             return torch.nn.functional.binary_cross_entropy_with_logits(pred, tgt)
         if loss_type == "mse":
             return torch.nn.functional.mse_loss(pred, tgt)
+        if loss_type in ("smooth_l1", "huber"):
+            return torch.nn.functional.smooth_l1_loss(pred, tgt)
+        if loss_type == "l1":
+            return torch.nn.functional.l1_loss(pred, tgt)
+        if loss_type == "cosine":
+            # per-frame cosine distance over channels (chroma is a DIRECTION, not a magnitude)
+            p = pred / (pred.norm(dim=1, keepdim=True) + 1e-8)
+            t = tgt / (tgt.norm(dim=1, keepdim=True) + 1e-8)
+            return (1.0 - (p * t).sum(dim=1)).mean()
         raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
     for i in tqdm(range(num_steps), disable=disable_tqdm):
