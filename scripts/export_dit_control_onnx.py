@@ -52,6 +52,7 @@ if AVP not in sys.path:
 from sa3_control.adapters import ControlledCrossAttention, _ACTIVE  # noqa: E402
 from sa3_control.inject import find_cross_attn  # noqa: E402
 from sa3_control.conditioner import ScalarAttributeEncoder  # noqa: E402
+from dit_control_onnx_infer import add_fractional_positions_np  # noqa: E402
 
 
 def install_adapters_on(dit, control_dim, position_encoding=True):
@@ -110,8 +111,13 @@ def main():
     ap.add_argument("--cond-dim", type=int, default=768, help="cross_attn cond_token_dim")
     ap.add_argument("--global-dim", type=int, default=768, help="global_cond_dim")
     ap.add_argument("--gain", type=float, default=2.0, help="dummy/validate gain (runtime is an input)")
+    ap.add_argument("--in-graph-pe", action="store_true",
+                    help="keep the adapter's fractional-position PE inside the graph (default: move it "
+                         "host-side so the fp16 export has no ConstantOfShape and converts cleanly)")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--fp16", action="store_true",
+                    help="also write a stamped fp16 copy (~3.1 GB; the host-PE graph converts cleanly)")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
@@ -154,33 +160,49 @@ def main():
           f"mask[1,{seq}] global[1,{args.global_dim}] local_add[1,{local_add_dim},{T}] "
           f"control_tokens[1,{n_tokens},{control_dim}] gain[1]")
 
+    host_pe = not args.in_graph_pe                          # default: PE host-side (fp16-friendly)
+    print(f"[pe] adapter positional encoding: {'HOST-side (fp16-friendly)' if host_pe else 'in-graph'}")
+
     g = torch.Generator().manual_seed(0)
-    dummy = (
+    raw_ct = torch.randn(1, n_tokens, control_dim, generator=g)        # raw conditioner-style tokens
+    base = [
         torch.randn(1, LATENT_DIM, T, generator=g),
         torch.rand(1, generator=g),
         torch.randn(1, seq, args.cond_dim, generator=g),
         torch.ones(1, seq, dtype=torch.bool),
         torch.randn(1, args.global_dim, generator=g),
         torch.randn(1, local_add_dim, T, generator=g),
-        torch.randn(1, n_tokens, control_dim, generator=g),     # non-zero control_tokens
-        torch.tensor([float(args.gain)]),                       # gain
-    )
+    ]
+    gain_t = torch.tensor([float(args.gain)])
     in_names = ["x", "t", "cross_attn_cond", "cross_attn_cond_mask", "global_embed",
                 "local_add_cond", "control_tokens", "gain"]
 
     wrap = ControlledDiTCore(dit).eval()
-    print("[torch] reference forward WITH control ...")
+    # GOLD reference = the TRAINED behavior: adapter applies its PE in-forward, raw tokens in.
     with torch.no_grad():
-        ref = wrap(*dummy).cpu().numpy().astype(np.float32)
-        # control OFF = zero control tokens (the trained null) — to prove control is non-trivial
-        d0 = list(dummy); d0[6] = torch.zeros_like(dummy[6])
+        ref_gold = wrap(*base, raw_ct, gain_t).cpu().numpy().astype(np.float32)
+
+    if host_pe:
+        for w in wrappers:
+            w.adapter.position_encoding = False                       # PE now applied host-side
+        ct_in = torch.from_numpy(add_fractional_positions_np(raw_ct.numpy()))
+    else:
+        ct_in = raw_ct
+    dummy = tuple(base) + (ct_in, gain_t)                              # what the graph is traced with
+
+    with torch.no_grad():
+        ref = wrap(*dummy).cpu().numpy().astype(np.float32)           # the EXPORTED behavior
+        off_ct = np.zeros((1, n_tokens, control_dim), np.float32)     # the uncond null...
+        if host_pe:
+            off_ct = add_fractional_positions_np(off_ct)              # ...+PE, exactly as in-adapter did
+        d0 = list(dummy); d0[6] = torch.from_numpy(off_ct)
         ref_off = wrap(*d0).cpu().numpy().astype(np.float32)
-    # The control effect is best read as the RELATIVE L2 of the velocity change, not
-    # cosine: per step the controlled/uncontrolled velocities point nearly the same way
-    # (cos ~0.9999) but the magnitude delta is real and gets ×cfg ×steps at generation.
+
+    equiv = _cos(ref_gold, ref)
+    print(f"[torch] host-PE refactor vs trained in-graph PE: cos={equiv:.6f}  "
+          + ("✔ equivalent" if equiv > 0.99999 else "✗ MISMATCH — PE port differs"))
     eff_rel = float(np.linalg.norm(ref - ref_off) / (np.linalg.norm(ref_off) or 1.0))
     print(f"[torch] control effect: rel-L2={eff_rel:.2%}  max|Δ|={np.abs(ref - ref_off).max():.3e}  "
-          f"cos={_cos(ref, ref_off):.6f}  "
           + ("(control changes the velocity ✔)" if eff_rel > 0.002 else
              "(WARNING: control had ~no effect — gain/tokens?)"))
 
@@ -202,8 +224,38 @@ def main():
              film2_b=enc.film[2].bias.detach().cpu().numpy().astype(np.float32),
              mean=np.float32(mean), std=np.float32(std),
              n_tokens=np.int64(n_tokens), control_dim=np.int64(control_dim),
-             field=str(field))
-    print(f"[cond] wrote conditioner -> {cond_npz}")
+             field=str(field), host_pe=np.bool_(host_pe))
+    print(f"[cond] wrote conditioner -> {cond_npz}  (host_pe={host_pe})")
+
+    # Stamp the onnx so the runner can detect a mismatched .cond.npz/.onnx pair (host_pe
+    # applied twice or zero times = silent CFG corruption). load_external_data=False rewrites
+    # only the small graph proto; the multi-GB .data weights are untouched.
+    import onnx
+
+    def _stamp(path):
+        m = onnx.load(str(path), load_external_data=False)
+        keys = {p.key for p in m.metadata_props}
+        for k, v in [("host_pe", str(bool(host_pe))), ("control_field", str(field))]:
+            if k not in keys:
+                m.metadata_props.append(onnx.StringStringEntryProto(key=k, value=v))
+        onnx.save(m, str(path))
+
+    _stamp(out)
+    print(f"[meta] stamped {out.name}: host_pe={host_pe}, control_field={field}")
+
+    if args.fp16:
+        from onnxconverter_common import float16
+        fp16_out = out.with_name(out.stem + "_fp16.onnx")
+        for p in (fp16_out, Path(str(fp16_out) + ".data")):
+            if p.exists():
+                p.unlink()
+        mf = float16.convert_float_to_float16_model_path(str(out), keep_io_types=True)
+        onnx.save_model(mf, str(fp16_out), save_as_external_data=True,
+                        all_tensors_to_one_file=True, location=fp16_out.name + ".data", size_threshold=1024)
+        _stamp(fp16_out)
+        sz = fp16_out.stat().st_size + Path(str(fp16_out) + ".data").stat().st_size
+        print(f"[fp16] wrote {fp16_out.name} (~{sz / 1e9:.1f} GB, stamped) — host-PE graph converts cleanly "
+              f"(no ConstantOfShape). Low-VRAM: ~3.1 GB DiT + fp16 decoder.")
 
     if args.validate:
         try:
@@ -220,9 +272,13 @@ def main():
         off_rel = float(np.linalg.norm(o - ref_off) / (np.linalg.norm(ref_off) or 1.0))
         print(f"[validate] ONNX vs torch(control ON):  cos={cos_on:.6f}  rel={rel:.2%}  (want ~1.0)")
         print(f"[validate] ONNX vs plain-DiT(ctrl OFF): rel-L2={off_rel:.2%}  cos={cos_off:.6f}  (want > 0)")
-        ok = cos_on > 0.9999 and off_rel > 0.002 and eff_rel > 0.002
+        # `equiv` (host-PE graph vs trained in-graph PE) is gated too: cos_on alone CANNOT catch a
+        # PE-port bug — it compares ONNX to the host-PE torch ref, so a bad PE cancels out. equiv is
+        # the only check that compares against the trained gold.
+        ok = cos_on > 0.9999 and off_rel > 0.002 and eff_rel > 0.002 and equiv > 0.99999
+        print(f"[validate] host-PE equivalence (vs trained gold): cos={equiv:.6f}  (want > 0.99999)")
         print("[validate] ✔ control correctly baked into the ONNX graph" if ok else
-              "[validate] ✗ FAILED — control not in the graph (or had no effect)")
+              "[validate] ✗ FAILED — control not in the graph / PE-port diverged")
 
 
 if __name__ == "__main__":
