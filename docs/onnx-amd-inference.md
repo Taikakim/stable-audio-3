@@ -291,6 +291,35 @@ above are from `torch.cuda.max_memory_allocated` and the fp16 file sizes.)
   ```
   Then compare the `vram_warm_gb` / `gen_s` / `rtf` rows and the saved `*.z0.npy` cosine. (z0-vs-torch is
   already cos 0.9999 on CPU; the benchmark adds the device latency/VRAM head-to-head.)
+
+## Control adapters (steering) baked into the ONNX (2026-06-27)
+
+A trained **control adapter** (`avp_sa3/sa3_control`) — decoupled cross-attention added to every
+DiT block, driven by a control signal — is a pure **forward** modification (no autograd/guidance),
+so unlike a LatCH guidance head it folds straight into the DiT ONNX. `export_dit_control_onnx.py`
+loads an adapter checkpoint (e.g. `onset_FUSION_lr2e5_40epoch/soup_exppeak.pt`, `scalar_field=onset_density`),
+wraps the 24 cross-attns with `ControlledCrossAttention`, and exports a DiT graph with two extra inputs:
+
+    control_tokens [1, n_tokens, control_dim]   # from the scalar conditioner (host, numpy)
+    gain           [1]                           # control strength (1=as trained, ~2-4 strong)
+
+The scalar→tokens FiLM conditioner is saved as a `.cond.npz` (a 5-line numpy port — no torch at
+runtime). `dit_control_onnx_infer.py` runs the CFG-control loop exactly as `sa3_control/onset_eval.py`:
+**cond pass gets `enc((target−mean)/std)`, uncond pass gets zeros (the trained null)**, so the control
+rides the CFG axis. The adapter reaches the wrapped modules via its module-global; threaded as explicit
+forward inputs it traces cleanly (`torch.export`).
+
+**Validated (CPU):** ONNX vs controlled-torch **cos = 1.000000** (the adapter is faithfully in the graph),
+and the graph differs from the plain DiT (control is non-trivial). **End-to-end steering works:** 8-step
+generation, requested onset density **3 → measured 4.88 onsets/sec, 11 → 11.15** (monotonic, calibrated;
+same prompt/seed, librosa onset detection). The control-DiT compiles/runs on MIGraphX like the plain DiT
+(GPU-verify pending a free GPU; same VRAM story → fp16-export for low VRAM). The adapter is length-agnostic
+— export any ladder rung with `--frames`.
+
+    python scripts/export_dit_control_onnx.py --ckpt <adapter.pt> --model medium-base --frames 256 --validate
+    python scripts/dit_control_onnx_infer.py --dit-onnx dit_..._ctrl_onset_density.onnx \
+        --cond-npz dit_..._ctrl_onset_density.cond.npz --decoder-onnx same_decoder_L128.onnx \
+        --cond cond.npz --uncond uncond.npz --frames 256 --onset-density 8 --gain 3 --out steered.wav
 - The fp16 ladder halves the 5.8 GB/rung; weights also aren't shared across rungs (dedup TODO).
 - `medium-base` conditioning confirmed = cross_attn + global + **local_add_cond (257, must be fed)**; no
   active prepend/input_concat. If a variant adds them, extend `DiTCore`.
