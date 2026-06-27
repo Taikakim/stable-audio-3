@@ -364,12 +364,29 @@ Mathematically exact (PE adds to the tokens before the K/V projection): host-PE 
 silent double/zero PE). The numpy PE isn't byte-equal to torch (max|Δ| ~1.2e-3 from `np.exp`/`np.float64(pi)`
 vs torch — below fp16 resolution, washes out of the velocity cos).
 
+**fp16 control-DiT GPU numbers (2026-06-27, MIGraphX, RX 9070 XT, first measured session).**
+Session-ready (AOT compile): **2391 s (DiT) / 2438 s (decoder)** — ~40 min each (longer than fp32
+control-DiT ~18 min because the host-PE graph change adds ops MIGraphX must compile). Per DiT call:
+**169 ms** (fp32: 294 ms — ~43% faster). Cos vs CPU: **0.9999** (fp16 resolution floor, not a graph
+error). 100% on-EP. **Compile-cache is a missing EP feature, not a configuration gap:**
+`migraphx_save/load_compiled_model` (and `_model_name` / `_model_path`) provider options are **rejected**
+by `onnxruntime_migraphx` 1.23.2 — ORT silently falls back to CPU. `decode_onnx.py:_augment_migraphx`
+detects this and retries on the bare GPU EP (retry guard at line 241), so caching is a no-op in this
+build. The API exists in MIGraphX proper but is not plumbed through the EP. Ways out: a newer ORT-ROCm
+build that exposes the cache options, a long-lived resident server (compiles once at boot), or the CPU
+path (no compile).
+
 **CPU-ONLY is the recommended eval path** (frees the GPU for training — and avoids the GPU contention that
 stalls a co-resident MIGraphX compile). On the Ryzen 9 9900X: onset-steered gen **~10 s (8-step) + decode,
 ≈2× realtime**, steers identically to GPU (onset 11→11.19). **Pin `--threads 12`** (physical cores; ~25%
 faster than 24 SMT, bandwidth-bound). **INT8 (CPU):** 1.4–1.7× faster but **cos 0.95** (real quality cost,
 audition first); needs a `value_info` strip + `op_types_to_quantize=['MatMul']` (this ORT build lacks a
 `ConvInteger` kernel). Since fp32 is already ~2× realtime, prefer fp32 for evals; reserve INT8 for VST latency.
+**Eval math (why CPU is the default, not a low-VRAM fallback):** a 30-clip control-eval grid (8 steps,
+CFG = 16 DiT calls/clip) costs **~42 min on GPU** (2391 s compile + 30 × 16 × 169 ms ≈ 1.4 min DiT,
+compile-dominated) vs **~5.4 min on CPU** (no compile; 30 × 16 × 674 ms). GPU only beats CPU once the
+compile amortises over hundreds of clips — i.e. a long-lived resident process (VST). For single eval grids,
+always use CPU.
 
     # GPU (free card) or CPU — same script:
     python scripts/export_dit_control_onnx.py --ckpt <adapter.pt> --model medium-base --frames 256 --fp16 --validate
@@ -380,3 +397,21 @@ audition first); needs a `value_info` strip + `op_types_to_quantize=['MatMul']` 
 - The fp16 ladder halves the 5.8 GB/rung; weights also aren't shared across rungs (dedup TODO).
 - `medium-base` conditioning confirmed = cross_attn + global + **local_add_cond (257, must be fed)**; no
   active prepend/input_concat. If a variant adds them, extend `DiTCore`.
+
+**Shared gen-core and eval tooling (2026-06-27).**
+- `scripts/sa3_control_onnx.py` — shared numpy/ORT generation core: `generate_z0`,
+  `make_control_tokens`, `resolve_host_pe`. Import by control eval consumers; no torch at runtime.
+- `avp_sa3/sa3_control/train.py --export-onnx-on-finish` (default True) — at training end, shells
+  out to `export_dit_control_onnx.py --fp16`, writing `riffer_final.pt → dit_medium-base_L256_ctrl.onnx`
+  + `.cond.npz` into the run dir automatically. Default frames = 256. Non-fatal (check=False);
+  disable with `--no-export-onnx-on-finish`.
+- `scripts/control_eval_server.py` — long-lived **all-CPU** file-drop eval server: resident T5-Gemma
+  conditioner + ONNX DiT/decoder (CPU EP, `--threads 12`), job queue at `SAO/control_eval_queue`
+  (inbox/processing/outbox), atomic claim (`os.rename`) + atomic publish (`os.replace`, then `.done`
+  last). Frames are derived from the DiT graph (authoritative rung); a job with mismatched frames is
+  rejected. Never touches the GPU — runs alongside training.
+- `scripts/submit_control_job.py` — stdlib-only cross-venv submitter (drop JSON, poll `.done`/`.err`).
+- **End-to-end verified 2026-06-27 (CPU):** boot ~16 s (ORT 5 s + T5-Gemma 13 s), 8-step job ≈ 20 s
+  total (DiT loop ~11.5 s + decode ~9 s). Steering confirmed through the full server path —
+  onset target 3 → 5.17 onsets/s, target 11 → 10.43 onsets/s (librosa; same monotonic response as the
+  direct CLI verify). z0 from the shared core is bit-exact (max|Δ|=0) vs the pre-refactor CLI.

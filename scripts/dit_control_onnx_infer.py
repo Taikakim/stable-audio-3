@@ -29,63 +29,8 @@ import numpy as np
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from decode_onnx import decode_chunked_onnx, pick_providers  # noqa: E402
-
-SR = 44100
-LATENT_DIM = 256
-DS = 4096
-LOCAL_ADD_DIM = 257
-
-
-def schedule(steps: int, T: int, alpha_min: float = 1.0, alpha_max: float = 1.0,
-             min_len: int = 256, max_len: int = 4096) -> np.ndarray:
-    import math
-    t = np.linspace(1.0, 0.0, steps + 1).astype(np.float64)
-    log_amin, log_amax = math.log(max(alpha_min, 1e-8)), math.log(max(alpha_max, 1e-8))
-    log_lo, log_hi = math.log(min_len), math.log(max(max_len, min_len + 1))
-    seqc = max(min(T, max_len), min_len)
-    frac = (math.log(seqc) - log_lo) / (log_hi - log_lo)
-    alpha = math.exp(log_amin + frac * (log_amax - log_amin))
-    if abs(alpha - 1.0) > 1e-9:
-        t = alpha * t / (1.0 + (alpha - 1.0) * t)
-        t[0] = 1.0
-    return t
-
-
-def load_cond(path: Path):
-    z = np.load(path)
-    return (z["cross_attn_cond"].astype(np.float32), z["cross_attn_mask"],
-            z["global_embed"].astype(np.float32))
-
-
-def control_tokens_from_npz(z, raw_value: float) -> np.ndarray:
-    """ScalarAttributeEncoder forward in numpy: scalar -> (1, n_tokens, control_dim)."""
-    s = np.float32((raw_value - float(z["mean"])) / float(z["std"]))
-    x = np.array([[s]], np.float32)
-    h = x @ z["film0_w"].T + z["film0_b"]
-    h = h * (1.0 / (1.0 + np.exp(-h)))                                  # SiLU
-    nt, cd = int(z["n_tokens"]), int(z["control_dim"])
-    gb = (h @ z["film2_w"].T + z["film2_b"]).reshape(1, nt, cd, 2)
-    return (z["tokens"][None] * (1.0 + gb[..., 0]) + gb[..., 1]).astype(np.float32)
-
-
-def add_fractional_positions_np(tokens: np.ndarray) -> np.ndarray:
-    """numpy port of sa3_control.adapters.add_fractional_positions. Identical sin/cos
-    layout. Applied HOST-SIDE when the control-DiT was exported with the adapter PE
-    disabled (so the fp16 graph has no ConstantOfShape) — the result is the same as the
-    in-adapter PE because PE is added to the tokens before the K/V projection."""
-    b, s, d = tokens.shape
-    if s <= 1:
-        return tokens
-    half = d // 2
-    if half == 0:
-        return tokens
-    pos = np.linspace(0.0, 1.0, s, dtype=np.float32)
-    freq = np.exp(np.linspace(0.0, 8.0, half, dtype=np.float32))
-    ang = pos[:, None] * freq[None, :] * np.float64(np.pi)   # fp64 pi (matches torch's pi)
-    pe = np.zeros((s, d), np.float32)
-    pe[:, :half] = np.sin(ang)
-    pe[:, half:half + half] = np.cos(ang)
-    return (tokens + pe[None]).astype(np.float32)
+from sa3_control_onnx import (  # noqa: E402
+    SR, DS, load_cond, resolve_host_pe, make_control_tokens, generate_z0)
 
 
 def main():
@@ -131,58 +76,26 @@ def main():
     dec = ort.InferenceSession(str(args.decoder_onnx), sess_options=so, providers=providers)
     print(f"[ort] sessions ready in {time.time() - t0:.0f}s  (DiT EP {dit.get_providers()[0]})")
 
-    c_cross, c_mask, c_glob = load_cond(args.cond)
-    u_cross, u_mask, u_glob = load_cond(args.uncond)
+    cond = load_cond(args.cond)
+    uncond = load_cond(args.uncond)
     T = args.frames
-    local_add = np.zeros((1, LOCAL_ADD_DIM, T), np.float32)
-    gain = np.array([args.gain], np.float32)
 
     cz = np.load(args.cond_npz)
-    cond_tok = control_tokens_from_npz(cz, args.onset_density)          # control ON (requested onset)
-    zero_tok = np.zeros_like(cond_tok)                                  # control OFF (trained null)
-    # If the adapter PE was moved host-side at export (fp16-friendly graph), apply it to
-    # BOTH passes here — exactly as the in-adapter PE did (uncond's zeros become PE, not 0).
-    host_pe = bool(cz["host_pe"]) if "host_pe" in cz.files else False
-    # Guard against a mismatched .cond.npz/.onnx pair (would double-apply or drop the PE → wrong
-    # CFG, silently). The export stamps host_pe into the onnx metadata; assert it agrees.
-    onnx_meta = dit.get_modelmeta().custom_metadata_map
-    if "host_pe" in onnx_meta:
-        onnx_host_pe = str(onnx_meta["host_pe"]).lower() == "true"
-        if onnx_host_pe != host_pe:
-            raise SystemExit(
-                f"[fatal] PE mismatch — onnx host_pe={onnx_host_pe} but .cond.npz host_pe={host_pe}: "
-                f"wrong .cond.npz/.onnx pair (PE would be applied "
-                f"{'twice' if host_pe else 'zero times'}). Use the matching pair.")
-    if host_pe:
-        cond_tok = add_fractional_positions_np(cond_tok)
-        zero_tok = add_fractional_positions_np(zero_tok)
+    # The export stamps host_pe into the onnx metadata; resolve_host_pe asserts the
+    # .cond.npz agrees (catches a mismatched pair → silent double/zero PE).
+    host_pe = resolve_host_pe(dit, cz)
+    # control ON (requested onset) + OFF (trained null); host PE applied to both if needed.
+    cond_tok, zero_tok = make_control_tokens(cz, args.onset_density, host_pe)
     print(f"[ctrl] field={str(cz['field'])}  onset_density={args.onset_density} "
           f"(norm {(args.onset_density - float(cz['mean'])) / float(cz['std']):+.2f})  gain={args.gain}  "
           f"host_pe={host_pe}  ||cond_tok||={np.linalg.norm(cond_tok):.1f}")
 
-    def dit_v(cross1, mask1, glob1, t_cur, ctrl_tok):
-        return dit.run(None, {
-            "x": x, "t": np.full((1,), t_cur, np.float32),
-            "cross_attn_cond": cross1[None], "cross_attn_cond_mask": mask1[None],
-            "global_embed": glob1[None], "local_add_cond": local_add,
-            "control_tokens": ctrl_tok, "gain": gain})[0]
-
-    rng = np.random.default_rng(args.seed)
-    x = rng.standard_normal((1, LATENT_DIM, T)).astype(np.float32)
-    sig = schedule(args.steps, T, args.alpha_min, args.alpha_max)
-
     print(f"[gen] T={T}  steps={args.steps}  cfg={args.cfg_scale}")
-    t0 = time.time()
-    for i in range(args.steps):
-        t_cur, dt = float(sig[i]), float(sig[i + 1] - sig[i])
-        v_cond = dit_v(c_cross, c_mask, c_glob, t_cur, cond_tok)        # cond + control
-        if args.cfg_scale == 1.0:
-            v = v_cond
-        else:
-            v_unc = dit_v(u_cross, u_mask, u_glob, t_cur, zero_tok)     # uncond + null control
-            v = v_unc + args.cfg_scale * (v_cond - v_unc)
-        x = x + dt * v
-    print(f"[gen] {args.steps} steps in {time.time() - t0:.2f}s -> z0 {x.shape} "
+    res = generate_z0(dit, cond=cond, uncond=uncond, cond_tok=cond_tok, zero_tok=zero_tok,
+                      frames=T, steps=args.steps, cfg_scale=args.cfg_scale, seed=args.seed,
+                      gain=args.gain, alpha_min=args.alpha_min, alpha_max=args.alpha_max)
+    x = res["z0"]
+    print(f"[gen] {args.steps} steps in {res['dit_loop_s']:.2f}s -> z0 {x.shape} "
           f"range[{x.min():.2f},{x.max():.2f}]")
     np.save(str(args.out) + ".z0.npy", x)
 

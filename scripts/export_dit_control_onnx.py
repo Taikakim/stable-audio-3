@@ -52,7 +52,7 @@ if AVP not in sys.path:
 from sa3_control.adapters import ControlledCrossAttention, _ACTIVE  # noqa: E402
 from sa3_control.inject import find_cross_attn  # noqa: E402
 from sa3_control.conditioner import ScalarAttributeEncoder  # noqa: E402
-from dit_control_onnx_infer import add_fractional_positions_np  # noqa: E402
+from sa3_control_onnx import add_fractional_positions_np  # noqa: E402
 
 
 def install_adapters_on(dit, control_dim, position_encoding=True):
