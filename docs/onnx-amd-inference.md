@@ -314,22 +314,69 @@ and the graph differs from the plain DiT (control is non-trivial). **End-to-end 
 generation, requested onset density **3 → measured 4.88 onsets/sec, 11 → 11.15** (monotonic, calibrated;
 same prompt/seed, librosa onset detection).
 
-**GPU-VERIFIED (MIGraphX, 2026-06-27):** control-DiT MIGraphX vs CPU **cos = 1.000000**, **100 % on the
-MIGraphX EP** (no CPU fallback), **294 ms/call** (vs the plain DiT's 144 ms — the 24 adapter cross-attns add
-~50 %), ~18-min compile. On-GPU steering matches CPU: onset **3 → 5.00, 11 → 11.19** onsets/sec, **~4 s per
-8-step generation**. The adapter is length-agnostic — export any ladder rung with `--frames`.
+**MIGraphX GPU run (2026-06-27, NOT YET CONFIRMED THIS SESSION).** The control-DiT MIGraphX path was
+launched but **not numerically verified** in this session — the EP is present and bound, but no on-GPU cos,
+placement, steering, or RTF number was produced. What is established vs. what remains:
+- **EP available + selected, node-level placement NOT observed.** mir venv `onnxruntime 1.23.2`,
+  `get_available_providers() = ['MIGraphXExecutionProvider','CPUExecutionProvider']`. The runner binds
+  MIGraphX (`[ort] sessions ready … (DiT EP …)`, `dit_control_onnx_infer.py:105`) but that line had not
+  printed — the **~13–15 min AOT compile** (CPU-bound, ~106 % CPU / GPU idle, ~1 GB VRAM held) was still
+  running when the turn ended. This runner has **no compile cache** (ORT 1.23.2 rejects the caching opts),
+  so every invocation pays the full compile. **Do not kill it.**
+- **cos vs torch: NOT MEASURED, and not measurable from the control runner.** `dit_control_onnx_infer.py`
+  emits **no** torch-parity metric (its only `cos` is a positional-encoding `np.cos`). The sole script that
+  prints cos-vs-torch is `decode_onnx.py --compare-torch`, and only on the **decoder**. That decoder check
+  is runnable from the **mir venv** (it has torch 2.9.1+rocm7.2 and can import `stable_audio_3` when
+  `PYTHONPATH=/home/kim/Projects/SAO/stable-audio-3` is set — the package is not installed there). Queued:
+  ```bash
+  PYTHONPATH=/home/kim/Projects/SAO/stable-audio-3 \
+  /home/kim/Projects/mir/mir/bin/python scripts/decode_onnx.py \
+    --onnx same_decoder_L128.onnx --crop 000000 --provider migraphx \
+    --report-placement --compare-torch     # expect decoder cos≈0.999998, max|Δ|≈2.8e-4, 100% on-EP
+  ```
+  Full **DiT**-vs-torch parity is **not reproducible from the shipped runtime scripts** (the control runner
+  self-reports nothing); it rests on export-time validation (CPU cos = 1.000000 above; MASTER.md §5). The
+  DiT runner also has **no node-level placement check** — even a completed DiT run would prove "ran on
+  MIGraphX" only via `get_providers()[0]`, which does NOT rule out per-node CPU fallback.
+- **Steering: NOT MEASURED.** Plan: lo (`--onset-density 3`) vs hi (`--onset-density 12`), identical
+  `--gain 3 --seed 42`, density read post-hoc with `librosa.onset.onset_detect` (onsets/sec). Control
+  `.cond.npz` verified (`onset_density` mean 7.107, std 1.419, n_tokens 16, control_dim 768 → density 3
+  normalizes to −2.89, density 12 to +3.45, strong span). Neither generation completed (no `steered_*.wav`).
+- **RTF: NOT MEASURED.** Reference (export-time / runbook, L256 fp32): ~191 ms/call, DiT-only RTF ≈ 7.8×,
+  full-pipeline MIGraphX ≈ 10.3× — **a VRAM/deployment win, not a speed win** (eager torch is ~3.3× faster
+  per call). Record the runner's `[gen] {steps} steps in {X}s`; do not expect MIGraphX to beat torch.
 
-**fp16-export of the control-DiT is currently broken** (`convert_float_to_float16_model_path` emits an
-invalid graph — a `ConstantOfShape` from the adapter's `add_fractional_positions` PE ends up fp16 where
-fp32 is expected; the path converter has no `op_block_list`). So the control-DiT runs **fp32 (6.3 GB)** for
-now, which fits a *free* 16 GB card (+ fp16 decoder = ~15.5 GB at compile, near the edge) but won't coexist
-with a training job. Fix for low-VRAM coexistence: compute the 16-token PE host-side and export the adapter
-with `position_encoding=False` (removes the offending op), or post-patch the node dtype. *(follow-up)*
+The only reason these are unverified is wall-clock: three sequential uncached MIGraphX AOT compiles (lo +
+hi + decoder, ~10–15 min each) exceed one turn. Re-run the queued commands to finish — no hard blocker
+remains. (Step-0 precache needed a documented workaround: the current SA3 `precache_dit_cond.py` hits a
+`cuda:0 vs cpu` device split and a `KeyError: 'inpaint_mask'` from `local_add_cond_ids`; a text-only
+assemble of `cross_attn_cond_ids=['prompt','seconds_total']` + `global_cond_ids=['seconds_total']` produces
+a correct `.cond.npz` — cross `(128,768)`, mask sum 14 (cond) / 0 (uncond).)
 
-    python scripts/export_dit_control_onnx.py --ckpt <adapter.pt> --model medium-base --frames 256 --validate
-    python scripts/dit_control_onnx_infer.py --dit-onnx dit_..._ctrl_onset_density.onnx \
-        --cond-npz dit_..._ctrl_onset_density.cond.npz --decoder-onnx same_decoder_L128.onnx \
-        --cond cond.npz --uncond uncond.npz --frames 256 --onset-density 8 --gain 3 --out steered.wav
+The adapter is length-agnostic — export any ladder rung with `--frames`.
+
+**fp16 control-DiT — FIXED (host-side PE).** The bad `ConstantOfShape` came from the adapter's
+`add_fractional_positions` PE (`tokens.new_zeros`). Moving the PE **host-side** removes it: export the adapter
+with `position_encoding=False` (`export_dit_control_onnx.py` default) and apply the PE in numpy in the runner.
+Mathematically exact (PE adds to the tokens before the K/V projection): host-PE vs trained in-graph PE
+**cos=1.000000** (gated in `--validate`). `--fp16` now converts cleanly → **3.1 GB** (stamped). The npz carries
+`host_pe=True` and the onnx is metadata-stamped; the runner asserts they match (guards a mismatched pair →
+silent double/zero PE). The numpy PE isn't byte-equal to torch (max|Δ| ~1.2e-3 from `np.exp`/`np.float64(pi)`
+vs torch — below fp16 resolution, washes out of the velocity cos).
+
+**CPU-ONLY is the recommended eval path** (frees the GPU for training — and avoids the GPU contention that
+stalls a co-resident MIGraphX compile). On the Ryzen 9 9900X: onset-steered gen **~10 s (8-step) + decode,
+≈2× realtime**, steers identically to GPU (onset 11→11.19). **Pin `--threads 12`** (physical cores; ~25%
+faster than 24 SMT, bandwidth-bound). **INT8 (CPU):** 1.4–1.7× faster but **cos 0.95** (real quality cost,
+audition first); needs a `value_info` strip + `op_types_to_quantize=['MatMul']` (this ORT build lacks a
+`ConvInteger` kernel). Since fp32 is already ~2× realtime, prefer fp32 for evals; reserve INT8 for VST latency.
+
+    # GPU (free card) or CPU — same script:
+    python scripts/export_dit_control_onnx.py --ckpt <adapter.pt> --model medium-base --frames 256 --fp16 --validate
+    python scripts/dit_control_onnx_infer.py --provider cpu --threads 12 \
+        --dit-onnx dit_..._ctrl_onset_density.onnx --cond-npz dit_..._ctrl_onset_density.cond.npz \
+        --decoder-onnx same_decoder_L128.onnx --cond cond.npz --uncond uncond.npz \
+        --frames 256 --onset-density 8 --gain 3 --out steered.wav
 - The fp16 ladder halves the 5.8 GB/rung; weights also aren't shared across rungs (dedup TODO).
 - `medium-base` conditioning confirmed = cross_attn + global + **local_add_cond (257, must be fed)**; no
   active prepend/input_concat. If a variant adds them, extend `DiTCore`.
