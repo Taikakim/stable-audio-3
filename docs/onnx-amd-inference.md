@@ -312,9 +312,19 @@ forward inputs it traces cleanly (`torch.export`).
 **Validated (CPU):** ONNX vs controlled-torch **cos = 1.000000** (the adapter is faithfully in the graph),
 and the graph differs from the plain DiT (control is non-trivial). **End-to-end steering works:** 8-step
 generation, requested onset density **3 → measured 4.88 onsets/sec, 11 → 11.15** (monotonic, calibrated;
-same prompt/seed, librosa onset detection). The control-DiT compiles/runs on MIGraphX like the plain DiT
-(GPU-verify pending a free GPU; same VRAM story → fp16-export for low VRAM). The adapter is length-agnostic
-— export any ladder rung with `--frames`.
+same prompt/seed, librosa onset detection).
+
+**GPU-VERIFIED (MIGraphX, 2026-06-27):** control-DiT MIGraphX vs CPU **cos = 1.000000**, **100 % on the
+MIGraphX EP** (no CPU fallback), **294 ms/call** (vs the plain DiT's 144 ms — the 24 adapter cross-attns add
+~50 %), ~18-min compile. On-GPU steering matches CPU: onset **3 → 5.00, 11 → 11.19** onsets/sec, **~4 s per
+8-step generation**. The adapter is length-agnostic — export any ladder rung with `--frames`.
+
+**fp16-export of the control-DiT is currently broken** (`convert_float_to_float16_model_path` emits an
+invalid graph — a `ConstantOfShape` from the adapter's `add_fractional_positions` PE ends up fp16 where
+fp32 is expected; the path converter has no `op_block_list`). So the control-DiT runs **fp32 (6.3 GB)** for
+now, which fits a *free* 16 GB card (+ fp16 decoder = ~15.5 GB at compile, near the edge) but won't coexist
+with a training job. Fix for low-VRAM coexistence: compute the 16-token PE host-side and export the adapter
+with `position_encoding=False` (removes the offending op), or post-patch the node dtype. *(follow-up)*
 
     python scripts/export_dit_control_onnx.py --ckpt <adapter.pt> --model medium-base --frames 256 --validate
     python scripts/dit_control_onnx_infer.py --dit-onnx dit_..._ctrl_onset_density.onnx \
