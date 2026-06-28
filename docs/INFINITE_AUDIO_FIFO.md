@@ -202,7 +202,10 @@ Built exactly as `generate()` does: `_build_conditioning_dicts` →
 ### Decoding
 Popped latent frames accumulate in a list; decode via `pretransform.decode` either in
 chunks (streaming) or once at the end (smoke). Note 1 latent frame ≈ 93 ms of audio, so
-emit/decode granularity is coarse — fine.
+emit/decode granularity is coarse — fine. **When writing the WAV, go float32 →
+peak-normalize/clamp → int16 PCM**: SA3 decoded audio routinely has >1.0 peaks, and
+`torchaudio.save` (esp. the torchcodec backend) clips them silently (the bug that bit the
+riffer auditions — `MASTER.md` §5). Never `torchaudio.save(x.float().cpu(), …)` raw.
 
 ---
 

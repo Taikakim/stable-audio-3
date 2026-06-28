@@ -29,7 +29,7 @@ The unit tests run anywhere, but the three commands below need:
 ```bash
 uv run python scripts/latch/encode_latch_dataset.py \
   --model same-s \
-  --audio-dir "/run/media/kim/Mantu/ai-music/Goa_Separated_crops" \
+  --audio-dir "/run/media/kim/Mantu/goa_crops" \
   --out-dir /run/media/kim/Lehto/sa3-latch-latents
 ```
 

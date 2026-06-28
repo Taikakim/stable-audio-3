@@ -273,6 +273,16 @@ cross-repo note: `SAO/MASTER.md` §5). `uv sync --inexact` preserves the built f
 
 The repo includes local ROCm wheels in `pyproject.toml` under `[tool.uv.sources]`. These are referenced with relative paths and require the wheel files to be present in the repo root.
 
+**SA3-medium ROCm/RDNA4 gotchas (full list: `SAO/MASTER.md` §5):**
+- **`MIOPEN_FIND_MODE=6` CRASHES the SA3-medium DiT** (MIOpen `std::vector` assertion / coredump) — use
+  `MIOPEN_FIND_MODE=2` for medium training/inference (mode 6 is fine for the tiny LatCH heads).
+- **`PYTORCH_TUNABLEOP_ENABLED=0`** — TunableOp freezes on RDNA4 / torch-2.12 (kernel-selection path trips
+  when the validator passes). With CK flash-attn, GEMM tuning is marginal anyway.
+- **Fixed `T=4096` beat-aligned crops** (the `latents_sa3` corpus) — batch=1 + variable-length training
+  thrashes the GEMM/Triton kernel cache (each unique sequence length is a new kernel shape).
+- **TFG / LatCH guidance must run fp32** — fp16 (model_half default) clashes with backprop grad dtypes.
+- INT8/INT4 quantization is non-functional on ROCm (use bf16 + FA2).
+
 ## Key Files & Patterns
 
 ### Adding a New Inference Mode
