@@ -44,6 +44,9 @@ from pathlib import Path
 
 import numpy as np
 
+# CPU-ONLY: make_text_cond.load_conditioner loads with device="cpu" so the 1.4B weights never
+# touch cuda (no OOM on a busy GPU); the GPU stays visible (the flash_attn/aiter import probes a
+# driver at import time) but is never allocated on, and the DiT/decoder run on the ORT CPU EP.
 # Single-source the validated generation math + the resident text conditioner loader.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPTS_DIR))

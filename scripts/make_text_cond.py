@@ -34,9 +34,15 @@ UNCOND_OUT = HERE / "dit_medium-base_L256_ctrl.uncond.npz"
 
 def load_conditioner(model_name: str = "medium-base"):
     """Load the SA3 DiT+conditioner module on CPU/fp32 (WORKAROUND 1: flash attn off,
-    cuda/cpu dtype mismatch avoided). Returns cdm = model.model."""
+    cuda/cpu dtype mismatch avoided). Returns cdm = model.model.
+
+    device="cpu" + model_half=False so the 1.4B weights load STRAIGHT to CPU and never
+    touch cuda — otherwise from_pretrained defaults to cuda (loading gigabytes before any
+    .to("cpu")) and OOMs when the GPU is busy with a training run. The GPU stays *visible*
+    (do NOT hide it via HIP_VISIBLE_DEVICES — that breaks the flash_attn/aiter import,
+    which probes a driver at import time); we simply never allocate on it."""
     os.environ["SA3_DISABLE_FLASH_ATTN"] = "1"
-    model = StableAudioModel.from_pretrained(model_name)
+    model = StableAudioModel.from_pretrained(model_name, device="cpu", model_half=False)
     return model.model.to("cpu").float()
 
 
