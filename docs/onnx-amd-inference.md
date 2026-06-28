@@ -415,3 +415,21 @@ always use CPU.
   total (DiT loop ~11.5 s + decode ~9 s). Steering confirmed through the full server path —
   onset target 3 → 5.17 onsets/s, target 11 → 10.43 onsets/s (librosa; same monotonic response as the
   direct CLI verify). z0 from the shared core is bit-exact (max|Δ|=0) vs the pre-refactor CLI.
+
+## CPU LatCH-guidance eval path (gradient sibling of the control eval server, 2026-06-28)
+
+Unlike control adapters (pure forward mod, baked into the ONNX), LatCH guidance is
+**gradient-based**: the plain DiT ONNX runs forward-only on the ORT CPU EP (numpy), and each
+step applies torch autograd through a ~5-7M-param LatCH head to compute the guidance gradient.
+The head never modifies the ONNX graph; the DiT needs no autograd → CPU-feasible.
+
+New scripts (commit 020b6c3, branch `latch-sa3-phase1`):
+
+- **`sa3_latch_onnx.py`** — `generate_z0_latch_guided(dit_session, *, cond, uncond, guides, frames, steps=30, cfg_scale=7.0, seed=777, rho=64.0, mu=64.0, gamma=0.3, n_iter=4, start_pct=0.4, end_pct=1.0)`. Two-stage Selective-TFG: (A) variance grad on x at t_cur, (B) plain-DiT APG CFG forward via ORT (z0 = x − t·v), (C) mean grad on z0 at t=0 with gamma noise aug (n_iter iterations), (D) Euler step. APG CFG faithfully ports `dit.py::apg_project` (orthogonal projection, lines 339-341). Also: `load_latch_head` (CPU fp32, eval), `make_latch_target` (standardized: (raw−std_mean)/std_std), `make_criterion` (huber_beta from head metadata), `latch_schedule` (LogSNR rate=0/anchor=−6.2/end=2.0).
+- **`latch_eval_server.py`** — long-lived all-CPU file-drop eval server: resident T5-Gemma + plain DiT ONNX (CPU EP) + torch head autograd. Queue at `SAO/latch_eval_queue`. Sibling of `control_eval_server.py`.
+- **`submit_latch_job.py`** — stdlib-only submitter. `--prompts` is one verbatim prompt per flag occurrence (no comma-split — repeat the flag for multiple prompts; musical prompts contain commas).
+- **`latch_validate.py`** — CPU/GPU z0-cosine harness; GPU half guarded behind `--run-gpu` (**DEFERRED** — needs the card free AND a shared init latent: CPU and CUDA `torch.randn(seed)` differ by RNG device, so seed-matching alone won't reach cos ≥ 0.999).
+
+**Gain.** `rho=mu=64.0` are conservative code defaults. The systematic 14-head sweep (WORKLOG 2026-06-28) puts the operating gain at **≈512 for energy heads**; gain 128 is a dead zone.
+
+**Device gotcha (shared with `control_eval_server.py`).** Load the T5-Gemma conditioner via `make_text_cond.load_conditioner` which calls `StableAudioModel.from_pretrained(device="cpu", model_half=False)` — the 1.4 B weights stay on CPU, no VRAM spike. Do **NOT** hide the GPU via `HIP_VISIBLE_DEVICES=""`: `flash_attn`/`aiter` probes a Triton driver at import time; zero visible devices → immediate crash. Fix is in both `latch_eval_server.py` and `control_eval_server.py`.
