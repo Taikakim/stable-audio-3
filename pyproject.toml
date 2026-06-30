@@ -3,19 +3,27 @@ name = "stable-audio-3"
 version = "0.1.0"
 description = "Stable Audio 3: A state-of-the-art open platform for fast, high-quality generated audio and music"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "einops>=0.8.2",
     "einops-exts>=0.0.4",
     "numpy>=2.2.6",
     "packaging>=26.0",
     "safetensors>=0.7.0",
-    "torch==2.7.1",
-    "torchaudio==2.7.1",
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
+    "torchvision==0.25.0",
+    "triton==3.6.0",
     "tqdm>=4.67.3",
     "huggingface-hub>=1.7.1",
     "transformers>=5.8.0",
     "soundfile>=0.13.1",
+    "librosa",
+    "scipy",
+    "torchcodec",
+    "ninja",
+    "pip",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
@@ -30,18 +38,15 @@ lora = [
   "dill>=0.4.1",
 ]
 
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
-
+# Local ROCm wheels — paths are relative to this pyproject.toml.
+# If you move the wheels, update these paths (or switch to absolute).
 [tool.uv.sources]
-torch = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
-]
-torchaudio = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }
-]
+torch       = { path = "./torch-2.10.0+rocm7.2.3.lw.git1a270074-cp313-cp313-linux_x86_64.whl" }
+torchaudio  = { path = "./torchaudio-2.10.0+rocm7.2.3.git5047768f-cp313-cp313-linux_x86_64.whl" }
+torchvision = { path = "./torchvision-0.25.0+rocm7.2.3.git82df5f59-cp313-cp313-linux_x86_64.whl" }
+triton      = { path = "./triton-3.6.0+rocm7.2.3.git4ed88892-cp313-cp313-linux_x86_64.whl" }
+# Local torchcodec source (sibling repo, built against the ROCm torch above).
+torchcodec  = { path = "../torchcodec" }
 
 [project.scripts]
 stable-audio = "stable_audio_3.cli:main"

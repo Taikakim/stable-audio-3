@@ -7,11 +7,13 @@ import torch
 import torchaudio
 import threading
 import os, time, math
+from pathlib import Path
 
 from einops import rearrange
 
 from stable_audio_3.interface.aeiou import audio_spectrogram_image
 from stable_audio_3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
+from stable_audio_3.inference.sampling import build_schedule
 from stable_audio_3.models.lora import has_lora
 from stable_audio_3.interface.reprompt import reprompt as _reprompt_fn, get_model as _reprompt_get_model, is_model_cached as _reprompt_is_model_cached
 
@@ -20,6 +22,105 @@ sample_size = 5324800
 sample_rate = 44100
 n_loras = 0
 _LENGTH_EXTRACT_RE = re.compile(r' Length: (\d+) seconds\.?\s*$')
+
+LATCH_DIR = Path(__file__).parent.parent.parent / "latch_weights_sa3"
+
+
+def _list_latch_models():
+    models = ["none"]
+    if LATCH_DIR.exists():
+        models.extend(sorted(f.name for f in LATCH_DIR.glob("*.pt")))
+    return models
+
+
+def _read_latch_metadata(model_name):
+    """Best-effort metadata read for a LatCH .pt (state_dict stripped). {} on failure."""
+    if not model_name or model_name == "none":
+        return {}
+    try:
+        path = LATCH_DIR / model_name
+        if not path.exists():
+            return {}
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(raw, dict) and "state_dict" in raw:
+            return {k: v for k, v in raw.items() if k != "state_dict"}
+    except Exception:
+        pass
+    return {}
+
+
+def create_sigma_chart(steps, dist_shift, latent_len, cfg_interval, cfg_scale, latch_windows=None):
+    """Chart the actual sampling sigma schedule, the CFG-active band, and LatCH windows.
+
+    Unlike the stable-audio-tools chart (which hooked the sampler for live data),
+    this derives the curve directly from build_schedule, so it matches the run
+    without instrumentation.
+    """
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from PIL import Image
+
+    sched = build_schedule(steps=int(steps), sigma_max=1.0, dist_shift=dist_shift,
+                           fallback_seq_len=int(latent_len), include_endpoint=True, device="cpu")
+    if sched.dim() == 2:
+        sched = sched[0]
+    sigmas = sched.float().cpu().numpy()
+    step_nums = list(range(len(sigmas)))
+    progresses = [1.0 - s for s in sigmas]
+
+    fig = Figure(figsize=(5, 4), dpi=100, facecolor='black')
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(facecolor='black')
+    for spine in ax.spines.values():
+        spine.set_color('white')
+    ax.tick_params(colors='white', which='both')
+    ax.xaxis.label.set_color('white')
+    ax.yaxis.label.set_color('white')
+    ax.title.set_color('white')
+
+    ax.plot(step_nums, sigmas, color='#4A90D9', linewidth=2, label='Sigma (noise level)')
+    ax.plot(step_nums, progresses, color='cyan', linewidth=1, linestyle='--', alpha=0.7, label='Progress (1-sigma)')
+
+    cfg_lo_p, cfg_hi_p = cfg_interval
+    cfg_start_step = cfg_end_step = None
+    for i, p in enumerate(progresses):
+        if cfg_start_step is None and p >= cfg_lo_p:
+            cfg_start_step = step_nums[i]
+        if cfg_end_step is None and p > cfg_hi_p:
+            cfg_end_step = step_nums[i]
+    max_step = step_nums[-1] if step_nums else int(steps)
+    cfg_lo = cfg_start_step if cfg_start_step is not None else step_nums[0]
+    cfg_hi = cfg_end_step if cfg_end_step is not None else max_step
+    if cfg_hi > cfg_lo:
+        ax.axvspan(cfg_lo, cfg_hi, alpha=0.2, color='#00FF00', label='CFG active')
+
+    if latch_windows:
+        win_labeled = ov_labeled = False
+        for ls, le in latch_windows:
+            lo, hi = ls * max_step, le * max_step
+            if hi <= lo:
+                continue
+            ax.axvspan(lo, hi, alpha=0.18, color='#FFD400',
+                       label=None if win_labeled else 'LatCH window')
+            win_labeled = True
+            ov_lo, ov_hi = max(lo, cfg_lo), min(hi, cfg_hi)
+            if ov_hi > ov_lo:
+                ax.axvspan(ov_lo, ov_hi, alpha=0.35, color='#FF8C00',
+                           label=None if ov_labeled else 'LatCH ∩ CFG')
+                ov_labeled = True
+
+    ax.set_xlabel('Step', fontsize=10)
+    ax.set_ylabel('Value (0-1)', fontsize=10)
+    ax.set_title(f'Sigma & CFG (scale={cfg_scale})', fontsize=11, color='white', pad=10)
+    ax.set_xlim(0, max_step)
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, color='gray', linestyle='-', linewidth=0.5)
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2, fontsize=7,
+              facecolor='black', edgecolor='white', labelcolor='white')
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.25)
+    canvas.draw()
+    return Image.fromarray(np.asarray(canvas.buffer_rgba()))
 
 
 # when using a prompt in a filename
@@ -64,6 +165,25 @@ def generate_cond(
         duration_padding_sec=6.0,
         batch_size=1,
         dist_shift=None,
+        latch_enable=False,
+        latch_model_1="none",
+        latch_target_1=1.0,
+        latch_weight_1=1.0,
+        latch_start_1=0.0,
+        latch_end_1=0.20,
+        latch_kind_1="constant",
+        latch_model_2="none",
+        latch_target_2=1.0,
+        latch_weight_2=1.0,
+        latch_start_2=0.0,
+        latch_end_2=0.20,
+        latch_kind_2="constant",
+        latch_rho=1.0,
+        latch_mu=1.0,
+        latch_gamma=0.3,
+        latch_n_iter=4,
+        latch_log_norms=False,
+        chart_sigma=False,
         *lora_args
     ):
 
@@ -164,7 +284,52 @@ def generate_cond(
             "inpaint_mask_end_seconds": mask_maskend,
         })
 
+    # LatCH guidance overrides the sampler with the gradient-enabled Euler path.
+    if latch_enable:
+        latch_configs = []
+        for m_name, kind, value, weight, start, end in [
+            (latch_model_1, latch_kind_1, latch_target_1, latch_weight_1, latch_start_1, latch_end_1),
+            (latch_model_2, latch_kind_2, latch_target_2, latch_weight_2, latch_start_2, latch_end_2),
+        ]:
+            if m_name and m_name != "none":
+                latch_configs.append({
+                    "model_path": str(LATCH_DIR / m_name),
+                    "kind": kind,
+                    "value": float(value),
+                    "weight": float(weight),
+                    "start_pct": float(start),
+                    "end_pct": float(end),
+                })
+        if latch_configs:
+            generate_args["latch_configs"] = latch_configs
+            generate_args["latch_hparams"] = {
+                "rho": float(latch_rho),
+                "mu": float(latch_mu),
+                "gamma": float(latch_gamma),
+                "n_iter": int(round(float(latch_n_iter))),
+                "log_norms": bool(latch_log_norms),
+            }
+
     audio = stable_audio_3_model.generate(**generate_args)
+
+    # Optional sigma/CFG/LatCH-window chart
+    sigma_chart_image = None
+    if chart_sigma:
+        latch_windows = []
+        if latch_enable:
+            if latch_model_1 and latch_model_1 != "none":
+                latch_windows.append((float(latch_start_1), float(latch_end_1)))
+            if latch_model_2 and latch_model_2 != "none":
+                latch_windows.append((float(latch_start_2), float(latch_end_2)))
+        ds_ratio = stable_audio_3_model.model.pretransform.downsampling_ratio
+        sigma_chart_image = create_sigma_chart(
+            steps=steps,
+            dist_shift=dist_shift if dist_shift is not None else stable_audio_3_model.model.sampling_dist_shift,
+            latent_len=input_sample_size // ds_ratio,
+            cfg_interval=(cfg_interval_min, cfg_interval_max),
+            cfg_scale=cfg_scale,
+            latch_windows=latch_windows,
+        )
 
     # Filenaming convention
     prompt_condensed = condense_prompt(prompt)
@@ -228,7 +393,7 @@ def generate_cond(
     # Asynchronously delete the files after returning the output file, so as to prevent clutter in the directory
     delete_files_async([output_wav, output_filename], 30)
 
-    return (output_filename, [audio_spectrogram, *preview_images])
+    return (output_filename, [audio_spectrogram, *preview_images], sigma_chart_image)
 
 #  Asynchronously delete the given list of filenames after delay seconds. Sets up thread that sleeps for delay then deletes.
 def delete_files_async(filenames, delay):
@@ -486,6 +651,86 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
                     )
                 seconds_total_slider.change(update_inpaint_sliders, inputs=[seconds_total_slider], outputs=[mask_maskstart_slider, mask_maskend_slider])
 
+            with gr.Accordion("LatCH Guidance", open=False):
+                l_models = _list_latch_models()
+                latch_enable_checkbox = gr.Checkbox(label="Enable LatCH (overrides sampler)", value=False)
+                with gr.Row():
+                    latch_rho_slider = gr.Slider(minimum=0.0, maximum=300.0, step=0.1, value=8.0, label="Variance ρ")
+                    latch_mu_slider = gr.Slider(minimum=0.0, maximum=300.0, step=0.1, value=8.0, label="Mean μ")
+                    latch_gamma_slider = gr.Slider(minimum=0.0, maximum=20.0, step=0.05, value=0.3, label="Noise γ")
+                    latch_n_iter_slider = gr.Slider(minimum=1, maximum=80, step=1, value=6, label="Mean iters")
+                    latch_log_checkbox = gr.Checkbox(label="Log gradient norms", value=False)
+                latch_chart_checkbox = gr.Checkbox(label="Show sigma/window chart", value=False)
+
+                gr.Markdown("**Slot 1**")
+                with gr.Row():
+                    latch_model_1_dropdown = gr.Dropdown(l_models, label="Model", value="none")
+                    latch_kind_1_dropdown = gr.Dropdown(
+                        ["constant", "ramp_up", "ramp_down", "beat_grid"], label="Target kind", value="constant")
+                with gr.Row():
+                    latch_target_1_slider = gr.Slider(minimum=-80.0, maximum=20.0, step=0.5, value=-30.0, label="Target value")
+                    latch_weight_1_slider = gr.Slider(minimum=0.0, maximum=500.0, step=0.1, value=1.0, label="Weight")
+                with gr.Row():
+                    latch_start_1_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="Start %")
+                    latch_end_1_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.60, label="End %")
+
+                gr.Markdown("**Slot 2**")
+                with gr.Row():
+                    latch_model_2_dropdown = gr.Dropdown(l_models, label="Model", value="none")
+                    latch_kind_2_dropdown = gr.Dropdown(
+                        ["constant", "ramp_up", "ramp_down", "beat_grid"], label="Target kind", value="constant")
+                with gr.Row():
+                    latch_target_2_slider = gr.Slider(minimum=-80.0, maximum=20.0, step=0.5, value=-30.0, label="Target value")
+                    latch_weight_2_slider = gr.Slider(minimum=0.0, maximum=500.0, step=0.1, value=1.0, label="Weight")
+                with gr.Row():
+                    latch_start_2_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.0, label="Start %")
+                    latch_end_2_slider = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.60, label="End %")
+
+                def _on_latch_model_change(model_name, kind):
+                    md = _read_latch_metadata(model_name)
+                    stats = md.get("feature_stats", {}) if md else {}
+                    default_kind = md.get("target_kind_default", "constant") if md else "constant"
+                    if kind == "beat_grid":
+                        slider_min, slider_max, slider_step, slider_val = 30.0, 240.0, 1.0, 120.0
+                    elif md and md.get("slider_min") is not None and md.get("slider_max") is not None:
+                        slider_min = float(md["slider_min"])
+                        slider_max = float(md["slider_max"])
+                        slider_step = max((slider_max - slider_min) / 100.0, 1e-4)
+                        slider_val = float(stats.get("mean", (slider_min + slider_max) / 2.0))
+                        slider_val = min(max(slider_val, slider_min), slider_max)
+                    elif stats and "min" in stats and "max" in stats:
+                        slider_min = float(stats["min"])
+                        slider_max = float(stats["max"]) * 2.0 if stats["max"] > 0 else 1.0
+                        slider_step = max((slider_max - slider_min) / 100.0, 1e-4)
+                        slider_val = float(stats.get("mean", (slider_min + slider_max) / 2.0))
+                    else:
+                        slider_min, slider_max, slider_step, slider_val = -80.0, 20.0, 0.5, -30.0
+                    return (
+                        gr.update(minimum=slider_min, maximum=slider_max, step=slider_step, value=slider_val),
+                        gr.update(value=default_kind if model_name != "none" else kind),
+                    )
+
+                latch_model_1_dropdown.change(
+                    fn=_on_latch_model_change,
+                    inputs=[latch_model_1_dropdown, latch_kind_1_dropdown],
+                    outputs=[latch_target_1_slider, latch_kind_1_dropdown])
+                latch_model_2_dropdown.change(
+                    fn=_on_latch_model_change,
+                    inputs=[latch_model_2_dropdown, latch_kind_2_dropdown],
+                    outputs=[latch_target_2_slider, latch_kind_2_dropdown])
+
+                def _on_latch_kind_change(model_name, kind):
+                    return _on_latch_model_change(model_name, kind)[0]
+
+                latch_kind_1_dropdown.change(
+                    fn=_on_latch_kind_change,
+                    inputs=[latch_model_1_dropdown, latch_kind_1_dropdown],
+                    outputs=[latch_target_1_slider])
+                latch_kind_2_dropdown.change(
+                    fn=_on_latch_kind_change,
+                    inputs=[latch_model_2_dropdown, latch_kind_2_dropdown],
+                    outputs=[latch_target_2_slider])
+
             inputs = [
                 prompt,
                 negative_prompt,
@@ -516,12 +761,32 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
                 duration_padding_slider,
                 batch_size_state,
                 dist_shift_state,
+                latch_enable_checkbox,
+                latch_model_1_dropdown,
+                latch_target_1_slider,
+                latch_weight_1_slider,
+                latch_start_1_slider,
+                latch_end_1_slider,
+                latch_kind_1_dropdown,
+                latch_model_2_dropdown,
+                latch_target_2_slider,
+                latch_weight_2_slider,
+                latch_start_2_slider,
+                latch_end_2_slider,
+                latch_kind_2_dropdown,
+                latch_rho_slider,
+                latch_mu_slider,
+                latch_gamma_slider,
+                latch_n_iter_slider,
+                latch_log_checkbox,
+                latch_chart_checkbox,
             ] + lora_ui_inputs
 
         with gr.Column():
             audio_output = gr.Audio(label="Output audio", interactive=False,
                     waveform_options=gr.WaveformOptions(show_recording_waveform=False))
             audio_spectrogram_output = gr.Gallery(label="Output spectrogram", show_label=False)
+            sigma_chart_output = gr.Image(label="Sigma / CFG / LatCH chart", show_label=True)
             send_to_init_button = gr.Button("Send to init audio", scale=1)
             send_to_init_button.click(fn=lambda audio: audio, inputs=[audio_output], outputs=[init_audio_input])
 
@@ -532,7 +797,8 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
         inputs=inputs,
         outputs=[
             audio_output,
-            audio_spectrogram_output
+            audio_spectrogram_output,
+            sigma_chart_output
         ],
         api_name="generate")
 

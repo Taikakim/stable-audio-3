@@ -224,12 +224,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         diffusion_opt_config = self.optimizer_configs['diffusion']
         opt_type = diffusion_opt_config['optimizer'].get('type')
 
-        if self.lora_config is not None:
-            opt_params = [*get_lora_params(self.diffusion.model), *get_lora_params(self.diffusion.conditioner)]
-        elif opt_type == 'MuonAdamW':
-            # Pass (name, param) tuples so MuonAdamW can match fused layer patterns
-            opt_params = [(n, p) for n, p in self.diffusion.named_parameters() if p.requires_grad]
-        elif opt_type == 'FusionOpt':
+        if opt_type == 'FusionOpt':
             # FusionOpt routes 2D matrices (min(shape) >= 128) to the spectral
             # Muon+MONA+KL-Shampoo path and everything else to a ScheduleFree-AdamW
             # scalar path. NOTE: the min(shape)>=128 threshold was designed for the
@@ -237,14 +232,27 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             # much larger, but the threshold still partitions cleanly. Use the
             # optimizer config's `force_scalar` (passed through `param_groups`) or
             # `spectral_lr`/`scalar_lr` to tune per-group LR if desired.
+            #
+            # build_fusion_param_groups filters to requires_grad params, so under
+            # LoRA it captures EXACTLY the trainable LoRA adapters and routes them
+            # into spectral/scalar groups (the frozen base is excluded). We route
+            # over the whole self.diffusion so conditioner LoRA params are included
+            # too; for a full (non-LoRA) finetune we keep the original model-only
+            # root.
             from stable_audio_tools.training.fusion_groups import (
                 build_fusion_param_groups, summarise_groups,
             )
             pg_cfg = diffusion_opt_config['optimizer'].get('param_groups', {}) or {}
-            opt_params = build_fusion_param_groups(self.diffusion.model, **pg_cfg)
+            route_root = self.diffusion if self.lora_config is not None else self.diffusion.model
+            opt_params = build_fusion_param_groups(route_root, **pg_cfg)
             if get_rank() == 0:
                 print("FusionOpt param groups:")
                 print(summarise_groups(opt_params))
+        elif self.lora_config is not None:
+            opt_params = [*get_lora_params(self.diffusion.model), *get_lora_params(self.diffusion.conditioner)]
+        elif opt_type == 'MuonAdamW':
+            # Pass (name, param) tuples so MuonAdamW can match fused layer patterns
+            opt_params = [(n, p) for n, p in self.diffusion.named_parameters() if p.requires_grad]
         else:
             # Only include parameters that require gradients (excludes frozen pretransform, conditioner, etc.)
             opt_params = [p for p in self.diffusion.parameters() if p.requires_grad]
@@ -654,12 +662,27 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         if self.lora_config is not None:
+            # Preserve the resume-relevant keys Lightning populated (optimizer
+            # state, LR schedulers, epoch/step counters) BEFORE clearing the
+            # frozen 2.3B base weights out of the checkpoint. Only LoRA params
+            # have optimizer state, so these stay LoRA-scale (tens of MB).
+            resume_state = {
+                k: checkpoint[k]
+                for k in (
+                    'optimizer_states',
+                    'lr_schedulers',
+                    'epoch',
+                    'global_step',
+                )
+                if k in checkpoint
+            }
             checkpoint.clear()
             checkpoint['state_dict'] = {
                 **get_lora_state_dict(self.diffusion.model),
                 **get_lora_state_dict(self.diffusion.conditioner)
             }
             checkpoint['lora_config'] = self.lora_config
+            checkpoint.update(resume_state)
 
     # ------------------------------------------------------------------
     # FusionOpt Schedule-Free lifecycle hooks

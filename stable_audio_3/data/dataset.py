@@ -323,6 +323,7 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         min_length_sec=None,
         max_length_sec=None,
         random_crop=False,
+        beat_aware_crop=False,
         tokenizers: Optional[dict] = None,
     ):
         super().__init__()
@@ -350,6 +351,7 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
         self.latent_crop_length = latent_crop_length
         self.random_crop = random_crop
+        self.beat_aware_crop = beat_aware_crop
 
         self.min_length_sec = min_length_sec
         self.max_length_sec = max_length_sec
@@ -362,6 +364,58 @@ class PreEncodedDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.filenames)
+
+    def _get_downbeat_starts(self, latent_filename, stored_length, max_start):
+        """Return a list of valid crop-start frame indices that land on a downbeat
+        (fallback: beat), scaled to latent-frame units. Empty list => caller falls
+        back to uniform random_crop. max_start = last_ix - latent_crop_length (inclusive)."""
+        # Resolve sibling <stem>.TIMESERIES.npz (latent_filename ends in .npy)
+        base = latent_filename[:-4] if latent_filename.endswith(".npy") else os.path.splitext(latent_filename)[0]
+        npz_path = base + ".TIMESERIES.npz"
+        if not os.path.exists(npz_path) or max_start < 0:
+            return []
+        try:
+            with np.load(npz_path) as npz:
+                if "downbeat_activation_ts" in npz:
+                    acts = npz["downbeat_activation_ts"]
+                elif "beat_activation_ts" in npz:
+                    acts = npz["beat_activation_ts"]
+                else:
+                    return []
+                acts = np.asarray(acts, dtype=np.float32).reshape(-1)
+        except Exception:
+            return []
+
+        if acts.size == 0 or not np.isfinite(acts).any():
+            return []
+
+        # Peak-pick downbeat activations. NOTE: the whole-track timeseries producer
+        # resamples madmom activations to the ~10.767 Hz latent grid, which smears the
+        # original sharp peaks down to ~0.1-0.2 — a fixed ">0.5" threshold never fires.
+        # Use scipy peak-picking with an adaptive (per-track) height threshold instead,
+        # plus a minimum inter-peak distance so close duplicates collapse.
+        amax = float(acts.max())
+        if amax <= 0.0:
+            return []
+        thr = max(acts.mean() + acts.std(), 0.4 * amax)
+        try:
+            from scipy.signal import find_peaks
+            cand, _ = find_peaks(acts, height=thr, distance=4)
+        except Exception:
+            # numpy-only local-maxima fallback
+            ge_prev = np.r_[True, acts[1:] >= acts[:-1]]
+            ge_next = np.r_[acts[:-1] >= acts[1:], True]
+            cand = np.flatnonzero(ge_prev & ge_next & (acts >= thr))
+        if cand.size == 0:
+            return []
+
+        # Scale npz indices -> latent-frame units (handles length mismatch)
+        if acts.size != stored_length:
+            cand = np.floor(cand.astype(np.float64) * (stored_length / acts.size)).astype(np.int64)
+
+        # Keep only candidates that yield a fully in-range crop
+        cand = cand[(cand >= 0) & (cand <= max_start)]
+        return cand.tolist()
 
     def _get_silence_for_file(self, latent_filename):
         """Return the silence latent for the dataset that contains this file, or None."""
@@ -392,7 +446,17 @@ class PreEncodedDataset(torch.utils.data.Dataset):
                     last_ix = len(info["padding_mask"]) - 1 - info["padding_mask"][::-1].index(1)
 
                     if self.random_crop and last_ix > self.latent_crop_length:
-                        start = random.randint(0, last_ix - self.latent_crop_length)
+                        max_start = last_ix - self.latent_crop_length
+                        start = None
+                        if self.beat_aware_crop:
+                            db_starts = self._get_downbeat_starts(
+                                latent_filename, stored_length, max_start
+                            )
+                            if db_starts:
+                                start = random.choice(db_starts)
+                        if start is None:
+                            # Fallback: uniform random offset
+                            start = random.randint(0, max_start)
                     else:
                         start = 0
 

@@ -116,6 +116,7 @@ def train(args):
             [LatentDatasetConfig(id="train", path=args.encoded_dir)],
             latent_crop_length=sample_size // ds_ratio,
             random_crop=True,
+            beat_aware_crop=args.beat_aware_crop,
         )
     else:
         dataset = SampleDataset(
@@ -152,18 +153,40 @@ def train(args):
         "include": args.include,
         "exclude": args.exclude,
     }
-    optimizer_config = {
-        "diffusion": {
-            "optimizer": {
-                "type": "AdamW",
-                "config": {
-                    "lr": args.lr,
-                    "weight_decay": 0.01,
-                    "betas": [0.9, 0.95],
-                },
+    if args.optimizer == "fusion":
+        # FusionOpt with ALL components enabled (full Fusion): Muon NS5 +
+        # SF-NorMuon row-scaling + Schedule-Free averaging + MONA curvature
+        # momentum + KL-Shampoo two-sided preconditioner. The wrapper's
+        # configure_optimizers() routes the trainable LoRA adapters (model +
+        # conditioner, requires_grad only) into spectral/scalar param groups via
+        # build_fusion_param_groups(). hot_dtype=bf16 is the production default
+        # (fp32-range exponent, can't overflow the NS5 quintic). lr from --lr is
+        # the Schedule-Free Polyak gamma_base.
+        optimizer_config = {
+            "diffusion": {
+                "optimizer": {
+                    "type": "FusionOpt",
+                    "config": {
+                        "lr": args.lr,
+                        "components": ["mona", "ns5", "normuon", "sf"],  # shampoo OFF (KL-Shampoo preconditioners OOM rank-128 on 16GB)
+                        "hot_dtype": "bf16",
+                    },
+                }
             }
         }
-    }
+    else:
+        optimizer_config = {
+            "diffusion": {
+                "optimizer": {
+                    "type": "AdamW",
+                    "config": {
+                        "lr": args.lr,
+                        "weight_decay": 0.01,
+                        "betas": [0.9, 0.95],
+                    },
+                }
+            }
+        }
 
     training_wrapper = DiffusionCondTrainingWrapper(
         model,
@@ -187,6 +210,15 @@ def train(args):
         ot_coupling=True,
         base_precision=args.base_precision,
     )
+
+    if args.compile:
+        # Compile the inner DiT — frozen base + LoRA parametrization passes through.
+        # First step pays Triton autotune ~60-120s; Inductor cache persists via the
+        # TRITON_CACHE_DIR set by rocm_env.yaml.
+        print("[compile] torch.compile(training_wrapper.diffusion.model)")
+        training_wrapper.diffusion.model = torch.compile(
+            training_wrapper.diffusion.model
+        )
 
     exc_callback = ExceptionCallback()
 
@@ -221,9 +253,14 @@ def train(args):
         logger = None
         checkpoint_dir = args.save_dir if args.save_dir else None
 
-    ckpt_callback = pl.callbacks.ModelCheckpoint(
-        every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1
-    )
+    if args.checkpoint_every_epochs:
+        ckpt_callback = pl.callbacks.ModelCheckpoint(
+            every_n_epochs=args.checkpoint_every_epochs, dirpath=checkpoint_dir, save_top_k=-1
+        )
+    else:
+        ckpt_callback = pl.callbacks.ModelCheckpoint(
+            every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1
+        )
 
     demo_dl = torch.utils.data.DataLoader(
         dataset,
@@ -254,7 +291,9 @@ def train(args):
         demo_dl=demo_dl,
     )
 
-    callbacks = [ckpt_callback, exc_callback, demo_callback]
+    callbacks = [ckpt_callback, exc_callback]
+    if not args.no_demos:
+        callbacks.append(demo_callback)
 
     # Combine args and config dicts
     args_dict = vars(args)
@@ -274,11 +313,12 @@ def train(args):
         accelerator="auto",
         strategy="auto",
         precision="bf16-mixed",
-        accumulate_grad_batches=1,
+        accumulate_grad_batches=args.accumulate_grad_batches,
         callbacks=callbacks,
         logger=logger,
         log_every_n_steps=1,
-        max_steps=args.steps,
+        max_steps=(-1 if args.epochs else args.steps),
+        max_epochs=(args.epochs if args.epochs else None),
         default_root_dir=args.save_dir,
         gradient_clip_val=args.gradient_clip_val,
         reload_dataloaders_every_n_epochs=0,
@@ -307,6 +347,14 @@ def main():
         "--encoded_dir",
         default=None,
         help="Pre-encoded latent directory from pre_encode_dataset.py (.npy/.json pairs; captions embedded in .json, no .txt needed)",
+    )
+    p.add_argument(
+        "--beat-aware-crop",
+        dest="beat_aware_crop",
+        action="store_true",
+        help="When using --encoded_dir, start each random sub-crop on a downbeat "
+             "(from sibling .TIMESERIES.npz downbeat_activation_ts; falls back to "
+             "beat_activation_ts, then uniform random if unavailable).",
     )
     p.add_argument("--rank", type=int, default=16)
     p.add_argument(
@@ -364,6 +412,23 @@ def main():
         default=None,
         help="Path to an existing LoRA .safetensors checkpoint to resume from",
     )
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile the inner diffusion model (after LoRA is applied). "
+                        "First step pays Triton/Inductor autotune cost; the cache persists "
+                        "via the TRITON_CACHE_DIR set by rocm_env.yaml. Skip if it errors.")
+    p.add_argument("--no_demos", action="store_true",
+                   help="Skip the inpaint-demo callback (each demo = 3 cfg scales × 50 ODE "
+                        "steps × ~4 s ≈ 10 min). Use for short tuning runs.")
+    p.add_argument(
+        "--optimizer",
+        choices=["adamw", "fusion"],
+        default="adamw",
+        help="Optimizer for the trainable LoRA params. 'adamw' (default) = "
+             "AdamW(lr, wd=0.01, betas=[0.9,0.95]). 'fusion' = FusionOpt with "
+             "ALL components on (Muon NS5 + SF-NorMuon + Schedule-Free + MONA + "
+             "KL-Shampoo, hot_dtype=bf16); routes the LoRA params into "
+             "spectral/scalar groups automatically.",
+    )
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=1)
@@ -373,6 +438,14 @@ def main():
         default=380.0,
         help="Maximum clip duration in seconds (default 380)",
     )
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Train for N epochs (overrides --steps; uses Trainer max_epochs).")
+    p.add_argument("--accumulate_grad_batches", type=int, default=1,
+                   help="Gradient accumulation steps; effective batch = batch_size * this.")
+    p.add_argument("--gradient_clip_val", type=float, default=0.0,
+                   help="Gradient clip norm (0 = disabled).")
+    p.add_argument("--checkpoint_every_epochs", type=int, default=None,
+                   help="Checkpoint every N epochs (epoch mode; else use --checkpoint_every steps).")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--logger", choices=["wandb", "comet", "csv", "none"], default="csv")
     p.add_argument("--name", type=str, default="lora-finetune")

@@ -221,6 +221,26 @@ def train(args):
         print(f"Standardize: mean={std_mean:.4f} std={std_std:.4f}")
     use_bf16 = args.precision == "bf16"
 
+    # --- EMA of the HEAD's params (no DiT here). When --ema>0 we keep a param-wise
+    #     exponential moving average updated on each OPTIMIZER step (every --grad-accum
+    #     micro-batches), and the EMA iterate is what gets saved (it's what we evaluate). ---
+    ema_params = None
+    if args.ema > 0.0:
+        ema_params = [p.detach().clone() for p in model.parameters()]
+        print(f"EMA: on, decay={args.ema} (saved checkpoint will be the EMA weights)")
+
+    def ema_state_dict():
+        """state_dict with the EMA params swapped in (restores live params after)."""
+        backup = [p.detach().clone() for p in model.parameters()]
+        with torch.no_grad():
+            for p, e in zip(model.parameters(), ema_params):
+                p.copy_(e)
+        sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        with torch.no_grad():
+            for p, b in zip(model.parameters(), backup):
+                p.copy_(b)
+        return sd
+
     # --- Full tiered telemetry -> wandb. STANDING REQUIREMENT (SAO/MASTER.md): every
     #     control-head run logs per-layer norms / dist-from-init / weight-space trajectory
     #     via avp_sa3's TrainTelemetry (RF loss is blind to control; the per-layer + trajectory
@@ -249,7 +269,11 @@ def train(args):
             opt.train()  # SF eval point y = (1-β)·z + β·x in live params
 
         total, nbatches = 0.0, 0
-        for batch in loader:
+        accum = max(1, args.grad_accum)   # effective batch = batch_size * accum
+        n_micro = len(loader)
+        opt.zero_grad()
+        micro_in_group = 0
+        for bi, batch in enumerate(loader):
             latents = batch["latents"].to(device)
             targets = batch["targets"].to(device)
             mask = batch["mask"].to(device)
@@ -261,24 +285,32 @@ def train(args):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 preds = model(z_t, t)
             loss = criterion(preds.float(), targets, mask)
-            opt.zero_grad()
-            loss.backward()
-            if is_fusion:
-                # Polyak γ_t = γ_base·clamp(loss_ema / gnorm_ema) needs the loss tensor
-                opt.set_loss(loss)
-            if telem is not None:
-                gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))  # measure only, no real clip
-                if hasattr(opt, "_telem_on"):       # FusionOpt: instrument the step we're about to log
-                    opt._telem_on = (step % args.log_every == 0)
-            opt.step()
-            if telem is not None:
-                _now = _time.perf_counter()
-                _rate = 1.0 / max(_now - _t_prev, 1e-6); _t_prev = _now
-                telem.log(step, loss=loss.item(), gnorm=gnorm, it_s=_rate,
-                          lr=opt.param_groups[0]["lr"], epoch=epoch)
-            step += 1
-            total += loss.item()
+            (loss / accum).backward()    # scale so accumulated grads ≈ mean over the effective batch
+            total += loss.item()         # report the unscaled per-micro-batch loss
             nbatches += 1
+            micro_in_group += 1
+            is_last = (bi == n_micro - 1)
+            if micro_in_group == accum or is_last:   # optimizer step every `accum` micro-batches (+ final partial group)
+                if is_fusion:
+                    # Polyak γ_t = γ_base·clamp(loss_ema / gnorm_ema) needs the loss tensor
+                    opt.set_loss(loss)
+                if telem is not None:
+                    gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))  # measure only, no real clip
+                    if hasattr(opt, "_telem_on"):       # FusionOpt: instrument the step we're about to log
+                        opt._telem_on = (step % args.log_every == 0)
+                opt.step()
+                opt.zero_grad()
+                if ema_params is not None:   # EMA on the optimizer step (every `accum` micro-batches), not per micro-batch
+                    with torch.no_grad():
+                        for e, p in zip(ema_params, model.parameters()):
+                            e.lerp_(p.detach(), 1.0 - args.ema)
+                if telem is not None:
+                    _now = _time.perf_counter()
+                    _rate = 1.0 / max(_now - _t_prev, 1e-6); _t_prev = _now
+                    telem.log(step, loss=loss.item(), gnorm=gnorm, it_s=_rate,
+                              lr=opt.param_groups[0]["lr"], epoch=epoch)
+                step += 1
+                micro_in_group = 0
         avg_loss = total / max(nbatches, 1)
         print(f"epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}")
 
@@ -300,7 +332,10 @@ def train(args):
             ckpt_path = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}.pt")
         if ckpt_path is not None:
             torch.save({
-                "state_dict": model.state_dict(),
+                "state_dict": ema_state_dict() if ema_params is not None else model.state_dict(),
+                "ema": args.ema,
+                "grad_accum": args.grad_accum,
+                "effective_batch": args.batch_size * max(1, args.grad_accum),
                 "feature_name": args.feature,
                 "noise_schedule": "rectified_flow",
                 "loss_type": loss_type,
@@ -346,6 +381,15 @@ if __name__ == "__main__":
                         "rms and low-variance spectral features (LATCH_RESULTS §18).")
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--ema", type=float, default=0.0,
+                   help="EMA decay for the LatCH head's params (0 = off, e.g. 0.999). When >0, "
+                        "a param-wise exponential moving average is updated on each optimizer step "
+                        "and the SAVED checkpoint's state_dict is the EMA (the EMA iterate is what "
+                        "we evaluate). Damping for the flat-RF drift (SAO/MASTER.md §4).")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Accumulate grads over N micro-batches before optimizer.step() "
+                        "(loss scaled by 1/N, step+zero_grad every N, final partial group steps too). "
+                        "Effective batch = batch_size * N. EMA updates on the optimizer step, not per micro-batch.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--save-dir", default="latch_weights_sa3")
     p.add_argument("--save-best-only", action="store_true",

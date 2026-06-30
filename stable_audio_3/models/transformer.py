@@ -2,6 +2,21 @@ from functools import reduce, partial
 from packaging import version
 import logging
 import math
+import os
+
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Escape hatches for flash-attn issues:
+#   SA3_DISABLE_FLASH_ATTN=1    -> disable flash-attn entirely (force SDPA).
+#   SA3_DISABLE_FLASH_VARLEN=1  -> disable ONLY the varlen path, keep the standard
+#                                  flash_attn_func path. Useful on ROCm where the
+#                                  aiter Triton-AMD varlen_fwd signature is skewed
+#                                  from the flash_attn wrapper (e.g. the num_splits
+#                                  arg) but the non-varlen fwd path works fine.
+_SA3_DISABLE_FLASH_ATTN = _env_flag("SA3_DISABLE_FLASH_ATTN")
+_SA3_DISABLE_FLASH_VARLEN = _SA3_DISABLE_FLASH_ATTN or _env_flag("SA3_DISABLE_FLASH_VARLEN")
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
@@ -20,6 +35,8 @@ except ImportError:
     flex_attention_available = False
 
 try:
+    if _SA3_DISABLE_FLASH_ATTN:
+        raise ImportError("flash attention disabled via SA3_DISABLE_FLASH_ATTN")
     from flash_attn import flash_attn_func, flash_attn_kvpacked_func
 except ImportError as e:
     print(e)
@@ -28,6 +45,8 @@ except ImportError as e:
     flash_attn_func = None
 
 try:
+    if _SA3_DISABLE_FLASH_VARLEN:
+        raise ImportError("flash varlen attention disabled via SA3_DISABLE_FLASH_VARLEN")
     from flash_attn import flash_attn_varlen_func
     from flash_attn.bert_padding import pad_input, unpad_input, index_first_axis
 except ImportError as e:

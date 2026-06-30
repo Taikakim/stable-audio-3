@@ -169,10 +169,22 @@ def _st_weights(sigmas_1d):
     return alpha / denom
 
 
+def _scaled_step(grad, ref, normalize):
+    """Guidance step direction. Raw gradient by default; when normalize=True, a unit-norm
+    direction rescaled to ref's per-sample norm -> the gain becomes dimensionless (the fraction
+    of the perturbed tensor's norm moved per step), so the useful range gravitates to O(0.01-1)
+    and a single gain transfers across features/losses (removes cosine's 1/||pred|| scale)."""
+    if not normalize:
+        return grad
+    gn = grad.flatten(1).norm(dim=1).clamp_min(1e-8).view(-1, 1, 1)
+    rn = ref.detach().flatten(1).norm(dim=1).view(-1, 1, 1)
+    return grad / gn * rn
+
+
 def sample_flow_euler_latch_guided(
     model, x, sigmas, *, head, target,
     rho=1.0, mu=1.0, gamma=0.3, n_iter=4,
-    window=(0.5, 1.0), loss_type="mse",
+    window=(0.5, 1.0), loss_type="mse", normalize=False,
     disable_tqdm=False, **model_kwargs,
 ):
     """Euler sampling with selective TFG from a LatCH head.
@@ -234,7 +246,7 @@ def sample_flow_euler_latch_guided(
             pred = head(x, t_curr)
             loss = head_loss(pred, target)
             grad = torch.autograd.grad(loss, x)[0]
-            x = (x - rho_t * grad).detach()
+            x = (x - rho_t * _scaled_step(grad, x, normalize)).detach()
 
         # --- Model velocity (no grad needed through the DiT for mean guidance) ---
         with torch.no_grad():
@@ -250,7 +262,7 @@ def sample_flow_euler_latch_guided(
                 aug = z0 + gamma * torch.randn_like(z0)
                 loss = head_loss(head(aug, t0), target)
                 grad = torch.autograd.grad(loss, z0)[0]
-                z0 = (z0 - mu_t * grad).detach()
+                z0 = (z0 - mu_t * _scaled_step(grad, z0, normalize)).detach()
             x_hat0 = z0
 
         # --- Euler update reconstructed from the (possibly guided) clean estimate ---

@@ -5,7 +5,10 @@ import typing as tp
 from torch.nn.functional import interpolate
 
 from stable_audio_3.inference.audio_utils import prepare_audio, numpy_audio_to_tensor
-from stable_audio_3.inference.sampling import sample_diffusion
+from stable_audio_3.inference.sampling import sample_diffusion, build_schedule
+from stable_audio_3.inference.latch_guided import sample_flow_euler_multi_latch_guided
+from stable_audio_3.inference.latch_targets import build_target as _build_latch_target
+from stable_audio_3.models.latch import load_latch_from_checkpoint
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
 from stable_audio_3.model_configs import ae_models, all_models
 from stable_audio_3.models.lora import (
@@ -103,6 +106,8 @@ class StableAudioModel:
         duration_padding_sec: float = 6.0,
         apg_scale: float = 1.0,
         dist_shift=None,
+        latch_configs: tp.Optional[tp.List[dict]] = None,
+        latch_hparams: tp.Optional[dict] = None,
         return_latents: bool = False,
         chunked_decode: tp.Optional[bool] = None,
         **sampler_kwargs,
@@ -314,32 +319,49 @@ class StableAudioModel:
 
         sampler_type = sampler_kwargs.pop("sampler_type", None)
 
-        result = sample_diffusion(
-            model=self.model.model,
-            noise=noise,
-            cond_inputs=cond_inputs,
-            diffusion_objective=self.model.diffusion_objective,
-            steps=steps,
-            cfg_scale=cfg_scale,
-            conditioning=conditioning,
-            sample_rate=self.model.sample_rate,
-            pretransform=self.model.pretransform,
-            mask_padding_attention=True,
-            use_effective_length_for_schedule=True,
-            headroom_seconds=duration_padding_sec,
-            dist_shift=dist_shift
-            if dist_shift is not None
-            else self.model.sampling_dist_shift,
-            sampler_type=sampler_type,
-            batch_cfg=True,
-            rescale_cfg=True,
-            apg_scale=apg_scale,
-            init_data=init_audio,
-            init_noise_level=init_noise_level,
-            decode=not return_latents,
-            chunked_decode=chunked_decode,
-            **sampler_kwargs,
-        )
+        if latch_configs:
+            result = self._latch_guided_generate(
+                noise=noise,
+                cond_inputs=cond_inputs,
+                latch_configs=latch_configs,
+                latch_hparams=latch_hparams or {},
+                steps=steps,
+                cfg_scale=cfg_scale,
+                apg_scale=apg_scale,
+                batch_size=batch_size,
+                latent_sample_size=latent_sample_size,
+                dist_shift=dist_shift
+                if dist_shift is not None
+                else self.model.sampling_dist_shift,
+                return_latents=return_latents,
+            )
+        else:
+            result = sample_diffusion(
+                model=self.model.model,
+                noise=noise,
+                cond_inputs=cond_inputs,
+                diffusion_objective=self.model.diffusion_objective,
+                steps=steps,
+                cfg_scale=cfg_scale,
+                conditioning=conditioning,
+                sample_rate=self.model.sample_rate,
+                pretransform=self.model.pretransform,
+                mask_padding_attention=True,
+                use_effective_length_for_schedule=True,
+                headroom_seconds=duration_padding_sec,
+                dist_shift=dist_shift
+                if dist_shift is not None
+                else self.model.sampling_dist_shift,
+                sampler_type=sampler_type,
+                batch_cfg=True,
+                rescale_cfg=True,
+                apg_scale=apg_scale,
+                init_data=init_audio,
+                init_noise_level=init_noise_level,
+                decode=not return_latents,
+                chunked_decode=chunked_decode,
+                **sampler_kwargs,
+            )
 
         if not return_latents:
             result = result.to(torch.float32).clamp(-1, 1)
@@ -359,6 +381,116 @@ class StableAudioModel:
                     )
 
         return result
+
+    def _latch_guided_generate(
+        self,
+        *,
+        noise,
+        cond_inputs,
+        latch_configs,
+        latch_hparams,
+        steps,
+        cfg_scale,
+        apg_scale,
+        batch_size,
+        latent_sample_size,
+        dist_shift,
+        return_latents,
+    ):
+        """Run flow-matching Euler sampling with one or more LatCH guides.
+
+        Overrides the normal sampler: builds the schedule, loads each head,
+        constructs its target on the latent frame grid, and dispatches to the
+        gradient-enabled multi-guide sampler. Heads run fp32; the diffusion model
+        may be fp16 (the sampler casts for the head forward).
+
+        generate() runs under @torch.inference_mode(), but TFG needs autograd.
+        We escape inference mode here and clone the inbound tensors (noise,
+        conditioning) into normal tensors so the guidance gradients can flow.
+        """
+        device = str(self.device)
+        ds_ratio = self.model.pretransform.downsampling_ratio
+        latent_fps = float(self.model.sample_rate) / float(ds_ratio)
+
+        def _clean(t):
+            """Copy inference tensors (created under inference_mode) into normal ones."""
+            if torch.is_tensor(t):
+                return t.clone()
+            if isinstance(t, list):
+                return [_clean(v) for v in t]
+            if isinstance(t, tuple):
+                return tuple(_clean(v) for v in t)
+            if isinstance(t, dict):
+                return {k: _clean(v) for k, v in t.items()}
+            return t
+
+        with torch.inference_mode(False), torch.enable_grad():
+            noise = _clean(noise)
+            cond_inputs = _clean(cond_inputs)
+
+            sigmas = build_schedule(
+                steps=steps,
+                sigma_max=1.0,
+                dist_shift=dist_shift,
+                fallback_seq_len=latent_sample_size,
+                include_endpoint=True,
+                device=device,
+            )
+
+            guides = []
+            for cfg in latch_configs:
+                head = load_latch_from_checkpoint(cfg["model_path"], device=device)
+                meta = getattr(head, "metadata", {}) or {}
+                head_sched = meta.get("noise_schedule")
+                if head_sched is not None and head_sched != self.model.diffusion_objective:
+                    print(
+                        f"[LatCH] WARNING: head trained for noise_schedule='{head_sched}' "
+                        f"but model objective is '{self.model.diffusion_objective}'."
+                    )
+                kind = cfg.get("kind") or meta.get("target_kind_default", "constant")
+                value = float(cfg.get("value", 1.0))
+                target = _build_latch_target(
+                    kind, value,
+                    batch_size=batch_size,
+                    channels=head.out_channels,
+                    frames=latent_sample_size,
+                    fps=latent_fps,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if meta.get("standardized"):
+                    _m = float(meta.get("std_mean", 0.0))
+                    _s = float(meta.get("std_std", 1.0)) or 1.0
+                    target = (target - _m) / _s
+                guides.append({
+                    "head": head,
+                    "target": target,
+                    "weight": float(cfg.get("weight", 1.0)),
+                    "start_pct": float(cfg.get("start_pct", 0.0)),
+                    "end_pct": float(cfg.get("end_pct", 1.0)),
+                    "loss_type": meta.get("loss_type", "mse"),
+                    "huber_beta": meta.get("huber_beta") or 1.0,
+                })
+
+            hp = {
+                "rho": float(latch_hparams.get("rho", 1.0)),
+                "mu": float(latch_hparams.get("mu", 1.0)),
+                "gamma": float(latch_hparams.get("gamma", 0.3)),
+                "n_iter": int(latch_hparams.get("n_iter", 4)),
+                "log_norms": bool(latch_hparams.get("log_norms", False)),
+            }
+
+            latents = sample_flow_euler_multi_latch_guided(
+                self.model.model, noise, sigmas, guides,
+                cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, apg_scale=apg_scale,
+                **hp, **cond_inputs,
+            )
+
+            if return_latents:
+                return latents.detach()
+            decode_dtype = next(self.model.pretransform.parameters()).dtype
+            with torch.no_grad():
+                return self.model.pretransform.decode(latents.detach().type(decode_dtype))
 
     # --- generate() helpers ---
 
