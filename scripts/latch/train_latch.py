@@ -361,7 +361,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     # Data / target
     p.add_argument("--feature", default="rms_energy_bass")
-    p.add_argument("--latent-dir", default="/run/media/kim/Lehto/latents_sa3")
+    p.add_argument("--latent-dir", default="/home/kim/Projects/latents_sa3")
     p.add_argument("--db-path", default=None)
     p.add_argument("--chroma-dir", default=None,
                    help="dir of per-crop <stem>.npz SAME-chroma (3,128,T); enables --target-source chroma")

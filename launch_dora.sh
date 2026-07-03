@@ -22,5 +22,5 @@ PYTORCH_TUNABLEOP_ENABLED=0 .venv/bin/python scripts/train_lora.py \
   --duration "${DORA_DURATION:-120}" \
   --num_workers 6 --seed 42 \
   --exclude seconds_total \
-  --save_dir /run/media/kim/Lehto/sa3_lora_runs/dora128_300trk \
+  --save_dir /run/media/kim/Mantu/sa3_lora_runs/dora128_300trk \
   --name dora128_300trk --logger "${DORA_LOGGER:-wandb}"

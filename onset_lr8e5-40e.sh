@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-variable probe: LR 2e-5 (vs current 1e-4), everything else identical to the winning
 # SF-NorMuon run.
-S=/run/media/kim/Lehto/sa3_control_runs
+S=/run/media/kim/Mantu/sa3_control_runs
 A=/home/kim/Projects/SAO/stable-audio-tools/avp_sa3
 cd "$A" || exit 1
 D=$S/onset_FUSION_lr2e5_40epoch
