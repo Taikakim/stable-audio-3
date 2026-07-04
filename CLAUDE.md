@@ -8,6 +8,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > Read it before cross-cutting work, and append to
 > `/home/kim/Projects/SAO/WORKLOG.md` when you finish something another repo's
 > agent would want to know.
+>
+> ⚠️ **`WORKLOG.md` and the `AGENT_DIALOGUE.md` cross-instance channel are PUBLIC** (the
+> dialogue log auto-mirrors to a public URL for remote review). **Never write secrets** —
+> passwords, API keys/tokens, SSH creds, `.netrc` contents, or credential-revealing paths —
+> into either; keep secrets in the shell/env. (See MASTER §4.)
+>
+> 📓 **Journal as you go.** The moment you land a finding or a **negative result** — however small —
+> drop a few lines in your instance journal (`SAO/profiles/<handle>.journal.md`, per
+> `SAO/profiles/SPEC-agent-profiles-journals.md`): a sentence + a link to the real doc. Negative
+> results are first-class — a logged dead end stops the next instance re-deriving it. (MASTER §4.)
+>
+> 🗂️ **Self-describing outputs.** When you create an eval / render / test output dir, write a short
+> sidecar beside the files: the test's **purpose** (one line), **paths to the related files** (config /
+> script / spec), and the **checkpoint id + location** if it lives elsewhere. Manual tracking no longer
+> scales — an anonymous dump of `.wav`/`.m4a` no one can place is a dead end. (MASTER §4.)
 @/home/kim/Projects/SAO/MASTER.md
 
 ## Project Overview
