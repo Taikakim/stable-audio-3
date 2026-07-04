@@ -141,6 +141,14 @@ def contrast(w, amount):
     return mean + (w - mean) * (1.0 + amount)
 
 
+def abs_quantile(w, q):
+    """Quantile of |w| that also works on tensors past torch.quantile's
+    2**24-element ceiling (SA3's qkv matrices exceed it) — kthvalue based."""
+    flat = w.detach().float().abs().flatten()
+    k = min(flat.numel(), max(1, int(round(q * (flat.numel() - 1))) + 1))
+    return flat.kthvalue(k).values.item()
+
+
 def life_step(w, alive_thresh):
     """One Game-of-Life generation on the weight matrix.
 
@@ -224,8 +232,7 @@ def apply_condition(model, cond, decay_eps=1e-3):
                     if w.ndim < 2 or d < 0.5:
                         continue
                     q = spec.get("quantile", 0.75)
-                    thresh = w.float().abs().quantile(q).item()
-                    out = life_step(w, alive_thresh=thresh)
+                    out = life_step(w, alive_thresh=abs_quantile(w, q))
                 else:
                     raise ValueError(f"unknown op {op!r}")
                 if out is not w:

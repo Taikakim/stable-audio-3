@@ -195,6 +195,8 @@ def main():
                            summary=summary, prompt=p, seed=s)
         print(f"[cond {ci}/{len(conds)}] {cond.name}: {summary['params_touched']} params, "
               f"blocks {summary['blocks_touched'][:4]}..", flush=True)
+        with open(os.path.join(args.out_dir, "run_meta.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
 
     restore_targets(all_targets, snap)
     manifest["wall_seconds"] = round(time.time() - t0, 1)

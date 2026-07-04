@@ -313,3 +313,23 @@ def test_snapshot_restore_between_conditions():
     restore_targets(collect_targets(m, target="all"), snap)
     for t in collect_targets(m, target="all"):
         assert torch.equal(t.param, snap[t.name])
+
+
+# ---------------------------------------------------------------- quantile
+
+from weight_mutations import abs_quantile
+
+
+def test_abs_quantile_matches_torch_on_small():
+    w = w0()
+    assert abs_quantile(w, 0.75) == pytest.approx(
+        w.abs().float().quantile(0.75).item(), rel=1e-4)
+
+
+def test_abs_quantile_works_past_torch_quantile_limit():
+    w = torch.randn(1 << 24 | 7)  # torch.quantile raises above 2**24 elements
+    with pytest.raises(RuntimeError):
+        w.quantile(0.75)
+    q = abs_quantile(w, 0.75)
+    frac_below = (w.abs() <= q).float().mean().item()
+    assert frac_below == pytest.approx(0.75, abs=0.01)
