@@ -98,6 +98,16 @@ def train(args):
         args.model, torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
 
+    if args.glitch:
+        # weight-garden experiment: train adapters ON TOP of a mutated base.
+        # Recipe is seed-reproducible (weight_mutations.py); scoped to the DiT
+        # (model.model) so conditioner/pretransform stay pristine.
+        from weight_mutations import Condition, apply_condition
+        _recipe = json.loads(args.glitch)
+        _gsum = apply_condition(model.model, Condition(**_recipe))
+        print(f"[glitch] {_recipe['name']}: {_gsum['params_touched']} params, "
+              f"blocks {_gsum['blocks_touched'][:6]}..")
+
     sample_rate = model.sample_rate
     ds_ratio = model.pretransform.downsampling_ratio
 
@@ -452,6 +462,10 @@ def main():
     p.add_argument("--checkpoint_every_epochs", type=int, default=None,
                    help="Checkpoint every N epochs (epoch mode; else use --checkpoint_every steps).")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--glitch", default=None,
+                   help="JSON Condition kwargs (scripts/weight_mutations.py) applied to "
+                        "the frozen base DiT before adapter attach — trains a LoRA/DoRA "
+                        "on a deliberately mutated base (weight-garden healing experiment)")
     p.add_argument("--logger", choices=["wandb", "comet", "csv", "none"], default="csv")
     p.add_argument("--name", type=str, default="lora-finetune")
     p.add_argument("--save_dir", type=str, default="./lora_checkpoints")

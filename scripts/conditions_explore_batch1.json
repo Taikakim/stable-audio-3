@@ -1,0 +1,20 @@
+[
+  {"name": "drift_x001", "ops": [{"op": "drift", "amount": 0.01}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "drift_x002", "ops": [{"op": "drift", "amount": 0.02}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "drift_x005", "ops": [{"op": "drift", "amount": 0.05}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "drift_x007", "ops": [{"op": "drift", "amount": 0.07}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "drift_x010", "ops": [{"op": "drift", "amount": 0.10}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "drift_early_005", "ops": [{"op": "drift", "amount": 0.05}], "decay_rate": 0.3, "decay_direction": "early", "mutation_seed": 777},
+  {"name": "drift_focus_mid", "ops": [{"op": "drift", "amount": 0.06}], "decay_direction": "focus", "decay_focus": 12, "mutation_seed": 777},
+  {"name": "drift_attn_06", "ops": [{"op": "drift", "amount": 0.06}], "target": "attn", "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "drift_mlp_06", "ops": [{"op": "drift", "amount": 0.06}], "target": "mlp", "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "shuffle_05", "ops": [{"op": "shuffle", "amount": 0.05}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "contrast_hyper", "ops": [{"op": "contrast", "amount": 1.0}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "contrast_deepwash", "ops": [{"op": "contrast", "amount": -0.9}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "tilt_tail_15", "ops": [{"op": "tilt", "amount": 1.5}], "decay_rate": 0.15, "mutation_seed": 777},
+  {"name": "tilt_head_15", "ops": [{"op": "tilt", "amount": -1.5}], "decay_rate": 0.15, "mutation_seed": 777},
+  {"name": "norm_storm", "ops": [{"op": "drift", "amount": 0.4}], "target": "norm", "decay_direction": "flat", "mutation_seed": 777},
+  {"name": "glitchwash", "ops": [{"op": "shuffle", "amount": 0.02}, {"op": "tilt", "amount": 0.8}, {"op": "contrast", "amount": -0.4}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "life_q60", "ops": [{"op": "life", "quantile": 0.6}], "decay_rate": 0.3, "mutation_seed": 777},
+  {"name": "life_q85", "ops": [{"op": "life", "quantile": 0.85}], "decay_rate": 0.3, "mutation_seed": 777}
+]
