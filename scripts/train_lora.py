@@ -168,7 +168,8 @@ def train(args):
                     "type": "FusionOpt",
                     "config": {
                         "lr": args.lr,
-                        "components": ["mona", "ns5", "normuon", "sf"],  # shampoo OFF (KL-Shampoo preconditioners OOM rank-128 on 16GB)
+                        "components": (["mona", "ns5", "normuon", "sf"]  # shampoo OFF (KL-Shampoo preconditioners OOM rank-128 on 16GB)
+                                       + (["cautious"] if args.cautious else [])),
                         "hot_dtype": "bf16",
                     },
                 }
@@ -429,6 +430,10 @@ def main():
              "KL-Shampoo, hot_dtype=bf16); routes the LoRA params into "
              "spectral/scalar groups automatically.",
     )
+    p.add_argument("--cautious", action="store_true",
+                   help="add cautious masking (C-Muon) to FusionOpt: zero update coords that "
+                        "fight the gradient, rescale survivors. Otherwise identical to --optimizer "
+                        "fusion. No effect for adamw.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=1)
