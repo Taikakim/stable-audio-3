@@ -122,8 +122,17 @@ def train(args):
                 tokenizers[key] = (cond.tokenizer, cond.max_length)
 
     if args.encoded_dir:
+        caption_fn = None
+        if args.caption_sidecar:
+            # tiered caption sampling (docs/prompting-conditioning-plan.md §4-5):
+            # sidecar keyed by latent stem; per-__getitem__ tier draw overrides
+            # the json's stored prompt. Sidecars keep pristine latents pristine.
+            from caption_tools import make_caption_sampler
+            probs = tuple(float(x) for x in args.caption_probs.split(","))
+            caption_fn = make_caption_sampler(args.caption_sidecar, probs=probs)
         dataset = PreEncodedDataset(
-            [LatentDatasetConfig(id="train", path=args.encoded_dir)],
+            [LatentDatasetConfig(id="train", path=args.encoded_dir,
+                                 custom_metadata_fn=caption_fn)],
             latent_crop_length=sample_size // ds_ratio,
             random_crop=True,
             beat_aware_crop=args.beat_aware_crop,
@@ -462,6 +471,11 @@ def main():
     p.add_argument("--checkpoint_every_epochs", type=int, default=None,
                    help="Checkpoint every N epochs (epoch mode; else use --checkpoint_every steps).")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--caption_sidecar", "--caption-sidecar", dest="caption_sidecar", default=None,
+                   help="captions.json sidecar (caption_tools.generate_sidecar) — enables "
+                        "tiered T1/T2/T3 prompt sampling, overriding the latent jsons' prompts")
+    p.add_argument("--caption_probs", default="0.6,0.3,0.1",
+                   help="sampling probabilities for caption tiers t1,t2,t3")
     p.add_argument("--glitch", default=None,
                    help="JSON Condition kwargs (scripts/weight_mutations.py) applied to "
                         "the frozen base DiT before adapter attach — trains a LoRA/DoRA "
