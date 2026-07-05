@@ -673,6 +673,17 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                     'lr_schedulers',
                     'epoch',
                     'global_step',
+                    # Lightning-native keys needed for trainer.fit(ckpt_path=...)
+                    # to accept the checkpoint and restore loop/epoch position.
+                    # Without these, ckpt_path resume raises KeyError on
+                    # 'pytorch-lightning_version' (only the base weights are
+                    # dropped to keep the file LoRA-scale; loop state is tiny).
+                    'pytorch-lightning_version',
+                    'loops',
+                    'callbacks',
+                    'hyper_parameters',
+                    'hparams_name',
+                    'MixedPrecision',
                 )
                 if k in checkpoint
             }
