@@ -122,17 +122,28 @@ def train(args):
                 tokenizers[key] = (cond.tokenizer, cond.max_length)
 
     if args.encoded_dir:
-        caption_fn = None
-        if args.caption_sidecar:
-            # tiered caption sampling (docs/prompting-conditioning-plan.md §4-5):
-            # sidecar keyed by latent stem; per-__getitem__ tier draw overrides
-            # the json's stored prompt. Sidecars keep pristine latents pristine.
-            from caption_tools import make_caption_sampler
-            probs = tuple(float(x) for x in args.caption_probs.split(","))
-            caption_fn = make_caption_sampler(args.caption_sidecar, probs=probs)
+        # Multi-source: --encoded_dir and --caption_sidecar accept comma-separated
+        # PARALLEL lists (per-source latent pools kept separate on disk, Kim's
+        # layout rule; composed here into one LatentDatasetConfig list so each
+        # source keeps its OWN caption sidecar — avoids cross-source stem collisions).
+        dirs = [d.strip() for d in args.encoded_dir.split(",") if d.strip()]
+        sidecars = [s.strip() for s in args.caption_sidecar.split(",")] if args.caption_sidecar else []
+        if sidecars and len(sidecars) != len(dirs):
+            raise ValueError(f"got {len(dirs)} encoded_dirs but {len(sidecars)} caption_sidecars "
+                             "— pass one sidecar per dir (empty string to skip a source)")
+        weights = [float(w) for w in args.source_weights.split(",")] if args.source_weights else [1.0] * len(dirs)
+        if len(weights) != len(dirs):
+            raise ValueError(f"got {len(dirs)} encoded_dirs but {len(weights)} source_weights")
+        from caption_tools import make_caption_sampler
+        probs = tuple(float(x) for x in args.caption_probs.split(","))
+        configs = []
+        for i, d in enumerate(dirs):
+            sc = sidecars[i] if i < len(sidecars) and sidecars[i] else None
+            fn = make_caption_sampler(sc, probs=probs) if sc else None
+            configs.append(LatentDatasetConfig(id=f"train{i}", path=d, weight=weights[i],
+                                               custom_metadata_fn=fn))
         dataset = PreEncodedDataset(
-            [LatentDatasetConfig(id="train", path=args.encoded_dir,
-                                 custom_metadata_fn=caption_fn)],
+            configs,
             latent_crop_length=sample_size // ds_ratio,
             random_crop=True,
             beat_aware_crop=args.beat_aware_crop,
@@ -345,7 +356,10 @@ def train(args):
         num_sanity_val_steps=0,  # If you need to debug validation, change this line
     )
 
-    trainer.fit(training_wrapper, dataloader)
+    # ckpt_path resumes optimizer + LR-scheduler + epoch/step from a full Lightning
+    # checkpoint (true continuation, not just LoRA-weight reload). max_epochs is the
+    # TOTAL target: resuming an epoch-4 ckpt with --epochs 8 runs 3 more epochs.
+    trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt)
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +490,12 @@ def main():
                         "tiered T1/T2/T3 prompt sampling, overriding the latent jsons' prompts")
     p.add_argument("--caption_probs", default="0.6,0.3,0.1",
                    help="sampling probabilities for caption tiers t1,t2,t3")
+    p.add_argument("--source_weights", default=None,
+                   help="comma-separated per-source sample weights (parallel to --encoded_dir); "
+                        "default 1.0 each = natural per-crop proportions")
+    p.add_argument("--resume_ckpt", "--resume-ckpt", dest="resume_ckpt", default=None,
+                   help="full Lightning .ckpt to RESUME from (restores optimizer/scheduler/epoch); "
+                        "--epochs is the total target, so resuming an ep-4 ckpt with --epochs 8 = 3 more")
     p.add_argument("--glitch", default=None,
                    help="JSON Condition kwargs (scripts/weight_mutations.py) applied to "
                         "the frozen base DiT before adapter attach — trains a LoRA/DoRA "
