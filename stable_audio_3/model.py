@@ -364,7 +364,13 @@ class StableAudioModel:
             )
 
         if not return_latents:
-            result = result.to(torch.float32).clamp(-1, 1)
+            # Normalize DOWN instead of hard-clamping: SA3 raw output routinely peaks
+            # >1.0, and clamp() flat-tops it before any writer's peak-normalize can
+            # help (W's 2026-07-07 audit: 74% of 48h eval renders clipped, peak at
+            # exactly 0 dBFS). Per-item scale, only when over full scale.
+            result = result.to(torch.float32)
+            peak = result.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1.0)
+            result = result / peak
 
         if not return_latents and truncate_output_to_duration:
             if isinstance(duration, (int, float)):
