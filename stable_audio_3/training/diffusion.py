@@ -69,10 +69,22 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             log_every_n_steps: int = 10,
             ot_coupling: bool = False,
             base_precision: tp.Optional[str] = None,
+            familiarity_beta: float = 0.0,
     ):
         super().__init__()
 
         self.ot_coupling = ot_coupling
+
+        # Familiarity-normalized loss weighting (scripts/familiarity.py): per-crop
+        # EMA of relative loss -> down-weight familiar crops, keep remote ones hot.
+        # beta=0 (default) = off. State is per-run (not checkpointed).
+        self.familiarity = None
+        if familiarity_beta and familiarity_beta > 0:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _sys.path.insert(0, str(_Path(__file__).resolve().parents[2] / "scripts"))
+            from familiarity import FamiliarityReweighter
+            self.familiarity = FamiliarityReweighter(beta=familiarity_beta)
 
         self.diffusion = model
 
@@ -486,6 +498,22 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         # Compute normalized MSE (normalization only affects non-"none" modes)
         mse_loss_full = compute_normalized_mse(output, targets, loss_mask, self.loss_normalization, self.loss_norm_eps)
+
+        # Familiarity-normalized weighting: scale each sample's loss surface by its
+        # crop's (past-visits) familiarity weight BEFORE the masked/context
+        # reductions, so every downstream term inherits the weighting consistently.
+        if self.familiarity is not None:
+            with torch.no_grad():
+                _mask = loss_mask.unsqueeze(1).to(mse_loss_full.dtype)
+                _denom = (_mask.sum(dim=(1, 2)) * mse_loss_full.shape[1]).clamp_min(1.0)
+                _per = (mse_loss_full.detach() * _mask).sum(dim=(1, 2)) / _denom
+            _ids = [md.get("latent_filename", md.get("path", f"idx{j}"))
+                    for j, md in enumerate(metadata)]
+            _w = self.familiarity.weights(_ids, _per.tolist())
+            _w_t = torch.tensor(_w, device=mse_loss_full.device, dtype=mse_loss_full.dtype)
+            mse_loss_full = mse_loss_full * _w_t[:, None, None]
+            log_dict["train/familiarity_w_min"] = float(min(_w))
+            log_dict["train/familiarity_w_max"] = float(max(_w))
 
         p.tick("mse_loss")
 

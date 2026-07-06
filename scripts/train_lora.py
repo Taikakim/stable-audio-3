@@ -248,6 +248,7 @@ def train(args):
         log_every_n_steps=args.log_every,
         ot_coupling=True,
         base_precision=args.base_precision,
+        familiarity_beta=args.familiarity_beta,
     )
 
     if args.compile:
@@ -499,6 +500,11 @@ def main():
     p.add_argument("--caption_sidecar", "--caption-sidecar", dest="caption_sidecar", default=None,
                    help="captions.json sidecar (caption_tools.generate_sidecar) — enables "
                         "tiered T1/T2/T3 prompt sampling, overriding the latent jsons' prompts")
+    p.add_argument("--familiarity_beta", "--familiarity-beta", dest="familiarity_beta",
+                   type=float, default=0.0,
+                   help="familiarity-normalized loss weighting exponent (scripts/"
+                        "familiarity.py): >0 down-weights crops the model already fits "
+                        "(per-crop EMA of relative loss), keeps remote crops hot; 0=off")
     p.add_argument("--track_type_prob", type=float, default=0.0,
                    help="probability of prepending 'TrackType: Music, VocalType: "
                         "Instrumental, ' to sampled captions (SA3 paper §5.1: base "
