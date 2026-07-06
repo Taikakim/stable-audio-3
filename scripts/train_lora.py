@@ -174,6 +174,13 @@ def train(args):
     lora_state_dict = None
     if args.lora_checkpoint:
         lora_state_dict, _ = load_lora_checkpoint(args.lora_checkpoint)
+    elif args.warm_start_ckpt:
+        # Warm-start path for OLD-format ckpts that trainer.fit(ckpt_path=...)
+        # rejects (saved before the on_save_checkpoint Lightning-key fix):
+        # adapter weights load here, optimizer/scheduler state is restored by
+        # the OptimizerWarmStart callback at on_train_start. Only loop counters
+        # (epoch numbering / shuffle position) are lost vs a true resume.
+        lora_state_dict, _ = load_lora_checkpoint(args.warm_start_ckpt)
 
     lora_config = {
         "rank": args.rank,
@@ -325,6 +332,9 @@ def train(args):
     callbacks = [ckpt_callback, exc_callback]
     if not args.no_demos:
         callbacks.append(demo_callback)
+    if args.warm_start_ckpt:
+        from warm_start import OptimizerWarmStart
+        callbacks.append(OptimizerWarmStart(args.warm_start_ckpt))
 
     # Combine args and config dicts
     args_dict = vars(args)
@@ -496,6 +506,11 @@ def main():
     p.add_argument("--resume_ckpt", "--resume-ckpt", dest="resume_ckpt", default=None,
                    help="full Lightning .ckpt to RESUME from (restores optimizer/scheduler/epoch); "
                         "--epochs is the total target, so resuming an ep-4 ckpt with --epochs 8 = 3 more")
+    p.add_argument("--warm_start_ckpt", "--warm-start-ckpt", dest="warm_start_ckpt", default=None,
+                   help="OLD-format .ckpt (pre Lightning-key fix, rejected by --resume_ckpt) to "
+                        "warm-start from: loads adapter weights + optimizer/scheduler state, but "
+                        "epoch/step counters restart — so --epochs is the ADDITIONAL count "
+                        "(continuing an ep-4 ckpt for 3 more = --epochs 3)")
     p.add_argument("--glitch", default=None,
                    help="JSON Condition kwargs (scripts/weight_mutations.py) applied to "
                         "the frozen base DiT before adapter attach — trains a LoRA/DoRA "
@@ -508,6 +523,9 @@ def main():
     p.add_argument("--demo_every", type=int, default=500)
     p.add_argument("--num_workers", type=int, default=8)
     args = p.parse_args()
+    if args.warm_start_ckpt and args.resume_ckpt:
+        p.error("--warm_start_ckpt and --resume_ckpt are mutually exclusive "
+                "(use --resume_ckpt for new-format ckpts, --warm_start_ckpt for old)")
     if not args.encoded_dir and not args.data_dir:
         p.error("one of --data_dir or --encoded_dir is required")
     train(args)
