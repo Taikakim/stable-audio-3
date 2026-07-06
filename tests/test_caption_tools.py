@@ -110,3 +110,30 @@ def test_generate_sidecar(tmp_path):
     assert d["000001"]["t1"] == "late 90s goa trance, dark mood, 150 bpm"
     assert d["000002"]["t1"] == d["000001"]["t1"]
     assert d["000001"]["t2"] is None and d["000001"]["t3"] is None
+
+
+# -------------------------------------------------- TrackType prefix (SA3 paper §5.1)
+
+def test_sampler_tracktype_prefix_always(tmp_path):
+    sc = _sidecar(tmp_path, {"000001": {"t1": "goa trance", "t2": None, "t3": None}})
+    fn = make_caption_sampler(sc, probs=(1.0, 0.0, 0.0), track_type_prob=1.0, seed=1)
+    out = fn({"latent_filename": "000001.npy"}, None)
+    assert out["prompt"] == "TrackType: Music, VocalType: Instrumental, goa trance"
+
+
+def test_sampler_tracktype_prefix_never_by_default(tmp_path):
+    sc = _sidecar(tmp_path, {"000001": {"t1": "goa trance", "t2": None, "t3": None}})
+    fn = make_caption_sampler(sc, probs=(1.0, 0.0, 0.0), seed=1)
+    for _ in range(50):
+        assert fn({"latent_filename": "000001.npy"}, None)["prompt"] == "goa trance"
+
+
+def test_sampler_tracktype_prefix_probabilistic_and_deterministic(tmp_path):
+    sc = _sidecar(tmp_path, {"000001": {"t1": "goa trance", "t2": None, "t3": None}})
+    fn = make_caption_sampler(sc, probs=(1.0, 0.0, 0.0), track_type_prob=0.5, seed=9)
+    got = [fn({"latent_filename": "000001.npy"}, None)["prompt"] for _ in range(400)]
+    frac = sum(p.startswith("TrackType: ") for p in got) / len(got)
+    assert 0.4 < frac < 0.6
+    fn2 = make_caption_sampler(sc, probs=(1.0, 0.0, 0.0), track_type_prob=0.5, seed=9)
+    got2 = [fn2({"latent_filename": "000001.npy"}, None)["prompt"] for _ in range(400)]
+    assert got == got2

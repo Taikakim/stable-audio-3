@@ -57,12 +57,22 @@ def build_t1(genres, moods, bpm, year):
     return ", ".join(parts)
 
 
-def make_caption_sampler(sidecar_path, probs=(0.6, 0.3, 0.1), seed=None):
+TRACK_TYPE_MUSIC = "TrackType: Music, VocalType: Instrumental, "
+
+
+def make_caption_sampler(sidecar_path, probs=(0.6, 0.3, 0.1), seed=None,
+                         track_type_prob=0.0):
     """custom_metadata_fn for PreEncodedDataset: sample a caption tier per call.
 
     Tiers with missing text fall back to t1. Unknown index -> {} (dataset keeps
     its stored prompt). Deterministic when `seed` is given (own RNG stream, so
     worker seeding elsewhere is untouched). Closure state survives dill.
+
+    track_type_prob: probability of prepending the SA3-paper TrackType prefix
+    ("TrackType: Music, VocalType: Instrumental, ") to the sampled caption.
+    The base model trained with AudioSparx metadata prefixes present ~50% of
+    the time and Stability recommends them at inference (SA3 paper §5.1) —
+    0.5 mirrors base training; default 0.0 preserves existing behaviour.
     """
     with open(sidecar_path) as f:
         table = json.load(f)
@@ -84,6 +94,8 @@ def make_caption_sampler(sidecar_path, probs=(0.6, 0.3, 0.1), seed=None):
         prompt = entry.get(tier) or entry.get("t1")
         if not prompt:
             return {}
+        if track_type_prob > 0 and rng.random() < track_type_prob:
+            prompt = TRACK_TYPE_MUSIC + prompt
         return {"prompt": prompt}
 
     return sampler

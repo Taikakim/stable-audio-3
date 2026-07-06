@@ -139,7 +139,8 @@ def train(args):
         configs = []
         for i, d in enumerate(dirs):
             sc = sidecars[i] if i < len(sidecars) and sidecars[i] else None
-            fn = make_caption_sampler(sc, probs=probs) if sc else None
+            fn = make_caption_sampler(sc, probs=probs,
+                                      track_type_prob=args.track_type_prob) if sc else None
             configs.append(LatentDatasetConfig(id=f"train{i}", path=d, weight=weights[i],
                                                custom_metadata_fn=fn))
         dataset = PreEncodedDataset(
@@ -498,6 +499,10 @@ def main():
     p.add_argument("--caption_sidecar", "--caption-sidecar", dest="caption_sidecar", default=None,
                    help="captions.json sidecar (caption_tools.generate_sidecar) — enables "
                         "tiered T1/T2/T3 prompt sampling, overriding the latent jsons' prompts")
+    p.add_argument("--track_type_prob", type=float, default=0.0,
+                   help="probability of prepending 'TrackType: Music, VocalType: "
+                        "Instrumental, ' to sampled captions (SA3 paper §5.1: base "
+                        "trained ~50%% with AudioSparx prefixes; 0.5 mirrors that)")
     p.add_argument("--caption_probs", default="0.6,0.3,0.1",
                    help="sampling probabilities for caption tiers t1,t2,t3")
     p.add_argument("--source_weights", default=None,
