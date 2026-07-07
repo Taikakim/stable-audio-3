@@ -332,6 +332,10 @@ class StableAudioModel:
                 steps=steps,
                 cfg_scale=cfg_scale,
                 apg_scale=apg_scale,
+                # cfg_interval rides **sampler_kwargs on the sample_diffusion path
+                # below; the latch path passes explicit kwargs only, so thread it
+                # through here too (same style as the callback passthrough).
+                cfg_interval=sampler_kwargs.pop("cfg_interval", (0.0, 1.0)),
                 batch_size=batch_size,
                 latent_sample_size=latent_sample_size,
                 dist_shift=dist_shift
@@ -405,6 +409,7 @@ class StableAudioModel:
         steps,
         cfg_scale,
         apg_scale,
+        cfg_interval=(0.0, 1.0),
         batch_size,
         latent_sample_size,
         dist_shift,
@@ -518,6 +523,9 @@ class StableAudioModel:
             latents = sample_flow_euler_multi_latch_guided(
                 self.model.model, noise, sigmas, guides,
                 cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, apg_scale=apg_scale,
+                # lands in **model_kwargs -> DiT forward, gated at dit.py
+                # (cfg_interval[0] <= sigma <= cfg_interval[1]) — native sigma semantics
+                cfg_interval=tuple(cfg_interval),
                 callback=callback, **hp, **cond_inputs,
             )
 
