@@ -52,7 +52,7 @@ def _make_latch_criterion(loss_type, huber_beta=1.0):
 def sample_flow_euler_multi_latch_guided(
     model, x, sigmas, guides, *,
     rho=1.0, mu=1.0, gamma=0.3, n_iter=4,
-    log_norms=False, disable_tqdm=False, **model_kwargs,
+    log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Flow-matching Euler sampler with multiple LatCH guides (Selective TFG).
 
@@ -108,6 +108,11 @@ def sample_flow_euler_multi_latch_guided(
         mu_t = mu * s_t
 
         active = [g for g in guides if g["_start"] <= i < g["_end"]]
+
+        if callback is not None:
+            # same contract as sample_discrete_euler's callback: live x, per-batch t.
+            # In-place edits to x take effect (graded clamps / release schedules).
+            callback({'x': x, 't': t_b, 'sigma': t_b, 'i': i, 'denoised': None})
 
         # --- Variance guidance on x at the true t_curr (head queried at t_curr) ---
         # Done before the model velocity and re-detached, mirroring the proven

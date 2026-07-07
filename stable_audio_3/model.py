@@ -322,6 +322,10 @@ class StableAudioModel:
         if latch_configs:
             result = self._latch_guided_generate(
                 noise=noise,
+                # audio2audio under guidance: start from the (already-encoded) init
+                # latents at init_noise_level instead of pure noise
+                init_latents=init_audio if init_audio is not None else None,
+                init_noise_level=init_noise_level,
                 cond_inputs=cond_inputs,
                 latch_configs=latch_configs,
                 latch_hparams=latch_hparams or {},
@@ -334,6 +338,7 @@ class StableAudioModel:
                 if dist_shift is not None
                 else self.model.sampling_dist_shift,
                 return_latents=return_latents,
+                callback=sampler_kwargs.pop("callback", None),
             )
         else:
             result = sample_diffusion(
@@ -392,6 +397,8 @@ class StableAudioModel:
         self,
         *,
         noise,
+        init_latents=None,
+        init_noise_level=1.0,
         cond_inputs,
         latch_configs,
         latch_hparams,
@@ -402,6 +409,7 @@ class StableAudioModel:
         latent_sample_size,
         dist_shift,
         return_latents,
+        callback=None,
     ):
         """Run flow-matching Euler sampling with one or more LatCH guides.
 
@@ -434,9 +442,17 @@ class StableAudioModel:
             noise = _clean(noise)
             cond_inputs = _clean(cond_inputs)
 
+            sigma_max = 1.0
+            if init_latents is not None:
+                # SDEdit-style start: x_t = (1-t)·z0 + t·ε at t = init_noise_level,
+                # schedule truncated to [init_noise_level, 0]
+                sigma_max = float(init_noise_level)
+                z0 = _clean(init_latents).to(noise.dtype)
+                noise = (1.0 - sigma_max) * z0 + sigma_max * noise
+
             sigmas = build_schedule(
                 steps=steps,
-                sigma_max=1.0,
+                sigma_max=sigma_max,
                 dist_shift=dist_shift,
                 fallback_seq_len=latent_sample_size,
                 include_endpoint=True,
@@ -453,17 +469,30 @@ class StableAudioModel:
                         f"[LatCH] WARNING: head trained for noise_schedule='{head_sched}' "
                         f"but model objective is '{self.model.diffusion_objective}'."
                     )
-                kind = cfg.get("kind") or meta.get("target_kind_default", "constant")
-                value = float(cfg.get("value", 1.0))
-                target = _build_latch_target(
-                    kind, value,
-                    batch_size=batch_size,
-                    channels=head.out_channels,
-                    frames=latent_sample_size,
-                    fps=latent_fps,
-                    device=device,
-                    dtype=torch.float32,
-                )
+                if cfg.get("target_raw") is not None:
+                    # Raw per-frame target array/tensor [C, T_any] (e.g. a measured
+                    # chroma curve for chroma-morph transitions) — nearest-resampled
+                    # to the latent frame grid, then standardized like built targets.
+                    raw = torch.as_tensor(cfg["target_raw"], dtype=torch.float32)
+                    if raw.dim() == 2:
+                        raw = raw.unsqueeze(0)
+                    if raw.shape[-1] != latent_sample_size:
+                        raw = torch.nn.functional.interpolate(
+                            raw, size=latent_sample_size, mode="linear",
+                            align_corners=False)
+                    target = raw.repeat(batch_size, 1, 1).to(device)
+                else:
+                    kind = cfg.get("kind") or meta.get("target_kind_default", "constant")
+                    value = float(cfg.get("value", 1.0))
+                    target = _build_latch_target(
+                        kind, value,
+                        batch_size=batch_size,
+                        channels=head.out_channels,
+                        frames=latent_sample_size,
+                        fps=latent_fps,
+                        device=device,
+                        dtype=torch.float32,
+                    )
                 if meta.get("standardized"):
                     _m = float(meta.get("std_mean", 0.0))
                     _s = float(meta.get("std_std", 1.0)) or 1.0
@@ -489,7 +518,7 @@ class StableAudioModel:
             latents = sample_flow_euler_multi_latch_guided(
                 self.model.model, noise, sigmas, guides,
                 cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, apg_scale=apg_scale,
-                **hp, **cond_inputs,
+                callback=callback, **hp, **cond_inputs,
             )
 
             if return_latents:
