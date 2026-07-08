@@ -305,7 +305,8 @@ def sample_flow_dpmpp(model, x, sigmas, callback=None, disable_tqdm=False, **ext
         old_denoised = denoised
     return x
 
-def sample_flow_pingpong(model, x, sigmas, callback=None, disable_tqdm=False, **extra_args):
+def sample_flow_pingpong(model, x, sigmas, callback=None, disable_tqdm=False,
+                         renoise_hook=None, **extra_args):
     """Draws samples from a model given starting noise. Ping-pong sampling for distilled models
 
     Args:
@@ -346,7 +347,13 @@ def sample_flow_pingpong(model, x, sigmas, callback=None, disable_tqdm=False, **
         if callback is not None:
             callback({'x': x, 'i': i, 't': t_curr, 'sigma': t_curr, 'sigma_hat': t_curr, 'denoised': denoised})
 
-        x = (1 - t_next_broadcast) * denoised + t_next_broadcast * torch.randn_like(x)
+        # renoise_hook(denoised, t_next, x, i) may return the next state (e.g.
+        # best-of-K candidate selection steering); None falls through to the
+        # standard single-draw renoise.
+        x_next = renoise_hook(denoised, t_next_broadcast, x, i) if renoise_hook is not None else None
+        if x_next is None:
+            x_next = (1 - t_next_broadcast) * denoised + t_next_broadcast * torch.randn_like(x)
+        x = x_next
 
     return x
 
@@ -372,6 +379,7 @@ def sample_diffusion(
     dist_shift = None,
     # Sampler options
     sampler_type: str = None,
+    renoise_hook=None,
     batch_cfg: bool = True,
     rescale_cfg: bool = False,
     # CFG options
@@ -498,7 +506,7 @@ def sample_diffusion(
         elif sampler_type == "dpmpp":
             sampled = sample_flow_dpmpp(model, noise, sigmas=sigmas, callback=callback, disable_tqdm=disable_tqdm, **common_kwargs)
         elif sampler_type == "pingpong":
-            sampled = sample_flow_pingpong(model, noise, sigmas=sigmas, callback=callback, disable_tqdm=disable_tqdm, **common_kwargs)
+            sampled = sample_flow_pingpong(model, noise, sigmas=sigmas, callback=callback, disable_tqdm=disable_tqdm, renoise_hook=renoise_hook, **common_kwargs)
         else:
             raise ValueError(f"Unknown sampler_type for {diffusion_objective}: {sampler_type}")
 
