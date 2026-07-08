@@ -55,3 +55,16 @@ def test_region_restriction():
     r_bad = measure(y, o, SR, region=(0.0, 4.0))
     r_good = measure(y, o, SR, region=(4.0, 8.0))
     assert r_good["band_corr_mean"] > r_bad["band_corr_mean"], (r_good, r_bad)
+
+
+def test_v2_floor_delta_catches_layered_drone():
+    """Pads BEHIND active content (Kim's actual case): busy source, output =
+    source + quiet sustained drone. v1 pad_fill misses it (no quiet zones);
+    the sustained-floor delta must catch it."""
+    y = np.concatenate([_beat_track(4.0), _beat_track(4.0)])   # busy throughout
+    t = np.arange(len(y))
+    o = y + 0.12 * np.sin(2 * np.pi * 2000 * t / SR).astype(np.float32)  # mid-band drone
+    r = measure(y, o, SR)
+    assert r["pad_floor_db"] > 4.0, r
+    r_id = measure(y, y, SR)
+    assert abs(r_id["pad_floor_db"]) < 1.0, r_id
