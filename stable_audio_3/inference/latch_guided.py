@@ -31,7 +31,7 @@ def _ensure_time_cache(head, t_values, device) -> None:
     cache.warm(t_values)
 
 
-def _make_latch_criterion(loss_type, huber_beta=1.0):
+def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
     """Guidance loss matching how the head was trained (see scripts/latch/train_latch.py)."""
     if loss_type == "bce_logits":
         return torch.nn.BCEWithLogitsLoss()
@@ -45,6 +45,27 @@ def _make_latch_criterion(loss_type, huber_beta=1.0):
         return torch.nn.SmoothL1Loss(beta=float(huber_beta or 1.0))
     if loss_type == "mse":
         return torch.nn.MSELoss()
+    if loss_type == "scalar_pooled":
+        # W's fix for scalar-head guidance (2026-07-10): matching a scalar head to a
+        # CONSTANT per-frame target demands a temporally-FLAT attribute = the buzz. Match
+        # the TIME-POOLED mean instead, so the output may vary in time as long as its mean
+        # tracks the request. pred/target: (B, out_dim, T).
+        def _pooled(pred, target):
+            return torch.nn.functional.mse_loss(pred.mean(dim=-1), target.mean(dim=-1))
+        return _pooled
+    if loss_type in ("chroma_rung1", "chroma_rung2"):
+        # T2 phase-tolerant chroma guidance (Kim 2026-07-10). w_sec = tolerance dial
+        # (~beats*60/bpm); fps = the LATENT frame grid (SA3-medium 10.767 Hz). Head
+        # output is (B, C=12, T); the loss wants (B, T, C) -> transpose. Both sides
+        # should already be head-standardized (caller builds the standardized target).
+        from .chroma_losses import chroma_loss_rung1, chroma_loss_rung2_contour
+        fn = chroma_loss_rung1 if loss_type == "chroma_rung1" else chroma_loss_rung2_contour
+        _fps = float(fps if fps is not None else 10.767)
+        _w = float(w_sec if w_sec is not None else 0.5)
+
+        def _chroma(pred, target):
+            return fn(pred.transpose(1, 2), target.transpose(1, 2), fps=_fps, w_sec=_w)
+        return _chroma
     raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
 
@@ -88,7 +109,8 @@ def sample_flow_euler_multi_latch_guided(
     for g in guides:
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"] = int(num_steps * g["end_pct"])
-        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0))
+        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
+                                                w_sec=g.get("w_sec"), fps=g.get("fps"))
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
 
     # Pre-warm per-guide adaLN-zero time caches with the full schedule + t=0.
