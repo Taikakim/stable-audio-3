@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from scripts.latch.latch_targets import resample_target
+from scripts.latch.latch_targets import resample_target, build_target
 
 
 def _open_default_db():
@@ -72,6 +72,27 @@ class LatCHDataset(Dataset):
                 raise RuntimeError(
                     f"target_source='chroma' but no <stem>.npz in {self.chroma_dir}")
             self.items = kept
+        elif target_source == "scalar_json":
+            # Per-crop scalar sidecar (<idx>.TIMBRAL.json: hardness/depth/booming,
+            # 2026-07-10 extraction). Target = constant (1, T) at the crop's scalar --
+            # the head learns a pooled readout. Null values (the 2 documented silent
+            # windows) are filtered out here.
+            import json as _json
+            kept = []
+            for p in self.items:
+                sc = p.with_suffix(".TIMBRAL.json")
+                if not sc.exists():
+                    continue
+                try:
+                    if _json.load(open(sc)).get(self.bare_feature) is not None:
+                        kept.append(p)
+                except Exception:
+                    continue
+            if not kept:
+                raise RuntimeError(
+                    f"target_source='scalar_json' but no *.TIMBRAL.json with "
+                    f"'{self.bare_feature}' in {latent_dir}")
+            self.items = kept
         else:
             raise ValueError(f"unknown target_source={target_source!r}")
 
@@ -86,6 +107,10 @@ class LatCHDataset(Dataset):
                 arr = z[self.chroma_key].astype(np.float32)              # (3, 128, T)
             arr = arr.reshape(arr.shape[0] * arr.shape[1], arr.shape[2])  # (384, T) band-major
             return resample_target(arr, t_frames)
+        if self.target_source == "scalar_json":
+            import json as _json
+            v = _json.load(open(npy_path.with_suffix(".TIMBRAL.json")))[self.bare_feature]
+            return build_target("constant", float(v), t_frames)
         if self.target_source == "npz":
             with np.load(str(npy_path.with_suffix(".TIMESERIES.npz"))) as z:
                 if self.ts_feature not in z.files:

@@ -366,9 +366,11 @@ if __name__ == "__main__":
     p.add_argument("--chroma-dir", default=None,
                    help="dir of per-crop <stem>.npz SAME-chroma (3,128,T); enables --target-source chroma")
     p.add_argument("--chroma-key", default="other", help="which stem's chroma: other / bass / full_mix")
-    p.add_argument("--target-source", choices=["db", "npz", "chroma"], default="npz",
+    p.add_argument("--target-source", choices=["db", "npz", "chroma", "scalar_json"], default="npz",
                    help="npz = <stem>.TIMESERIES.npz companions (latents_sa3, medium grid); "
-                        "db = legacy per-crop TimeseriesDB (small-music-base / phase 1).")
+                        "db = legacy per-crop TimeseriesDB (small-music-base / phase 1); "
+                        "scalar_json = constant target from <stem>.TIMBRAL.json "
+                        "(--feature hardness/depth/booming, pooled-readout head).")
     # Training loop
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=32)
