@@ -508,8 +508,13 @@ class StableAudioModel:
                     "weight": float(cfg.get("weight", 1.0)),
                     "start_pct": float(cfg.get("start_pct", 0.0)),
                     "end_pct": float(cfg.get("end_pct", 1.0)),
-                    "loss_type": meta.get("loss_type", "mse"),
+                    # cfg override wins over head metadata: lets a caller run e.g.
+                    # scalar_pooled guidance on an mse-trained scalar head (the
+                    # constant-target-flatness fix, 2026-07-10) without retraining.
+                    "loss_type": cfg.get("loss_type") or meta.get("loss_type", "mse"),
                     "huber_beta": meta.get("huber_beta") or 1.0,
+                    "w_sec": cfg.get("w_sec"),
+                    "fps": cfg.get("fps"),
                 })
 
             hp = {
