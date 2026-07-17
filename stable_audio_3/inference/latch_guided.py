@@ -66,6 +66,16 @@ def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
         def _chroma(pred, target):
             return fn(pred.transpose(1, 2), target.transpose(1, 2), fps=_fps, w_sec=_w)
         return _chroma
+    if loss_type == "band_hinge":
+        # E1 anti-loop tilt (plan 2026-07-15): one-sided smooth hinge above a corpus band
+        # edge -- zero gradient inside the band (lens-B: never a point target). Pairs with
+        # recurrence_potential.RecurrenceHead; huber_beta doubles as the hinge width.
+        from .recurrence_potential import band_hinge_loss
+        _w = float(huber_beta or 0.05)
+
+        def _hinge(pred, target):
+            return band_hinge_loss(pred, target, width=_w)
+        return _hinge
     raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
 

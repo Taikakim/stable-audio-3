@@ -466,6 +466,29 @@ class StableAudioModel:
 
             guides = []
             for cfg in latch_configs:
+                if cfg.get("builtin") == "recurrence":
+                    # E1 anti-loop potential (validation plan 2026-07-15): parameterless
+                    # head, no checkpoint; band-hinge target = corpus band UPPER edge
+                    # (scalar, broadcasts against the head's (B,1,P) recurrence curve).
+                    from .inference.recurrence_potential import RecurrenceHead
+                    head = RecurrenceHead(
+                        fps=latent_fps,
+                        **{k: float(cfg[k]) for k in
+                           ("patch_sec", "lookback_min_sec", "lookback_max_sec", "temp")
+                           if cfg.get(k) is not None},
+                    ).to(device)
+                    guides.append({
+                        "head": head,
+                        "target": torch.full((batch_size, 1, 1),
+                                             float(cfg.get("value", 0.738)), device=device),
+                        "weight": float(cfg.get("weight", 1.0)),
+                        "start_pct": float(cfg.get("start_pct", 0.3)),
+                        "end_pct": float(cfg.get("end_pct", 0.8)),
+                        "loss_type": "band_hinge",
+                        "huber_beta": float(cfg.get("huber_beta", 0.05)),
+                        "w_sec": None, "fps": latent_fps,
+                    })
+                    continue
                 head = load_latch_from_checkpoint(cfg["model_path"], device=device)
                 meta = getattr(head, "metadata", {}) or {}
                 head_sched = meta.get("noise_schedule")
