@@ -38,7 +38,7 @@ The diffusion transformer learns to generate SAME latents conditioned on inputs 
 ## SAME 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.18613-b31b1b.svg)](https://arxiv.org/abs/2605.18613)
 
-SAME compresses 44.1 kHz stereo audio into a continuous latent space with total downsampling 4096x and a latent dimension of 256. For a 10-second clip, 2 channels × 441k samples compresses down to 216×256 (216 latents of 256 dimensions each).
+SAME compresses 44.1 kHz stereo audio into a continuous latent space with total downsampling 4096x and a latent dimension of 256, i.e. a latent frame rate of 44100/4096 ≈ 10.77 Hz. For a 10-second clip, 2 channels × 441k samples compresses down to about 108×256 (≈108 latents of 256 dimensions each).
 
 SAME is designed to be useful in two mutually reinforcing ways. First, it is a high-fidelity autoencoder that preserves both low-level acoustic detail and high-level semantic content. Second, it is trained to produce a latent space that is structured and generatively tractable. Unlike autoencoders focused purely on reconstruction, SAME latents are easier for a generative model to learn from.
 
