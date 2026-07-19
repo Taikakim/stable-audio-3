@@ -623,6 +623,14 @@ class StableAudioModel:
             align = ds_ratio * latent_align
             target_audio_samples = ((target_audio_samples + align - 1) // align) * align
 
+        if target_audio_samples > sample_size:
+            sr = self.model.sample_rate
+            print(
+                f"Warning: requested duration {target_audio_samples / sr:.2f}s "
+                f"(seconds_total={max_seconds:.1f} + pad {duration_padding_sec:.1f}) exceeds the "
+                f"sample_size cap {sample_size / sr:.2f}s ({sample_size} samples) -- output CLAMPED "
+                f"to the cap. Raise sample_size (or --duration) to render the full length."
+            )
         return min(target_audio_samples, sample_size)
 
     def _encode_audio_input(self, audio_input, audio_sample_size, inpaint_mask=None):
