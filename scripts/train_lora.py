@@ -83,6 +83,27 @@ PRECISION_MODES = {
 }
 
 
+def load_layer_update_weights(spec):
+    """Parse --layer-update-weights (PATH or PATH#CURVE) -> {int layer: float mult} or None.
+    A multi-curve file ({"curves": {name: {layer: mult}}}, e.g. C's lumi/layer_curves/curves.json)
+    REQUIRES a #CURVE selector; a flat {layer: mult} file is used as-is."""
+    if not spec:
+        return None
+    path, _, curve = spec.partition("#")
+    data = json.load(open(path))
+    if isinstance(data, dict) and "curves" in data:
+        avail = list(data["curves"])
+        if not curve:
+            raise SystemExit(f"--layer-update-weights: {path} is multi-curve; use PATH#CURVE "
+                             f"(available: {avail})")
+        if curve not in data["curves"]:
+            raise SystemExit(f"--layer-update-weights: curve '{curve}' not in {path} (available: {avail})")
+        data = data["curves"][curve]
+    elif curve and isinstance(data, dict) and curve in data:
+        data = data[curve]
+    return {int(k): float(v) for k, v in data.items()}
+
+
 def load_model(model_name: str, device: torch.device,
                dtype: torch.dtype = torch.bfloat16):
     if model_name not in base_models:
@@ -291,6 +312,8 @@ def train(args):
                         "components": (["mona", "ns5", "normuon", "sf"]  # shampoo OFF (KL-Shampoo preconditioners OOM rank-128 on 16GB)
                                        + (["cautious"] if args.cautious else [])),
                         "hot_dtype": "bf16",
+                        # per-DiT-layer update-weight schedule (None = uniform; splats to FusionOpt)
+                        "layer_update_weights": load_layer_update_weights(args.layer_update_weights),
                     },
                 }
             }
@@ -592,6 +615,13 @@ def main():
              "ALL components on (Muon NS5 + SF-NorMuon + Schedule-Free + MONA + "
              "KL-Shampoo, hot_dtype=bf16); routes the LoRA params into "
              "spectral/scalar groups automatically.",
+    )
+    p.add_argument(
+        "--layer-update-weights", default=None, metavar="PATH[#CURVE]",
+        help="FusionOpt only: per-DiT-layer update-weight schedule. PATH to a JSON "
+             "{layer_index: multiplier}, or PATH#CURVE to select one curve from a multi-curve "
+             "file (e.g. lumi/layer_curves/curves.json#protect_melody_log). Scales each "
+             "transformer.layers.N param's post-NS5 spectral step by curve[N]; unset = uniform 1.0.",
     )
     p.add_argument(
         "--full-finetune", "--full_finetune",
