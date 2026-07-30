@@ -309,12 +309,20 @@ def train(args):
                     "type": "FusionOpt",
                     "config": {
                         "lr": args.lr,
-                        "components": (["mona", "ns5", "normuon", "sf"]  # shampoo OFF (KL-Shampoo preconditioners OOM rank-128 on 16GB)
+                        # shampoo default-OFF: KL-Shampoo preconditioners OOM rank-128 on 16GB
+                        # LOCAL VRAM — a 64GB LUMI GCD fits them, hence the opt-in flag
+                        # (--fusion-shampoo, alpha-campaign arm 7: "does KL-Shampoo help now
+                        # that VRAM allows it").
+                        "components": (["mona", "ns5", "normuon", "sf"]
+                                       + (["shampoo"] if args.fusion_shampoo else [])
                                        + (["cautious"] if args.cautious else [])),
                         "hot_dtype": "bf16",
                         # per-DiT-layer update-weight schedule (None = uniform; splats to FusionOpt)
                         "layer_update_weights": load_layer_update_weights(args.layer_update_weights),
                     },
+                    # param-group routing knobs (splat into build_fusion_param_groups in
+                    # configure_optimizers, NOT into FusionOpt) — qkv row-block split, off by default.
+                    "param_groups": {"split_qkv": args.fusion_split_qkv},
                 }
             }
         }
@@ -617,6 +625,13 @@ def main():
              "spectral/scalar groups automatically.",
     )
     p.add_argument(
+        "--fusion-split-qkv", action="store_true",
+        help="FusionOpt only: orthogonalise fused ATTENTION up-projections (to_qkv/to_q/to_kv) "
+             "per dim-row block instead of whole — q/k/v (+ the differential-attention diff "
+             "blocks) each get their own NS5. Block count is read from each param's shape; "
+             "non-attention params unchanged. Off by default.",
+    )
+    p.add_argument(
         "--layer-update-weights", default=None, metavar="PATH[#CURVE]",
         help="FusionOpt only: per-DiT-layer update-weight schedule. PATH to a JSON "
              "{layer_index: multiplier}, or PATH#CURVE to select one curve from a multi-curve "
@@ -641,6 +656,11 @@ def main():
                    help="add cautious masking (C-Muon) to FusionOpt: zero update coords that "
                         "fight the gradient, rescale survivors. Otherwise identical to --optimizer "
                         "fusion. No effect for adamw.")
+    p.add_argument("--fusion-shampoo", "--fusion_shampoo", dest="fusion_shampoo",
+                   action="store_true",
+                   help="add the KL-Shampoo two-sided preconditioner to FusionOpt's components "
+                        "(default OFF: its preconditioners OOM rank-128 on 16GB local VRAM; a "
+                        "64GB LUMI GCD fits them — alpha-campaign arm 7). No effect for adamw.")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--steps", type=int, default=10_000)
     p.add_argument("--batch_size", type=int, default=1)
