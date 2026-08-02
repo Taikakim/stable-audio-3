@@ -272,6 +272,12 @@ See the README for available CUDA variants and their requirements.
 wheels are useless — we use the **CK-backend `flash_attn 2.8.4`** built for gfx1201, already present in
 `.venv` (torch 2.10/2.12 ROCm).
 
+> **FAST venv — ROCm 7.14, use it (Kim 2026-08-02).** `SAO/.venv` (py3.13, HIP runtime 7.14.60850,
+> torch 2.14.0a0, source-built native-CK `flash_attn 2.8.4`) runs **100–200% faster** than this repo's
+> 7.2.3 `.venv` and is now the **default for SA3 render/inference** — `/home/kim/Projects/SAO/.venv/bin/python`.
+> Same activation rule below. Keep the 7.2.3 `.venv` as the stable reference (the existing eval corpus
+> was rendered on it — a same-config A/B across backends carries a small confound). Full note: `SAO/MASTER.md` §3/§5.
+
 **Activation — do it for every run; it's 30–100% faster than the fallback:**
 
 ```bash
