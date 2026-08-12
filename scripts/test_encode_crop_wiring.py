@@ -62,6 +62,58 @@ def _make_store(dirpath: Path, track_name: str, dur_s: float = 200.0):
     return tf
 
 
+def _make_wrongrate_store(dirpath: Path, track_name: str, dur_s: float = 1000.0):
+    """A store whose maest-shaped coarse field has a 2x-WRONG stated rate (the real bug W caught
+    2026-08-12, mir f10d007). True patch hop ~10 s -> ~0.1 Hz, but the producer hardcodes 0.2 Hz,
+    so trusting the sidecar maps the FIRST HALF of the track onto the whole and every LATE crop
+    slices out of range. W's fix derives the rate from n_frames/duration and overrides. This case
+    only fires on a crop PAST the halfway mark -- the region a small early-crop sample never sees."""
+    tf = dirpath / track_name
+    tf.mkdir(parents=True, exist_ok=True)
+    n100 = int(dur_s * 100)
+    f0 = np.full(n100, 60.0, dtype=np.float32)
+    voiced = np.ones(n100, dtype=np.float32)
+    # maest-shaped: TRUE 0.1 Hz -> 100 samples over 1000 s, value = the 0..100 position ramp so a
+    # crop's mean reveals WHICH region was read. Stated rate is 0.2 (2x wrong).
+    n_maest = int(dur_s * 0.1)
+    maest = np.linspace(0.0, 100.0, n_maest).astype(np.float32)
+    meta = {
+        "frame_rate": 100, "n_frames": n100, "duration": dur_s, "sample_rate": 44100,
+        "field_rates": {"f0_other_ts": 100.0, "f0_other_voiced_ts": 100.0,
+                        "maest_embed_ts": 0.2},          # <-- the wrong number
+        "fields": ["f0_other_ts", "f0_other_voiced_ts", "maest_embed_ts"],
+    }
+    np.savez(tf / f"{track_name}.TIMESERIES.npz",
+             f0_other_ts=f0, f0_other_voiced_ts=voiced, maest_embed_ts=maest,
+             __meta__=np.array(json.dumps(meta)))
+    return tf
+
+
+def test_late_window_wrong_rate(fails):
+    """Late crop [700,900]s of a 1000 s track. maest's TRUE 0.1 Hz puts that window at frames
+    [70:90] (value ~80 on the 0..100 ramp). Trusting the stated 0.2 Hz would ask frames [140:180]
+    of a 100-length array -> empty -> the whole crop dropped/raised. Passing REQUIRES W's f10d007
+    rate-derivation."""
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        track = "Long Artist - Long Track"
+        tf = _make_wrongrate_store(td, track)
+        out = enc.build_crop_timeseries(None, tf, track, 700.0, 900.0)
+        if out is None:
+            fails.append("late-window crop DROPPED — maest sliced at the stated 2x-wrong 0.2 Hz "
+                         "went out of range (W's f10d007 rate-derivation not active)")
+            return
+        if "maest_embed_ts" not in out:
+            fails.append("maest_embed_ts missing from late-window crop")
+        elif out["maest_embed_ts"].shape[0] != LATENT_FRAMES:
+            fails.append(f"maest_embed_ts shape {out['maest_embed_ts'].shape} != ({LATENT_FRAMES},)")
+        else:
+            mm = float(np.mean(out["maest_embed_ts"]))
+            if not (74.0 <= mm <= 86.0):
+                fails.append(f"maest late-window mean {mm:.1f} — expected ~80 (frames [70:90] at "
+                             f"the DERIVED 0.1 Hz); a different value means it read the wrong region")
+
+
 def main():
     fails = []
     with tempfile.TemporaryDirectory() as td:
@@ -113,14 +165,20 @@ def main():
                 fails.append(f"coarse field mean {cm:.1f} — expected ~30 (0.2 Hz slice of "
                              f"[100,110]s); wrong value means it was sliced at 100 Hz (W bug #1)")
 
+    # Scenario 2: the maest 2x-wrong-rate late-window failure (W f10d007). A small early-crop
+    # sample cannot reach this region — F's blind-spot lesson, now permanent in the suite.
+    test_late_window_wrong_rate(fails)
+
     if fails:
         print("RED — wiring not yet correct:")
         for f in fails:
             print("  FAIL:", f)
         sys.exit(1)
     print("GREEN — build_crop_timeseries resamples per-field correctly:")
-    print("  f0 masked-mean ~60 (not smeared), chords mode-pooled to {3,10}, "
+    print("  [mixed-rate] f0 masked-mean ~60 (not smeared), chords mode-pooled to {3,10}, "
           "coarse sliced at 0.2 Hz, all fields at LATENT_FRAMES.")
+    print("  [late-window] maest 2x-wrong stated rate overridden by n/duration derivation — "
+          "crop [700,900]s of a 1000s track read the correct late region (~80), not dropped.")
 
 
 if __name__ == "__main__":
