@@ -114,6 +114,66 @@ def test_late_window_wrong_rate(fails):
                              f"the DERIVED 0.1 Hz); a different value means it read the wrong region")
 
 
+def _make_f0_store(dirpath: Path, track_name: str, dur_s: float = 200.0):
+    """Store with legacy + f0 + a maest-bloat field, for the additive-whitelist test."""
+    tf = dirpath / track_name
+    tf.mkdir(parents=True, exist_ok=True)
+    n100 = int(dur_s * 100)
+    spectral = np.linspace(0.0, 1.0, n100).astype(np.float32)          # a legacy 100 Hz field
+    f0o = np.full(n100, 220.0, dtype=np.float32); vo = np.ones(n100, np.float32)
+    f0b = np.full(n100, 55.0, dtype=np.float32);  vb = np.ones(n100, np.float32)
+    f0o[:n100 // 2] = 0.0; vo[:n100 // 2] = 0.0                        # half unvoiced (masking check)
+    maest = np.linspace(0, 1, int(dur_s * 0.1)).astype(np.float32)[:, None].repeat(768, 1)  # bloat
+    meta = {"frame_rate": 100, "n_frames": n100, "duration": dur_s,
+            "field_rates": {"spectral_flux_ts": 100.0, "f0_other_ts": 100.0, "f0_other_voiced_ts": 100.0,
+                            "f0_bass_ts": 100.0, "f0_bass_voiced_ts": 100.0, "maest_embed_ts": 0.1}}
+    np.savez(tf / f"{track_name}.TIMESERIES.npz", spectral_flux_ts=spectral,
+             f0_other_ts=f0o, f0_other_voiced_ts=vo, f0_bass_ts=f0b, f0_bass_voiced_ts=vb,
+             maest_embed_ts=maest, __meta__=np.array(json.dumps(meta)))
+    return tf
+
+
+def test_additive_f0_whitelist(fails):
+    """The production path Kim authorized 2026-08-13: companion-only --fields <4 f0> --additive.
+    A crop whose EXISTING companion carries only legacy fields must gain EXACTLY the 4 f0 fields,
+    keep every legacy field (incl relative_position_ts), and NOT gain maest. Latent untouched."""
+    F0 = {"f0_other_ts", "f0_other_voiced_ts", "f0_bass_ts", "f0_bass_voiced_ts"}
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        track = "Add Artist - Add Track"
+        tf = _make_f0_store(td, track)
+        out = td / "corpus"; out.mkdir()
+        idx = "000000"
+        # existing companion = legacy fields only (the 21-field stand-in) + relative_position_ts
+        legacy = {"spectral_flux_ts": np.linspace(0, 1, LATENT_FRAMES).astype(np.float32),
+                  "relative_position_ts": np.linspace(0.0, 1.0, LATENT_FRAMES).astype(np.float32)}
+        np.savez(out / f"{idx}.TIMESERIES.npz", **legacy)
+        (out / f"{idx}.npy").write_bytes(b"LATENT")                    # sentinel: must stay byte-identical
+        (out / f"{idx}.json").write_text(json.dumps({
+            "source_track": track, "timestamps": [0.0, 100.0],
+            "source_path": str(tf / "full_mix.flac"),
+            "relative_position_start": 0.0, "relative_position_end": 0.5}))
+
+        enc.rebuild_companions(out, None, fields=F0, additive=True)
+
+        z = dict(np.load(out / f"{idx}.TIMESERIES.npz"))
+        keys = set(z.keys())
+        missing = F0 - keys
+        if missing:
+            fails.append(f"additive: f0 fields not added: {missing}")
+        for legk in ("spectral_flux_ts", "relative_position_ts"):
+            if legk not in keys:
+                fails.append(f"additive: legacy field {legk} DROPPED (merge should preserve it)")
+        if "maest_embed_ts" in keys:
+            fails.append("additive: maest_embed_ts was added — whitelist did not exclude the bloat")
+        if "f0_other_ts" in z:                                         # masking still correct
+            vv = z["f0_other_ts"][z["f0_other_ts"] > 0]
+            if vv.size and not (215.0 <= float(np.median(vv)) <= 225.0):
+                fails.append(f"additive: f0_other median {np.median(vv):.0f} != ~220 (masking wrong)")
+        if (out / f"{idx}.npy").read_bytes() != b"LATENT":
+            fails.append("additive: latent .npy was modified — must be read-only")
+
+
 def main():
     fails = []
     with tempfile.TemporaryDirectory() as td:
@@ -169,6 +229,9 @@ def main():
     # sample cannot reach this region — F's blind-spot lesson, now permanent in the suite.
     test_late_window_wrong_rate(fails)
 
+    # Scenario 3: the production f0-only additive whitelist path (Kim GO 2026-08-13).
+    test_additive_f0_whitelist(fails)
+
     if fails:
         print("RED — wiring not yet correct:")
         for f in fails:
@@ -179,6 +242,8 @@ def main():
           "coarse sliced at 0.2 Hz, all fields at LATENT_FRAMES.")
     print("  [late-window] maest 2x-wrong stated rate overridden by n/duration derivation — "
           "crop [700,900]s of a 1000s track read the correct late region (~80), not dropped.")
+    print("  [additive-f0] --fields whitelist + --additive: 4 f0 fields merged in, legacy fields + "
+          "latent preserved, maest excluded.")
 
 
 if __name__ == "__main__":

@@ -212,13 +212,21 @@ def load_whole_track_npz(path: Path):
 
 
 def build_crop_timeseries(timeseries_root: Path | None, track_folder: Path, track_name: str,
-                           start: float, end: float) -> dict | None:
+                           start: float, end: float, fields: set | None = None) -> dict | None:
     npz_path = find_whole_track_npz(timeseries_root, track_folder, track_name)
     if npz_path is None:
         return None
     data, meta = load_whole_track_npz(npz_path)
     if data is None:
         return None
+    if fields is not None:
+        # Restrict to a whitelist BEFORE pooling -- avoids computing the fields we won't keep (e.g.
+        # the 768-d maest embedding). W's resampler derives each sentinel field's voicing mask from
+        # the values (>0) if the mask array isn't present, so a value-only whitelist still pools
+        # correctly; we pass the masks too for exact validity weights.
+        data = {k: v for k, v in data.items() if k in fields}
+        if not data:
+            return None
     # Per-field slice + pool via W's resampler (mir): each field at its OWN native rate (the store
     # now spans 0.2-100 Hz), masked-mean for f0 sentinel fields (0.0 = unvoiced, NOT silence),
     # mode-pool for categorical chords, and a LOUD ValueError if a field cannot cover the crop
@@ -231,16 +239,24 @@ def build_crop_timeseries(timeseries_root: Path | None, track_folder: Path, trac
         return None
 
 
-def rebuild_companions(out_dir: Path, timeseries_root: Path | None):
-    """--companion-only: rebuild ONLY the <idx>.TIMESERIES.npz beside existing <idx>.npy latents,
-    from each crop's already-written <idx>.json (source_track + timestamps). CPU only -- no model
-    load, no audio read, no GPU re-encode. This is how corrected/added whole-track fields (e.g. W's
-    f0) reach the crop companions WITHOUT touching the pristine latents. The latents are read-only
-    here; only .TIMESERIES.npz is overwritten."""
+def rebuild_companions(out_dir: Path, timeseries_root: Path | None,
+                       fields: set | None = None, additive: bool = False):
+    """--companion-only: rebuild the <idx>.TIMESERIES.npz beside existing <idx>.npy latents, from
+    each crop's <idx>.json (source_track + timestamps). CPU only -- no model, no audio, no GPU.
+    Latents are read-only; only .TIMESERIES.npz changes.
+
+    fields   -- if set, compute ONLY these whitelisted store fields (e.g. the 4 f0 fields; excludes
+                the 768-d maest bloat).
+    additive -- if True, MERGE the (whitelisted) fields INTO the existing companion, preserving every
+                field already there (incl relative_position_ts). This is the safe way to ADD f0 to a
+                corpus's companions without dropping the legacy fields training already uses. If False,
+                the companion is fully rebuilt from the store (+ relative_position_ts re-added)."""
     jsons = sorted(p for p in out_dir.glob("*.json") if p.stem.isdigit())
     if not jsons:
         print(f"companion-only: no <idx>.json sidecars in {out_dir}", file=sys.stderr)
         sys.exit(1)
+    print(f"companion-only: {len(jsons)} crops in {out_dir} | fields={sorted(fields) if fields else 'ALL'} "
+          f"| mode={'ADDITIVE-merge' if additive else 'full-rebuild'}", flush=True)
     n_ok = n_skip = n_nolatent = 0
     for jp in jsons:
         idx_str = jp.stem
@@ -259,20 +275,30 @@ def rebuild_companions(out_dir: Path, timeseries_root: Path | None):
         # so this only matters where a colocated .npz sits beside the track.
         src = info.get("source_path") or info.get("path") or ""
         track_folder = Path(src).parent if src else out_dir
-        ts = build_crop_timeseries(timeseries_root, track_folder, track_name, start, end)
+        ts = build_crop_timeseries(timeseries_root, track_folder, track_name, start, end, fields=fields)
         if ts is None:
             print(f"  SKIP (no coverage/timeseries): {idx_str} {track_name}", file=sys.stderr)
             n_skip += 1; continue
-        rp0, rp1 = info.get("relative_position_start"), info.get("relative_position_end")
-        if rp0 is not None and rp1 is not None:      # re-add exactly as the full path does
-            ts["relative_position_ts"] = np.linspace(float(rp0), float(rp1), LATENT_FRAMES, dtype=np.float32)
+        npz_path = out_dir / f"{idx_str}.TIMESERIES.npz"
         if not (out_dir / f"{idx_str}.npy").exists():
             n_nolatent += 1
-        np.savez(out_dir / f"{idx_str}.TIMESERIES.npz", **ts)
+        if additive:
+            if not npz_path.exists():
+                print(f"  SKIP (additive needs an existing companion): {idx_str}", file=sys.stderr)
+                n_skip += 1; continue
+            with np.load(npz_path) as z:
+                merged = {k: z[k] for k in z.files}      # preserve ALL existing fields
+            merged.update(ts)                            # add/overwrite only the whitelisted new ones
+            np.savez(npz_path, **merged)
+        else:
+            rp0, rp1 = info.get("relative_position_start"), info.get("relative_position_end")
+            if rp0 is not None and rp1 is not None:      # re-add exactly as the full path does
+                ts["relative_position_ts"] = np.linspace(float(rp0), float(rp1), LATENT_FRAMES, dtype=np.float32)
+            np.savez(npz_path, **ts)
         n_ok += 1
         if n_ok % 200 == 0:
-            print(f"  {n_ok} companions rebuilt", flush=True)
-    print(f"companion-only DONE: {n_ok} rebuilt, {n_skip} skipped, {n_nolatent} had no .npy "
+            print(f"  {n_ok} companions written", flush=True)
+    print(f"companion-only DONE: {n_ok} written, {n_skip} skipped, {n_nolatent} had no .npy "
           f"(latents untouched).")
 
 
@@ -285,6 +311,14 @@ def main():
                           "(CPU, no re-encode), from each crop's <idx>.json. Use after a whole-track "
                           "field is corrected/added (e.g. W's f0) so it reaches the crops without "
                           "re-encoding pristine latents. Ignores --manifest.")
+    ap.add_argument("--fields", type=str, default=None,
+                     help="companion-only: comma-separated whitelist of store fields to emit (e.g. "
+                          "f0_other_ts,f0_other_voiced_ts,f0_bass_ts,f0_bass_voiced_ts). Excludes "
+                          "everything else (e.g. the 768-d maest bloat). Default = all store fields.")
+    ap.add_argument("--additive", action="store_true",
+                     help="companion-only: MERGE the (whitelisted) fields INTO the existing companion, "
+                          "preserving every field already there. The safe way to ADD f0 to a corpus "
+                          "without dropping the legacy fields training uses. Default = full rebuild.")
     ap.add_argument("--timeseries-root", type=Path, default=Path("/run/media/kim/Lehto/timeseries"))
     ap.add_argument("--out", type=Path, required=True,
                      help="Per-source destination dir, e.g. /home/kim/Projects/latents_<source>. "
@@ -309,7 +343,8 @@ def main():
 
     if args.companion_only:
         # CPU-only companion rebuild -- no model, no manifest. Returns before any GPU work.
-        rebuild_companions(args.out, args.timeseries_root)
+        wl = {f.strip() for f in args.fields.split(",") if f.strip()} if args.fields else None
+        rebuild_companions(args.out, args.timeseries_root, fields=wl, additive=args.additive)
         return
 
     if args.manifest is None:
