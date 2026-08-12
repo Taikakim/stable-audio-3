@@ -59,6 +59,11 @@ def main(args):
         sample_rate=ae.sample_rate,
         force_channels="stereo",
     )
+    shard_i = 0
+    if getattr(args, "shard", None):
+        shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+        dataset.filenames = dataset.filenames[shard_i::shard_n]   # deterministic 1/N slice
+        print(f"[shard {shard_i}/{shard_n}] encoding {len(dataset.filenames)} of the corpus", flush=True)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -97,7 +102,7 @@ def main(args):
 
         for i, latent in enumerate(latents):
             latent_np = latent.cpu().numpy()
-            latent_id = f"{nb:06d}{i:04d}"
+            latent_id = f"{shard_i:02d}{nb:06d}{i:04d}"   # shard-prefixed -> collision-free merge
 
             md = dict(metadata[i])
             padding_mask = (
@@ -154,6 +159,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pad", action="store_true", help="Pad audio samples to --sample_size"
+    )
+    parser.add_argument(
+        "--shard", default=None,
+        help="'I/N' -- encode only the deterministic 1/N slice filenames[I::N] of the corpus, "
+             "with I-prefixed latent ids so 8 GCD-pinned shards write one collision-free dir.",
     )
     args = parser.parse_args()
 
