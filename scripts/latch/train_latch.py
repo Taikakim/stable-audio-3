@@ -179,11 +179,22 @@ def train(args):
         print(f"Seed: {args.seed}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ds = LatCHDataset(args.latent_dir, target_feature=args.feature,
+    # Resolve the (possibly multi-root) latent dir. --latent-dirs (list) wins; else split --latent-dir
+    # on commas. A single dir stays a str (byte-identical single-root path); several -> a list.
+    if args.latent_dirs:
+        latent_dir = args.latent_dirs if len(args.latent_dirs) > 1 else args.latent_dirs[0]
+    else:
+        _parts = [s for s in args.latent_dir.split(",") if s]
+        latent_dir = _parts if len(_parts) > 1 else args.latent_dir
+    if isinstance(latent_dir, list):
+        print(f"Multi-root dataset: {len(latent_dir)} corpora {latent_dir}")
+    ds = LatCHDataset(latent_dir, target_feature=args.feature,
                       db_path=args.db_path, target_source=args.target_source,
-                      chroma_dir=args.chroma_dir, chroma_key=args.chroma_key)
-    print(f"Dataset: {len(ds)} crops, target_source={args.target_source}, feature={args.feature}")
-    sample_latent, sample_target = ds[0]
+                      chroma_dir=args.chroma_dir, chroma_key=args.chroma_key,
+                      voiced_field=args.voiced_field)
+    print(f"Dataset: {len(ds)} crops, target_source={args.target_source}, feature={args.feature}"
+          + (f", voiced_field={args.voiced_field}" if args.voiced_field else ""))
+    sample_latent, sample_target, _ = ds[0]
     out_channels = sample_target.shape[0]
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
                         num_workers=args.num_workers, collate_fn=collate_varlen,
@@ -276,7 +287,12 @@ def train(args):
         for bi, batch in enumerate(loader):
             latents = batch["latents"].to(device)
             targets = batch["targets"].to(device)
-            mask = batch["mask"].to(device)
+            # mask = length (padding) mask; weight = per-frame loss weight (all-ones unless
+            # --voiced-field is set — the melody head's voiced-fraction weighting, SAO
+            # WORKLOG 2026-08-13). Folding weight into mask here is the ONLY change needed:
+            # every masked_* loss already does mask.to(pred.dtype), so a continuous-valued
+            # mask acts as a soft per-frame weight with zero changes to the loss functions.
+            mask = batch["mask"].to(device).float() * batch["weight"].to(device)
             if args.standardize:
                 targets = (targets - std_mean) / std_std
             t = torch.rand(latents.shape[0], device=device)
@@ -361,11 +377,23 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     # Data / target
     p.add_argument("--feature", default="rms_energy_bass")
-    p.add_argument("--latent-dir", default="/home/kim/Projects/latents_sa3")
+    p.add_argument("--latent-dir", default="/home/kim/Projects/latents_sa3",
+                   help="latent dir; ALSO accepts a comma-separated list (goa,avp) for a combined "
+                        "multi-root dataset (full-path item lists concatenated -> stem collision sidestepped).")
+    p.add_argument("--latent-dirs", nargs="+", default=None,
+                   help="explicit multi-root form of --latent-dir: one or more latent dirs "
+                        "(space-separated). Overrides --latent-dir when given.")
     p.add_argument("--db-path", default=None)
     p.add_argument("--chroma-dir", default=None,
                    help="dir of per-crop <stem>.npz SAME-chroma (3,128,T); enables --target-source chroma")
     p.add_argument("--chroma-key", default="other", help="which stem's chroma: other / bass / full_mix")
+    p.add_argument("--voiced-field", default=None,
+                   help="npz field carrying a per-frame [0,1] loss WEIGHT, pooled-voiced-fraction "
+                        "convention (e.g. f0_other_voiced_ts for --feature f0_other). Melody/pitch "
+                        "targets carry an unvoiced sentinel (0.0 Hz) that must not be regressed on "
+                        "directly -- weighting by voiced fraction rather than hard-masking is the "
+                        "settled design (SAO WORKLOG 2026-08-13). Only target_source=npz honors this; "
+                        "default None = every other feature's loss is byte-identical to before.")
     p.add_argument("--target-source", choices=["db", "npz", "chroma", "scalar_json"], default="npz",
                    help="npz = <stem>.TIMESERIES.npz companions (latents_sa3, medium grid); "
                         "db = legacy per-crop TimeseriesDB (small-music-base / phase 1); "

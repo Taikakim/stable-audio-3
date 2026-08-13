@@ -29,17 +29,33 @@ class LatCHDataset(Dataset):
               21-field timeseries companion already sliced/resampled to T=4096).
     """
 
-    def __init__(self, latent_dir: str, target_feature: str = "rms_energy_bass",
+    def __init__(self, latent_dir, target_feature: str = "rms_energy_bass",
                  db=None, db_path: Optional[str] = None, target_source: str = "db",
-                 chroma_dir: Optional[str] = None, chroma_key: str = "other"):
-        self.latent_dir = Path(latent_dir)
+                 chroma_dir: Optional[str] = None, chroma_key: str = "other",
+                 voiced_field: Optional[str] = None):
+        # multi-root: accept a single dir (str/Path) OR a list of dirs — glob each and
+        # concatenate the FULL-PATH item lists. Each item carries its own absolute path, so
+        # the 000000.* stem COLLISION between corpora (goa + avp) is sidestepped and all the
+        # per-item sidecar loads (.TIMESERIES.npz beside each .npy) stay path-correct. Single
+        # dir is byte-identical (one sorted glob).
+        self.latent_dirs = ([Path(d) for d in latent_dir]
+                            if isinstance(latent_dir, (list, tuple)) else [Path(latent_dir)])
+        self.latent_dir = self.latent_dirs[0]   # first root kept for messages / back-compat
         self.bare_feature = target_feature.removesuffix("_ts")
         self.ts_feature = self.bare_feature + "_ts"
         self.target_source = target_source
         self.chroma_dir = Path(chroma_dir) if chroma_dir else None
         self.chroma_key = chroma_key   # which stem's SAME-chroma: other / bass / full_mix
-        self.items = sorted(p for p in self.latent_dir.glob("*.npy")
-                            if p.stem != "silence")
+        # Optional per-frame LOSS WEIGHT companion (e.g. f0_{other,bass}_voiced_ts — the
+        # crop resampler's pooled VOICED FRACTION, continuous [0,1], not boolean). Melody
+        # regression targets carry an unvoiced sentinel (0.0 Hz) that must not be regressed
+        # on directly; weighting the loss by voiced fraction (rather than hard-masking) is
+        # the settled design (SAO WORKLOG 2026-08-13, W+F+Kim). None (default) = every other
+        # feature's existing behavior is untouched: weight is all-ones everywhere.
+        self.voiced_field = voiced_field
+        self.items = []
+        for _d in self.latent_dirs:
+            self.items.extend(sorted(p for p in _d.glob("*.npy") if p.stem != "silence"))
         if not self.items:
             raise RuntimeError(f"No .npy latents in {latent_dir}")
         self._db = None
@@ -53,15 +69,24 @@ class LatCHDataset(Dataset):
             else:
                 self._db = _open_default_db()
         elif target_source == "npz":
-            # Keep only items whose companion npz has the requested field.
+            # Keep only items whose companion npz has the requested field (and the
+            # requested voiced_field, if any -- same fail-loud convention as the target
+            # field itself: a crop silently falling back to weight=1 would hide unweighted
+            # items in a mixed corpus rather than surfacing them at dataset-build time).
             kept = []
             for p in self.items:
                 npz = p.with_suffix(".TIMESERIES.npz")
-                if npz.exists():
-                    kept.append(p)
+                if not npz.exists():
+                    continue
+                if self.voiced_field is not None:
+                    with np.load(str(npz)) as z:
+                        if self.voiced_field not in z.files:
+                            continue
+                kept.append(p)
             if not kept:
                 raise RuntimeError(
-                    f"target_source='npz' but no *.TIMESERIES.npz companions in {latent_dir}")
+                    f"target_source='npz' but no *.TIMESERIES.npz companions in {latent_dir} "
+                    f"with the requested field(s)")
             self.items = kept
         elif target_source == "chroma":
             # SAME-compatible (3,128,T) chroma from a separate per-crop npz (stem-resolved).
@@ -122,6 +147,14 @@ class LatCHDataset(Dataset):
             raise ValueError(f"{self.ts_feature} missing for {npy_path.stem}")
         return resample_target(arrays[self.ts_feature], t_frames)
 
+    def _load_weight(self, npy_path: Path, t_frames: int) -> np.ndarray:
+        """Per-frame loss weight, (1, t_frames). All-ones unless voiced_field is set."""
+        if self.voiced_field is None:
+            return np.ones((1, t_frames), dtype=np.float32)
+        with np.load(str(npy_path.with_suffix(".TIMESERIES.npz"))) as z:
+            arr = z[self.voiced_field]
+        return resample_target(arr, t_frames)
+
     def __getitem__(self, idx):
         start = idx
         while True:
@@ -130,7 +163,8 @@ class LatCHDataset(Dataset):
                 latent = np.load(str(npy_path)).astype(np.float32)  # (256, T)
                 t_frames = latent.shape[1]
                 target = self._load_target(npy_path, t_frames)  # (C, T)
-                return torch.from_numpy(latent), torch.from_numpy(target)
+                weight = self._load_weight(npy_path, t_frames)  # (1, T)
+                return torch.from_numpy(latent), torch.from_numpy(target), torch.from_numpy(weight)
             except Exception:
                 idx = (idx + 1) % len(self.items)
                 if idx == start:
@@ -138,15 +172,19 @@ class LatCHDataset(Dataset):
 
 
 def collate_varlen(batch):
-    """Pad a list of (latent (256,T), target (C,T)) to the max T; return a length mask."""
-    max_t = max(lat.shape[1] for lat, _ in batch)
+    """Pad a list of (latent (256,T), target (C,T), weight (1,T)) to the max T; return a
+    length mask (bool, padding only) plus the per-frame loss weight (float, all-ones unless
+    the dataset was built with a voiced_field)."""
+    max_t = max(lat.shape[1] for lat, _, _ in batch)
     c_out = batch[0][1].shape[0]
     latents = torch.zeros(len(batch), 256, max_t)
     targets = torch.zeros(len(batch), c_out, max_t)
     mask = torch.zeros(len(batch), max_t, dtype=torch.bool)
-    for i, (lat, tgt) in enumerate(batch):
+    weight = torch.zeros(len(batch), max_t)
+    for i, (lat, tgt, w) in enumerate(batch):
         t = lat.shape[1]
         latents[i, :, :t] = lat
         targets[i, :, :t] = tgt
         mask[i, :t] = True
-    return {"latents": latents, "targets": targets, "mask": mask}
+        weight[i, :t] = w[0]
+    return {"latents": latents, "targets": targets, "mask": mask, "weight": weight}
