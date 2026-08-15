@@ -24,6 +24,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+# 8 GCD-pinned shards on one LUMI node, each spawning its own DataLoader workers, decoding
+# long goa_archive tracks through the default shared-memory IPC -> exhausts /dev/shm / node
+# RAM -> kernel oom_kill (job 21073662, 2026-08-15: died in <8min, 0 real latents written).
+# Same bug + same fix as train_lora.py's live-encode DDP path (job 20687866, 2026-08-06):
+# 'file_system' shares tensors via /tmp files (bound in the container) instead of /dev/shm.
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except Exception:
+    pass
 from torch.nn import functional as F
 
 from stable_audio_3 import AutoencoderModel
@@ -68,7 +77,7 @@ def main(args):
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=min(4, os.cpu_count() or 1),
+        num_workers=args.num_workers if args.num_workers is not None else min(4, os.cpu_count() or 1),
         drop_last=False,
         collate_fn=collation_fn,
     )
@@ -156,6 +165,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model_half", action="store_true", help="Run autoencoder in fp16"
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=None,
+        help="DataLoader workers. Default None = min(4, cpu_count()), fine for a solo run "
+             "but OOMs the node when several GCD-pinned shards run in parallel on one node "
+             "(8 shards x 4 workers = 32 processes decoding long tracks at once -> kernel "
+             "oom_kill, job 21073662). Pass a small explicit value (e.g. 1-2) for parallel "
+             "multi-shard preencode jobs.",
     )
     parser.add_argument(
         "--pad", action="store_true", help="Pad audio samples to --sample_size"
