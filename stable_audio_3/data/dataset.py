@@ -28,7 +28,25 @@ _FFMPEG = _shutil.which("ffmpeg")
 _FFPROBE = _shutil.which("ffprobe")
 
 
-_MAX_DECODE_SECONDS = 1800.0  # 30 min
+_MAX_DECODE_SECONDS = 720.0  # 12 min (tightened 2026-08-15 from 30min, still no confirmed
+# culprit file -- Kim's call to cut the cap further while the RSS-instrumented single-shard
+# smoke runs, rather than wait on the 30min cap's unconfirmed theory before trying anything)
+
+
+def _log_rss(tag):
+    """Print this process's resident memory (VmRSS) -- runs in the DataLoader WORKER
+    process (not the main training/encode process), since that's where _ffmpeg_load's
+    decode buffer actually lives. Added 2026-08-15 to catch the preencode_bigset OOM
+    (jobs 21073662/21148858/21149732, still unresolved after 2 rounds of blind fixes)
+    in the act instead of guessing again."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    print(f"[rss pid={os.getpid()}] {tag} {line.strip()}", flush=True)
+                    return
+    except Exception:
+        pass
 
 
 def _ffmpeg_load(filename, max_duration_s=_MAX_DECODE_SECONDS):
@@ -41,12 +59,13 @@ def _ffmpeg_load(filename, max_duration_s=_MAX_DECODE_SECONDS):
     stereo f32 track is ~1.7GB just for the raw buffer -- with several parallel
     GCD-pinned shards each landing on one of these (goa_archive's "VA - ..." compilation
     folders plausibly contain some), that's a real node-RAM exhaustion mechanism. A
-    >30min file is also not representative single-track training data regardless --
+    >12min file is also not representative single-track training data regardless --
     it would just get truncated to whatever --sample_size crops to, wasting the decode.
     Skipping fast via ffprobe's duration (no extra subprocess) turns a potential OOM
     into a clean, logged reject."""
     if not _FFMPEG or not _FFPROBE:
         raise RuntimeError("ffmpeg/ffprobe not on PATH — cannot decode audio without torchcodec")
+    _log_rss(f"before-probe {os.path.basename(filename)}")
     probe = _subprocess.run(
         [_FFPROBE, "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=sample_rate,channels:format=duration", "-of", "default=nw=1", filename],
@@ -70,6 +89,7 @@ def _ffmpeg_load(filename, max_duration_s=_MAX_DECODE_SECONDS):
     if proc.returncode != 0 or not proc.stdout:
         raise RuntimeError(
             f"ffmpeg decode failed ({filename}): {proc.stderr[:200].decode('utf-8', 'replace')}")
+    _log_rss(f"after-decode {os.path.basename(filename)} dur={duration:.0f}s bytes={len(proc.stdout)}")
     audio = np.frombuffer(proc.stdout, dtype=np.float32).reshape(-1, ch).T.copy()
     return torch.from_numpy(audio), sr
 

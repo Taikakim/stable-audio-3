@@ -44,6 +44,20 @@ from stable_audio_3.data.dataset import (
 )
 
 
+def _log_rss(tag):
+    """Main-process RSS (model + tensors received from DataLoader workers via the
+    file_system sharing strategy). Sibling of dataset.py's per-worker _log_rss --
+    added together 2026-08-15 to catch the still-unresolved preencode OOM in the act."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    print(f"[rss pid={os.getpid()} main] {tag} {line.strip()}", flush=True)
+                    return
+    except Exception:
+        pass
+
+
 def caption_metadata_fn(info, _audio):
     txt = Path(info["path"]).with_suffix(".txt")
     if not txt.exists():
@@ -98,6 +112,8 @@ def main(args):
 
     for nb, (audio, metadata) in enumerate(loader):
         print(f"Processing batch {nb}")
+        if nb % 20 == 0:
+            _log_rss(f"batch {nb}")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
