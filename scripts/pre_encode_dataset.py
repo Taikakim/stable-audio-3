@@ -58,6 +58,30 @@ def _log_rss(tag):
         pass
 
 
+def _log_leak_scan(tag, min_bytes=1_000_000):
+    """Scan the live object graph for large numpy/torch buffers still reachable -- the
+    decisive test between 'a Python reference leak' (this climbs in lockstep with RSS;
+    gc.get_referrers() on a hit would show WHO holds it) and 'a lower-level allocator
+    effect below Python's visibility' (this stays flat while RSS still grows). Added
+    2026-08-15 after tracemalloc was ruled out (it only sees allocations routed through
+    CPython's own allocator; numpy/torch buffers this size go through raw malloc,
+    invisible to it) and static code reading found no obvious accumulating list/cache."""
+    gc.collect()
+    total = 0
+    count = 0
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, np.ndarray) and obj.nbytes >= min_bytes:
+                total += obj.nbytes
+                count += 1
+            elif isinstance(obj, torch.Tensor) and obj.numel() * obj.element_size() >= min_bytes:
+                total += obj.numel() * obj.element_size()
+                count += 1
+        except Exception:
+            pass
+    print(f"[leak-scan] {tag} live_large_objs={count} total_mb={total/1e6:.1f}", flush=True)
+
+
 def caption_metadata_fn(info, _audio):
     txt = Path(info["path"]).with_suffix(".txt")
     if not txt.exists():
@@ -114,6 +138,7 @@ def main(args):
         print(f"Processing batch {nb}")
         if nb % 20 == 0:
             _log_rss(f"batch {nb}")
+            _log_leak_scan(f"batch {nb}")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
