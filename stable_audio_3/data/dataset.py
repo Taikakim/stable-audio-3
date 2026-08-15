@@ -15,6 +15,64 @@ from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T, VolumeNorm,
 
 AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
 
+# --- ffmpeg audio-decode fallback (torchcodec-free path) -------------------------------
+# torchaudio 2.x delegates decode to torchcodec, which is ABSENT on the LUMI multitorch image
+# (torch 2.10+rocm7; a matching torchcodec wheel is fragile per our history — MASTER §5). ffmpeg
+# IS present there, so decode via ffmpeg when torchcodec is missing. ffmpeg only DECODES at native
+# rate; resampling stays with torchaudio in load_file(). NEVER use sox for anything (CLAUDE.md).
+import subprocess as _subprocess
+import shutil as _shutil
+import importlib.util as _importlib_util
+_HAVE_TORCHCODEC = _importlib_util.find_spec("torchcodec") is not None
+_FFMPEG = _shutil.which("ffmpeg")
+_FFPROBE = _shutil.which("ffprobe")
+
+
+_MAX_DECODE_SECONDS = 1800.0  # 30 min
+
+
+def _ffmpeg_load(filename, max_duration_s=_MAX_DECODE_SECONDS):
+    """Decode any container to a float32 (C, N) tensor via ffmpeg at native rate.
+    Returns (audio, sr). Used only when torchcodec is unavailable (multitorch image).
+
+    max_duration_s guards against DJ-mix/compilation-length files (2026-08-15,
+    preencode_bigset job 21148858 OOM investigation): subprocess.run(capture_output=True)
+    buffers the ENTIRE decoded PCM stream in memory before returning, so an 80-min
+    stereo f32 track is ~1.7GB just for the raw buffer -- with several parallel
+    GCD-pinned shards each landing on one of these (goa_archive's "VA - ..." compilation
+    folders plausibly contain some), that's a real node-RAM exhaustion mechanism. A
+    >30min file is also not representative single-track training data regardless --
+    it would just get truncated to whatever --sample_size crops to, wasting the decode.
+    Skipping fast via ffprobe's duration (no extra subprocess) turns a potential OOM
+    into a clean, logged reject."""
+    if not _FFMPEG or not _FFPROBE:
+        raise RuntimeError("ffmpeg/ffprobe not on PATH — cannot decode audio without torchcodec")
+    probe = _subprocess.run(
+        [_FFPROBE, "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate,channels:format=duration", "-of", "default=nw=1", filename],
+        capture_output=True, text=True)
+    meta = dict(l.split("=", 1) for l in probe.stdout.split() if "=" in l)
+    if "sample_rate" not in meta or "channels" not in meta:
+        raise RuntimeError(f"ffprobe could not read {filename}: {probe.stderr[:200]}")
+    try:
+        duration = float(meta.get("duration", 0.0) or 0.0)
+    except ValueError:
+        duration = 0.0
+    if duration > max_duration_s:
+        raise RuntimeError(
+            f"{filename}: duration {duration:.0f}s exceeds the {max_duration_s:.0f}s cap "
+            "(likely a DJ-mix/compilation track, not representative training data)")
+    sr = int(meta["sample_rate"]); ch = max(1, int(meta["channels"]))
+    proc = _subprocess.run(
+        [_FFMPEG, "-nostdin", "-v", "error", "-i", filename,
+         "-f", "f32le", "-acodec", "pcm_f32le", "-ac", str(ch), "-ar", str(sr), "pipe:1"],
+        capture_output=True)
+    if proc.returncode != 0 or not proc.stdout:
+        raise RuntimeError(
+            f"ffmpeg decode failed ({filename}): {proc.stderr[:200].decode('utf-8', 'replace')}")
+    audio = np.frombuffer(proc.stdout, dtype=np.float32).reshape(-1, ch).T.copy()
+    return torch.from_numpy(audio), sr
+
 # fast_scandir implementation by Scott Hawley originally in https://github.com/zqevans/audio-diffusion/blob/main/dataset/dataset.py
 
 def fast_scandir(
@@ -232,7 +290,11 @@ class SampleDataset(torch.utils.data.Dataset):
     def load_file(self, filename):
         ext = filename.split(".")[-1]
 
-        audio, in_sr = torchaudio.load(filename, format=ext)
+        if _HAVE_TORCHCODEC:
+            audio, in_sr = torchaudio.load(filename, format=ext)
+        else:
+            # torchaudio 2.x needs torchcodec (absent on the multitorch image) — decode via ffmpeg.
+            audio, in_sr = _ffmpeg_load(filename)
 
         if in_sr != self.sr:
             resample_tf = T.Resample(in_sr, self.sr)
@@ -243,7 +305,11 @@ class SampleDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.filenames)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, _retries=0):
+        if _retries > 100:
+            raise RuntimeError(
+                f"LocalDataset: >100 consecutive load/skip retries (idx {idx}) — dataset likely "
+                f"broken (missing audio decoder, or all-silent/all-rejected). Aborting, not recursing.")
         audio_filename = self.filenames[idx]
         try:
             start_time = time.time()
@@ -258,7 +324,7 @@ class SampleDataset(torch.utils.data.Dataset):
 
             # Check for silence
             if is_silence(audio):
-                return self[random.randrange(len(self))]
+                return self.__getitem__(random.randrange(len(self)), _retries + 1)
 
             # Run augmentations on this sample (including random crop)
             if self.augs is not None:
@@ -295,7 +361,7 @@ class SampleDataset(torch.utils.data.Dataset):
                     info.update(custom_metadata)
 
                 if "__reject__" in info and info["__reject__"]:
-                    return self[random.randrange(len(self))]
+                    return self.__getitem__(random.randrange(len(self)), _retries + 1)
 
                 # Provide audio inputs as their own dictionary to be merged into info, each audio element will be normalized in the same way as the main audio
                 if "__audio__" in info:
@@ -312,7 +378,7 @@ class SampleDataset(torch.utils.data.Dataset):
             return (audio, info)
         except Exception as e:
             print(f'Couldn\'t load file {audio_filename}: {e}')
-            return self[random.randrange(len(self))]
+            return self.__getitem__(random.randrange(len(self)), _retries + 1)
 
 
 class PreEncodedDataset(torch.utils.data.Dataset):
@@ -538,6 +604,138 @@ class PreEncodedDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f'Couldn\'t load file {latent_filename}: {e}')
             return self[random.randrange(len(self))]
+
+class ArcRolloutDataset(torch.utils.data.Dataset):
+    """ARC-Forcing rollout dataset (shared data contract, SAO task #46).
+
+    Reads a directory of .npz files, one per training sample, with keys:
+      context_latent (fp16, [C, Tctx]) -- the model's own drifted rollout context;
+                                          REPLACES the clamped (mask==1) region
+      target_latent  (fp16, [C, T])    -- the TRUE full window (context + continuation);
+                                          loss frames are mask==0
+      mask           (uint8, [T])      -- 1 = frame is CLAMPED context visible to
+                                          the model, 0 = to-generate. mask[:Tctx] = 1,
+                                          so the context lives INSIDE the target window
+      prompt         (str)
+      meta           (json str)        -- source stem, crop offsets, rollout nl, ckpt id
+    T is a multiple of 256 (MASTER §5); Tctx = mask.sum(). A manifest.json at the
+    dir root lists files + generation params (manifest-v2).
+
+    Returns (latents [C, T], info) where latents = target_latent (the true window,
+    used only for the mask==0 loss region) and info carries the inpaint conditioning:
+      inpaint_mask         [1, T] -- the contract mask
+      inpaint_masked_input [C, T] -- the DRIFTED context_latent written into the
+                                     mask==1 frames, zeros elsewhere. Never
+                                     latents * mask: that would leak the clean
+                                     teacher context and defeat the ARC
+                                     exposure-bias objective.
+    The training wrapper routes these through the same conditioning keys inference
+    uses ('inpaint_mask'/'inpaint_masked_input' -> local_add_cond) and restricts
+    the diffusion loss to the free (mask=0) region.
+    """
+
+    def __init__(
+        self,
+        path,
+        sample_rate=44100,
+        downsampling_ratio=4096,
+        tokenizers: Optional[dict] = None,
+    ):
+        super().__init__()
+        paths = path if isinstance(path, list) else [path]
+
+        self.filenames = []
+        self.manifest = None
+        for p in paths:
+            _, files = fast_scandir(p, ["npz"])
+            # Exclude timeseries siblings that may live next to latents in mixed dirs
+            self.filenames.extend(f for f in files if not f.endswith(".TIMESERIES.npz"))
+
+            manifest_path = os.path.join(p, "manifest.json")
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r") as f:
+                        self.manifest = json.load(f)
+                except Exception as e:
+                    print(f"Couldn't load manifest file {manifest_path}: {e}")
+        self.filenames.sort()
+
+        self.sample_rate = sample_rate
+        self.downsampling_ratio = downsampling_ratio
+        self.tokenizers = tokenizers
+
+        print(f'Found {len(self.filenames)} ARC rollout samples')
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        npz_filename = self.filenames[idx]
+        try:
+            with np.load(npz_filename) as npz:
+                context = npz["context_latent"].astype(np.float32)  # [C, Tctx]
+                target = npz["target_latent"].astype(np.float32)    # [C, T]
+                mask = npz["mask"].astype(np.float32)                # [T]
+                prompt = str(npz["prompt"])
+                meta = json.loads(str(npz["meta"])) if "meta" in npz.files else {}
+
+            if mask.shape[0] != target.shape[1]:
+                raise Exception(
+                    f"contract violation: mask length {mask.shape[0]} != target T {target.shape[1]}"
+                )
+            n_clamped = int(mask.sum())
+            if context.shape[1] != n_clamped:
+                raise Exception(
+                    f"contract violation: context Tctx {context.shape[1]} != "
+                    f"mask.sum() {n_clamped}"
+                )
+
+            # The context is EMBEDDED in the target window (mask[:Tctx]=1), so the
+            # true window IS the full training sequence — no concatenation.
+            latents = torch.from_numpy(target)  # [C, T]
+            t_total = latents.shape[1]
+
+            inpaint_mask = torch.from_numpy(mask).unsqueeze(0)  # [1, T]
+            # Model-visible input: the DRIFTED rollout context in the clamped
+            # frames, zeros in the to-generate frames. NOT latents * mask — that
+            # would clamp the clean teacher context and defeat the ARC objective.
+            inpaint_masked_input = torch.zeros_like(latents)
+            clamped = torch.from_numpy(mask).bool()
+            inpaint_masked_input[:, clamped] = torch.from_numpy(context)
+
+            info = {
+                "path": npz_filename,
+                "latent_filename": npz_filename,
+                "prompt": prompt,
+                "seconds_total": t_total * self.downsampling_ratio / self.sample_rate,
+                "padding_mask": [torch.ones(t_total, dtype=torch.bool)],
+                "inpaint_mask": [inpaint_mask],
+                "inpaint_masked_input": [inpaint_masked_input],
+                "arc_meta": meta,
+            }
+
+            # Pre-tokenize text fields in DataLoader workers (same as PreEncodedDataset)
+            if self.tokenizers is not None:
+                for key, (tokenizer, max_length) in self.tokenizers.items():
+                    if key in info and isinstance(info[key], str):
+                        info[f"{key}_text"] = info[key]
+                        encoded = tokenizer(
+                            info[key],
+                            truncation=True,
+                            max_length=max_length,
+                            padding="max_length",
+                            return_tensors="pt",
+                        )
+                        info[key] = {
+                            "input_ids": encoded["input_ids"].squeeze(0),
+                            "attention_mask": encoded["attention_mask"].squeeze(0),
+                        }
+
+            return (latents, info)
+        except Exception as e:
+            print(f'Couldn\'t load file {npz_filename}: {e}')
+            return self[random.randrange(len(self))]
+
 
 # get_dbmax and is_silence copied from https://github.com/drscotthawley/aeiou/blob/main/aeiou/core.py under Apache 2.0 License
 # License can be found in LICENSES/LICENSE_AEIOU.txt
