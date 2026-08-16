@@ -99,7 +99,8 @@ def main(args):
     dataset = SampleDataset(
         [
             LocalDatasetConfig(
-                id="train", path=args.data_dir, custom_metadata_fn=caption_metadata_fn
+                id="train", path=args.data_dir,
+                custom_metadata_fn=None if args.no_caption_check else caption_metadata_fn,
             )
         ],
         sample_size=args.sample_size,
@@ -222,6 +223,16 @@ if __name__ == "__main__":
         "--shard", default=None,
         help="'I/N' -- encode only the deterministic 1/N slice filenames[I::N] of the corpus, "
              "with I-prefixed latent ids so 8 GCD-pinned shards write one collision-free dir.",
+    )
+    parser.add_argument(
+        "--no_caption_check", action="store_true",
+        help="Skip caption_metadata_fn's per-file .txt sidecar requirement (default: every file "
+             "missing a matching .txt is __reject__-ed). Use when captions are merged in a LATER "
+             "local step, not expected at encode time (e.g. goa_archive, whose captions come from "
+             "a sidecar JSON, not one .txt per file -- 2026-08-17: this requirement silently "
+             "rejected 100% of goa_archive, root-causing both the '>100 consecutive retries' abort "
+             "AND the preencode 'memory leak' misdiagnosis, which was actually RSS high-water-mark "
+             "growth from repeatedly decoding full tracks that then got discarded on rejection).",
     )
     args = parser.parse_args()
 
