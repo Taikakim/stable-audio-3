@@ -192,6 +192,19 @@ def train(args):
     torch._dynamo.config.capture_scalar_outputs = True
     torch.set_float32_matmul_precision("high")
 
+    # torchrun (unlike the --gpus-per-task=1 cgroup-isolated srun launch) makes ALL GPUs on
+    # the node visible to every spawned process -- torch.device("cuda") with no index would
+    # resolve to physical GPU 0 for every rank (the exact "Pattern 1 OOM, all ranks load onto
+    # GPU 0" failure documented in fullft_avp_aug.sbatch), since this runs BEFORE Lightning's
+    # Trainer ever assigns per-rank devices. Pin explicitly from LOCAL_RANK (set by torchrun,
+    # absent under the cgroup-isolated launch -- this is a no-op there, preserving existing
+    # behavior for every other script). 2026-08-17, prompted by the CSC/LUMI reference example
+    # (llm-fine-tuning-examples) using torchrun --standalone --nproc-per-node=N instead of the
+    # --gpus-per-task=1 + Lightning-SLURMEnvironment-auto-detect pattern this repo used
+    # everywhere, which job 21161065 showed can silently fail to form real DDP at all.
+    if "LOCAL_RANK" in os.environ:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
     seed = args.seed
 
     pl.seed_everything(seed, workers=True)
