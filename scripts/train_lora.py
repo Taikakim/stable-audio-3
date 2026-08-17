@@ -157,6 +157,35 @@ def caption_metadata_fn(info, audio):
     return {"prompt": txt.read_text().strip()}
 
 
+def _parse_caption_probs(spec, n_sources):
+    """Parse --caption_probs into one (p1,p2,p3) tuple PER SOURCE.
+
+    `spec` is either a single "p1,p2,p3" (applied to every source — the historical behaviour, so
+    existing commands are unaffected) or semicolon-separated per-source tuples in --encoded_dir
+    order. Raises on a count mismatch rather than silently recycling: a caption-tier mix that
+    quietly applies to the wrong corpus is invisible in the logs and only shows up as a model that
+    learned the wrong prompts.
+    """
+    parts = [p.strip() for p in str(spec).split(";") if p.strip()]
+    out = []
+    for p in parts:
+        t = tuple(float(x) for x in p.split(","))
+        if len(t) != 3:
+            raise ValueError(f"--caption_probs tuple {p!r} must have 3 values (t1,t2,t3)")
+        if any(v < 0 for v in t):
+            raise ValueError(f"--caption_probs tuple {p!r} has a negative probability")
+        if sum(t) <= 0:
+            raise ValueError(f"--caption_probs tuple {p!r} sums to 0 — no tier could ever be picked")
+        out.append(t)
+    if len(out) == 1:
+        return out * n_sources
+    if len(out) != n_sources:
+        raise ValueError(f"--caption_probs has {len(out)} per-source tuples but there are "
+                         f"{n_sources} encoded_dirs — pass one tuple, or exactly one per dir "
+                         f"(semicolon-separated, in --encoded_dir order)")
+    return out
+
+
 def make_data_dir_caption_fn(sidecar_path, probs, track_type_prob):
     """--data_dir sibling of the --encoded_dir make_caption_sampler wiring.
 
@@ -303,12 +332,26 @@ def train(args):
         if len(weights) != len(dirs):
             raise ValueError(f"got {len(dirs)} encoded_dirs but {len(weights)} source_weights")
         from caption_tools import make_caption_sampler
-        probs = tuple(float(x) for x in args.caption_probs.split(","))
+        # PER-SOURCE tier probabilities (2026-08-17). --caption_probs was parsed once and applied to
+        # every source, which forced one corpus's caption quality onto all of them. Concretely: the
+        # goa bigset's granite tier measured NOT GROUNDED (rare-term recall 1.24x vs chance — it was
+        # generated from folder names, see eval/audit_caption_sidecar.py), so goa must ride its MF
+        # tier `0,0,1`, while suomisoundi (16.17x) and AVP (3.84x) have genuinely per-track granite
+        # and want Kim's `0,0.9,0.1`. One global tuple cannot express that, so a bad tier in ONE
+        # corpus would either poison the mix or hold the good corpora hostage.
+        # Syntax: semicolon-separates per source, in --encoded_dir order; a single tuple (no
+        # semicolon) applies to all, so every existing invocation is unchanged.
+        #   --caption_probs "0,0.9,0.1"                 -> all sources
+        #   --caption_probs "0,0.9,0.1;0,0.9,0.1;0,0,1" -> avp ; suomisoundi ; goa
+        probs_list = _parse_caption_probs(args.caption_probs, len(dirs))
         configs = []
         for i, d in enumerate(dirs):
             sc = sidecars[i] if i < len(sidecars) and sidecars[i] else None
-            fn = make_caption_sampler(sc, probs=probs,
+            fn = make_caption_sampler(sc, probs=probs_list[i],
                                       track_type_prob=args.track_type_prob) if sc else None
+            if sc:
+                print(f"[captions] source {i} ({os.path.basename(d)}): tiers "
+                      f"t1/t2/t3 = {probs_list[i]}  sidecar={os.path.basename(sc)}")
             configs.append(LatentDatasetConfig(id=f"train{i}", path=d, weight=weights[i],
                                                custom_metadata_fn=fn))
         dataset = PreEncodedDataset(
@@ -321,7 +364,8 @@ def train(args):
         if args.caption_sidecar:
             # sidecar-driven captions (e.g. #90 goa_archive big-set): NOT
             # make_caption_sampler's per-clip-.txt path, see make_data_dir_caption_fn.
-            probs = tuple(float(x) for x in args.caption_probs.split(","))
+            # single source here, so a per-source spec would be ambiguous — take the one tuple.
+            probs = _parse_caption_probs(args.caption_probs, 1)[0]
             md_fn = make_data_dir_caption_fn(args.caption_sidecar, probs, args.track_type_prob)
         else:
             md_fn = caption_metadata_fn
@@ -1055,7 +1099,16 @@ def main():
                         "Instrumental, ' to sampled captions (SA3 paper §5.1: base "
                         "trained ~50%% with AudioSparx prefixes; 0.5 mirrors that)")
     p.add_argument("--caption_probs", default="0.6,0.3,0.1",
-                   help="sampling probabilities for caption tiers t1,t2,t3")
+                   help="sampling probabilities for caption tiers t1,t2,t3. ONE tuple applies to "
+                        "every source; SEMICOLON-separated tuples set them PER SOURCE in "
+                        "--encoded_dir order, e.g. '0,0.9,0.1;0,0.9,0.1;0,0,1'. Per-source exists "
+                        "because caption quality differs BY CORPUS: audit a sidecar's granite tier "
+                        "with eval/audit_caption_sidecar.py before trusting it — as of 2026-08-17 "
+                        "suomisoundi scores 16.2x rare-term recall vs chance and AVP 3.8x (both "
+                        "grounded, safe at t2=0.9), but the goa bigset scores 1.24x (NOT grounded, "
+                        "generated from folder names) and must ride its MF tier '0,0,1' until "
+                        "regenerated. A missing tier falls back to t1 SILENTLY, so a wrong mix "
+                        "trains on boilerplate without erroring.")
     p.add_argument("--source_weights", default=None,
                    help="comma-separated per-source sample weights (parallel to --encoded_dir); "
                         "default 1.0 each = natural per-crop proportions")
