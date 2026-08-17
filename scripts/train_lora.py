@@ -270,6 +270,21 @@ def train(args):
             model.pretransform.requires_grad_(False)
             model.pretransform.enable_grad = False
         model.conditioner.requires_grad_(False)
+        # EDM2-style forced weight norm on the output projection (arXiv 2312.02696). MUST happen
+        # HERE — after the DiT is unfrozen and BEFORE configure_optimizers runs — because it adds a
+        # `gain` parameter per wrapped site, and build_fusion_param_groups only sees parameters that
+        # exist when it builds its groups. `gain` is 1-D so it routes to ScheduleFree-AdamW rather
+        # than being orthogonalized by NS5. Step 0 is functionally identical to the loaded weights
+        # (gain init = pretrained per-channel norms), so there is no resume/fine-tune spike.
+        if getattr(args, "forced_weight_norm", False):
+            from stable_audio_3.training.forced_weight_norm import apply_forced_weight_norm
+            _pats = tuple(p.strip() for p in args.fwn_patterns.split(",") if p.strip())
+            _wrapped = apply_forced_weight_norm(model.model, patterns=_pats, verbose=True)
+            if not _wrapped:
+                raise SystemExit(
+                    f"[fwn] FATAL: --forced-weight-norm matched no wrappable module for patterns "
+                    f"{list(_pats)}. Refusing to run: the arm would train as a plain full-FT with "
+                    f"no magnitude bound, and look like a valid EDM2 arm in the logs.")
         _dit = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
         _pt = sum(p.numel() for p in model.pretransform.parameters()) if model.pretransform is not None else 0
         _cond = sum(p.numel() for p in model.conditioner.parameters())
@@ -703,6 +718,32 @@ def train(args):
         training_wrapper.strict_loading = False
         print(f"[resume] strict_loading=False for {args.resume_ckpt} "
               f"(stripped-base DoRA/fullft fat; missing frozen-base keys are expected)")
+        if getattr(args, "forced_weight_norm", False):
+            # strict_loading=False means a checkpoint that PREDATES forced weight norm restores its
+            # `weight` tensors but leaves every `gain` at whatever this process constructed — which
+            # is the gain of the FRESHLY LOADED base, not of the resumed weights. That silently
+            # rescales the model instead of erroring. Re-derive each gain from the restored weight
+            # AFTER Lightning has loaded it, via a hook, so the resumed function is reproduced.
+            from stable_audio_3.training.forced_weight_norm import ForcedWeightNorm
+
+            def _refit_gains(*_a, **_k):
+                n = 0
+                for _m in training_wrapper.diffusion.model.modules():
+                    if isinstance(_m, ForcedWeightNorm):
+                        _m.reinit_gain_from_weight()
+                        n += 1
+                print(f"[fwn] re-derived `gain` from restored weights at {n} site(s) "
+                      f"(resume of a possibly pre-FWN checkpoint)")
+
+            if hasattr(training_wrapper, "register_load_state_dict_post_hook"):
+                training_wrapper.register_load_state_dict_post_hook(
+                    lambda module, incompatible_keys: _refit_gains())
+            else:
+                # LUMI runs torch 2.10 where local dev is 2.14 — do not assume the API is there.
+                print("[fwn] WARNING: this torch has no register_load_state_dict_post_hook, so "
+                      "`gain` cannot be re-derived automatically after restore. If --resume_ckpt "
+                      "PREDATES forced weight norm, the model will be silently rescaled — start "
+                      "that arm fresh instead of resuming.")
     trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt)
 
 
@@ -951,6 +992,30 @@ def main():
                    help="add the KL-Shampoo two-sided preconditioner to FusionOpt's components "
                         "(default OFF: its preconditioners OOM rank-128 on 16GB local VRAM; a "
                         "64GB LUMI GCD fits them — alpha-campaign arm 7). No effect for adamw.")
+    p.add_argument("--forced-weight-norm", "--forced_weight_norm", dest="forced_weight_norm",
+                   action="store_true",
+                   help="EDM2-style forced weight normalization (arXiv 2312.02696) on the DiT's "
+                        "OUTPUT PROJECTION: W_eff[i]=gain[i]*W[i]/‖W[i]‖, so magnitude lives in a "
+                        "learnable 1-D per-output-channel `gain` instead of drifting across the "
+                        "matrix. Targets the runaway at its site — the output proj is NOT "
+                        "scale-invariant, so weight-norm growth IS output-magnitude growth. "
+                        "RETROFIT-SAFE: gain init = the pretrained per-channel norms, so step 0 is "
+                        "functionally identical to the loaded checkpoint (no spike). DISTINCT FROM "
+                        "--hyperball: that FREEZES whole-tensor ‖W‖_F at ‖W0‖_F across every "
+                        "spectral matrix (magnitude cannot change); this keeps magnitude LEARNABLE "
+                        "but well-conditioned, on a targeted layer. The two compose. Zero-init "
+                        "layers (postprocess_conv) are skipped — W/‖W‖ would be 0/0. Full-finetune "
+                        "only. EDM2's from-scratch pieces (MP-SiLU/MP-sum) are deliberately NOT "
+                        "implemented — they need training from scratch.")
+    p.add_argument("--fwn-patterns", "--fwn_patterns", dest="fwn_patterns",
+                   default=r"project_out$",
+                   help="comma-separated regexes selecting which submodules --forced-weight-norm "
+                        "wraps (matched against qualified module names). Default `project_out$` = "
+                        "the DiT's output projection (transformer.py:1171), which is where the "
+                        "measured latent-scale runaway lives. Add `global_cond_embedder\\.2` to "
+                        "include the AdaLN modulation emitter (MaP-DiT names AdaLN scale as the "
+                        "other magnitude-non-preserving site). Matching nothing is a FATAL error, "
+                        "not a warning — a silent no-op would look like a valid EDM2 arm.")
     p.add_argument("--hyperball", action="store_true",
                    help="FusionOpt only (arXiv 2606.16899): constrain each spectral 2D weight "
                         "matrix to the hypersphere of radius R=‖W0‖_F (the loaded weight's norm, "
