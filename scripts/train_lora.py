@@ -670,6 +670,19 @@ def train(args):
     if args.warm_start_ckpt:
         from warm_start import OptimizerWarmStart
         callbacks.append(OptimizerWarmStart(args.warm_start_ckpt))
+    if args.traj_sketch_dir:
+        # Step-resolution trajectory recorder (Kim 2026-08-18): CountSketch of every optimizer
+        # step's update + gradient (inner-product-preserving, so the whole Gram of the walk is
+        # recoverable from ~4 KB/step) + trainable-only checkpoints on a coarse grid. See
+        # scripts/trajectory_sketch.py. Inert unless the flag is given.
+        from trajectory_sketch import TrajectorySketch
+        _spe = len(dataset) // args.batch_size // max(1, args.accumulate_grad_batches)
+        _traj_T = (_spe * args.epochs if args.epochs else args.steps) + 8
+        callbacks.append(TrajectorySketch(
+            args.traj_sketch_dir, max_steps=_traj_T, k=args.traj_sketch_k,
+            hashes=args.traj_sketch_hashes, subsample=args.traj_subsample,
+            ckpt_every=args.traj_ckpt_every, lora_config=lora_config,
+            ckpt_dense_until=args.traj_ckpt_dense_until))
 
     # Combine args and config dicts
     args_dict = vars(args)
@@ -1193,6 +1206,19 @@ def main():
     p.add_argument("--name", type=str, default="lora-finetune")
     p.add_argument("--save_dir", type=str, default="./lora_checkpoints")
     p.add_argument("--checkpoint_every", type=int, default=500)
+    p.add_argument("--traj-sketch-dir", dest="traj_sketch_dir", default=None,
+                   help="record a step-resolution weight trajectory here (CountSketch of every "
+                        "optimizer step's update+grad, per-tensor norms, raw coordinate subsample, "
+                        "trainable-only ckpts every --traj-ckpt-every). scripts/trajectory_sketch.py")
+    p.add_argument("--traj-sketch-k", dest="traj_sketch_k", type=int, default=1024,
+                   help="buckets per hash (sketch dim = k * hashes)")
+    p.add_argument("--traj-sketch-hashes", dest="traj_sketch_hashes", type=int, default=4)
+    p.add_argument("--traj-subsample", dest="traj_subsample", type=int, default=16384,
+                   help="raw coordinates kept per step (fixed random subset)")
+    p.add_argument("--traj-ckpt-every", dest="traj_ckpt_every", type=int, default=100,
+                   help="save trainable tensors (bf16) every N optimizer steps into <dir>/ckpt/")
+    p.add_argument("--traj-ckpt-dense-until", dest="traj_ckpt_dense_until", type=int, default=0,
+                   help="additionally save EVERY step up to this global_step (disk: ~23 MB/step at rank 16)")
     p.add_argument("--log_every", type=int, default=100)
     p.add_argument("--demo_every", type=int, default=500)
     p.add_argument("--num_workers", type=int, default=8)
