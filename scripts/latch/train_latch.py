@@ -54,7 +54,7 @@ import random  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from torch.utils.data import DataLoader  # noqa: E402
+from torch.utils.data import DataLoader, Subset  # noqa: E402
 
 from scripts.latch.latch_dataset import LatCHDataset, collate_varlen  # noqa: E402
 from scripts.latch.latch_model import LatCH  # noqa: E402
@@ -68,6 +68,41 @@ def forward_noise(z0, noise, t):
     """Flow-matching linear interpolation z_t = (1-t)*z0 + t*noise. t: (B,)."""
     t = t.view(-1, 1, 1)
     return (1.0 - t) * z0 + t * noise
+
+
+# ---------------------------------------------------------------------------
+# Held-out validation split — BY SOURCE TRACK, not by crop
+# ---------------------------------------------------------------------------
+
+def split_indices(groups, val_frac, seed=0):
+    """Deterministic train/val split that never splits a GROUP across the two sides.
+
+    `groups[i]` is item i's group key (for `latents_sa3`, its source track). Holding out
+    whole groups is not a refinement here, it is the only honest option: in that corpus every
+    one of the 2676 source tracks contributes >=2 crops, so a crop-level split would leak a
+    sibling crop of essentially every val track into train. Sibling crops of one goa track
+    share key, lead patch and often literal repeated loop material — for an f0/melody target
+    that is close to training on the validation set.
+
+    val_frac == 0 returns (everything, []) so runs that do not opt in are unchanged.
+    """
+    n = len(groups)
+    if val_frac <= 0.0:
+        return list(range(n)), []
+    uniq = sorted(set(groups))
+    shuffled = list(uniq)
+    random.Random(seed).shuffle(shuffled)
+    n_val = max(1, int(round(val_frac * len(uniq))))
+    if n_val >= len(uniq):
+        raise ValueError(
+            f"val split would hold out {n_val} of {len(uniq)} group(s), leaving no training "
+            f"data. The dataset has too few distinct groups for --val-frac {val_frac}.")
+    held = set(shuffled[:n_val])
+    train = [i for i, g in enumerate(groups) if g not in held]
+    val = [i for i, g in enumerate(groups) if g in held]
+    if not train or not val:
+        raise ValueError(f"val split produced an empty side (train={len(train)}, val={len(val)})")
+    return train, val
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +231,35 @@ def train(args):
           + (f", voiced_field={args.voiced_field}" if args.voiced_field else ""))
     sample_latent, sample_target, _ = ds[0]
     out_channels = sample_target.shape[0]
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+
+    # --- Held-out validation (opt-in; --val-frac 0 = every prior run's behaviour) ----------
+    # Without this, `_best.pt` is the epoch with the lowest TRAINING loss, which is not a
+    # convergence claim — it is the most-memorised checkpoint. Split is BY SOURCE TRACK; see
+    # split_indices for why a crop-level split cannot work on this corpus.
+    val_loader = None
+    val_meta = None
+    if args.val_frac > 0.0:
+        groups = ds.group_keys(args.val_group_by)
+        tr_idx, va_idx = split_indices(groups, args.val_frac, seed=args.val_seed)
+        n_groups = len(set(groups))
+        n_val_groups = len({groups[i] for i in va_idx})
+        val_meta = {"val_frac": args.val_frac, "val_seed": args.val_seed,
+                    "val_group_by": args.val_group_by, "n_groups": n_groups,
+                    "n_val_groups": n_val_groups, "n_train_crops": len(tr_idx),
+                    "n_val_crops": len(va_idx)}
+        print(f"Val split: {len(va_idx)} crops from {n_val_groups} held-out "
+              f"{args.val_group_by}(s) / {n_groups} total; {len(tr_idx)} crops train"
+              + ("  [LEAKY: crop-level split]" if args.val_group_by in (None, "none") else ""))
+        val_ds = Subset(ds, va_idx)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                drop_last=False, num_workers=args.num_workers,
+                                collate_fn=collate_varlen,
+                                persistent_workers=args.num_workers > 0)
+        train_ds = Subset(ds, tr_idx)
+    else:
+        train_ds, tr_idx = ds, list(range(len(ds)))
+
+    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
                         num_workers=args.num_workers, collate_fn=collate_varlen,
                         persistent_workers=args.num_workers > 0)
 
@@ -223,9 +286,11 @@ def train(args):
     # Target standardization stats (zero-mean/unit-std) from a sample of the dataset.
     std_mean, std_std = 0.0, 1.0
     if args.standardize:
+        # Sample TRAIN items only — target mean/std computed over the val crops too would leak
+        # held-out statistics into the model's output scale, a quiet way to flatter val loss.
         rng = np.random.RandomState(0)
-        samp = [ds[int(i)][1].numpy().reshape(-1)
-                for i in rng.randint(0, len(ds), size=min(256, len(ds)))]
+        samp = [ds[int(tr_idx[i])][1].numpy().reshape(-1)
+                for i in rng.randint(0, len(tr_idx), size=min(256, len(tr_idx)))]
         allv = np.concatenate(samp)
         std_mean = float(allv.mean())
         std_std = float(allv.std()) or 1.0
@@ -335,9 +400,52 @@ def train(args):
         if is_fusion:
             opt.eval()
 
-        is_best = avg_loss < best_loss
+        # --- validation ------------------------------------------------------------------
+        # Runs AFTER opt.eval() so FusionOpt is measured on its deployable averaged iterate,
+        # and with the EMA weights swapped in when EMA is on — i.e. we validate whatever this
+        # epoch would actually SAVE, not a different set of weights.
+        val_loss = None
+        if val_loader is not None:
+            swapped = None
+            if ema_params is not None:
+                swapped = [p.detach().clone() for p in model.parameters()]
+                with torch.no_grad():
+                    for p, e in zip(model.parameters(), ema_params):
+                        p.copy_(e)
+            model.eval()
+            vtot, vb = 0.0, 0
+            with torch.no_grad():
+                for vi, batch in enumerate(val_loader):
+                    latents = batch["latents"].to(device)
+                    targets = batch["targets"].to(device)
+                    mask = batch["mask"].to(device).float() * batch["weight"].to(device)
+                    if args.standardize:
+                        targets = (targets - std_mean) / std_std
+                    # FIXED noise/t per batch index, identical every epoch: otherwise the
+                    # epoch-to-epoch val delta is dominated by which t's happened to be drawn,
+                    # and a "val improved" reading would be mostly resampling noise.
+                    g = torch.Generator().manual_seed(args.val_seed * 1000003 + vi)
+                    t = torch.rand(latents.shape[0], generator=g).to(device)
+                    noise = torch.randn(latents.shape, generator=g).to(device)
+                    z_t = forward_noise(latents, noise, t)
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                        preds = model(z_t, t)
+                    vtot += criterion(preds.float(), targets, mask).item()
+                    vb += 1
+            val_loss = vtot / max(vb, 1)
+            model.train()
+            if swapped is not None:
+                with torch.no_grad():
+                    for p, b in zip(model.parameters(), swapped):
+                        p.copy_(b)
+            print(f"           val={val_loss:.4f}  (held-out {val_meta['n_val_groups']} "
+                  f"{args.val_group_by}s)")
+
+        # Select on VAL when we have it — training loss selects the most-memorised epoch.
+        sel = val_loss if val_loss is not None else avg_loss
+        is_best = sel < best_loss
         if is_best:
-            best_loss = avg_loss
+            best_loss = sel
 
         if args.save_best_only:
             if is_best:
@@ -366,6 +474,11 @@ def train(args):
                 "seed": args.seed,
                 "epoch": epoch + 1,
                 "avg_loss": avg_loss,
+                # None when the run had no held-out set. A consumer can then tell a
+                # val-selected head from a train-selected one instead of assuming.
+                "val_loss": val_loss,
+                "val_split": val_meta,
+                "selected_on": "val_loss" if val_loader is not None else "train_loss",
             }, ckpt_path)
             print(f"  -> saved {ckpt_path}{' (new best)' if is_best else ''}")
 
@@ -400,6 +513,17 @@ if __name__ == "__main__":
                         "scalar_json = constant target from <stem>.TIMBRAL.json "
                         "(--feature hardness/depth/booming, pooled-readout head).")
     # Training loop
+    p.add_argument("--val-frac", type=float, default=0.0,
+                   help="fraction of GROUPS (source tracks) held out for validation. 0 (default) "
+                        "= no val set, and `_best.pt` is then selected on TRAINING loss, which "
+                        "is not a convergence signal. Set this for any run you intend to "
+                        "believe.")
+    p.add_argument("--val-seed", type=int, default=0,
+                   help="seed for the group split AND for the fixed val noise/t draws")
+    p.add_argument("--val-group-by", default="source_track",
+                   help="crop-json field to group by so a track's crops never straddle the "
+                        "split ('none' = crop-level split; LEAKY on latents_sa3, where every "
+                        "track has >=2 crops)")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--precision", choices=["fp32", "bf16"], default="bf16",

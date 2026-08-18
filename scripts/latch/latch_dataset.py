@@ -1,6 +1,7 @@
 # scripts/latch/latch_dataset.py
 """LatCH dataset for SA3: SAME latents (256xT) + MIR target resampled to each clip's T."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -123,6 +124,39 @@ class LatCHDataset(Dataset):
 
     def __len__(self):
         return len(self.items)
+
+    def group_keys(self, group_by: str = "source_track"):
+        """Per-item group key for a leak-free train/val split (see train_latch.split_indices).
+
+        Read from each crop's `<stem>.json` sidecar; in `latents_sa3` that is `source_track`
+        ("Artist - Title"), the field that says which real track a crop was cut from.
+
+        `group_by="none"` gives every crop its own group = a crop-level split. That is the
+        LEAKY mode (every track in this corpus has >=2 crops) and exists only so it can be
+        chosen deliberately, never arrived at by accident — hence a missing field is a hard
+        error rather than a quiet per-crop fallback, which would silently reintroduce exactly
+        the leak this split exists to prevent.
+        """
+        if group_by in (None, "none"):
+            return [str(p) for p in self.items]
+        keys, missing = [], []
+        for p in self.items:
+            meta = p.with_suffix(".json")
+            val = None
+            if meta.exists():
+                try:
+                    val = json.loads(meta.read_text()).get(group_by)
+                except Exception:
+                    val = None
+            if val is None:
+                missing.append(p.name)
+            keys.append(val)
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} of {len(self.items)} crops have no {group_by!r} in their .json "
+                f"sidecar (first: {missing[:3]}). A group-aware val split cannot be built. "
+                f"Pass --val-group-by none to accept a crop-level (LEAKY) split instead.")
+        return keys
 
     def _load_target(self, npy_path: Path, t_frames: int) -> np.ndarray:
         if self.target_source == "chroma":
