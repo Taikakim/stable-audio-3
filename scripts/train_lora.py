@@ -452,6 +452,14 @@ def train(args):
     _warmup_steps = compute_warmup_steps(
         args.warmup_steps, args.warmup_frac, len(dataset), args.batch_size,
         args.accumulate_grad_batches, args.epochs, args.steps)
+    # total OPTIMIZER steps of this run (same units as warmup) — the horizon for --fusion-decay
+    _spe_total = len(dataset) // args.batch_size // max(1, args.accumulate_grad_batches)
+    _total_steps = _spe_total * args.epochs if args.epochs else args.steps
+    if args.fusion_decay != "none":
+        print(f"[fusion] decay: {args.fusion_decay} over {_total_steps} steps -> x{args.fusion_decay_min}"
+              + (f" (flat until {args.fusion_decay_start_frac:.0%})" if args.fusion_decay == "wsd" else ""))
+    if args.fusion_snr != "off":
+        print(f"[fusion] snr gate: {args.fusion_snr} beta={args.fusion_snr_beta} floor={args.fusion_snr_floor} power={args.fusion_snr_power}")
     if _warmup_steps:
         print(f"[fusion] warmup: {_warmup_steps} steps"
               + (f" ({args.warmup_frac:.0%} of total)" if args.warmup_frac is not None else ""))
@@ -494,10 +502,21 @@ def train(args):
                         "components": ((["mona", "ns5", "normuon"] if args.hyperball
                                         else ["mona", "ns5", "normuon", "sf"])
                                        + (["shampoo"] if args.fusion_shampoo else [])
-                                       + (["cautious"] if args.cautious else [])),
+                                       + (["cautious"] if args.cautious else [])
+                                       + (["snr"] if args.fusion_snr != "off" else [])),
                         "hyperball": args.hyperball,
                         "hot_dtype": "bf16",
                         "warmup_steps": _warmup_steps,
+                        # DAMPING (C 2026-08-19, Kim's muon damping tests): in-optimizer LR decay
+                        # over the run's total optimizer steps + optional SNR gate. Both default off.
+                        "decay_schedule": args.fusion_decay,
+                        "total_steps": _total_steps,
+                        "decay_min": args.fusion_decay_min,
+                        "decay_start_frac": args.fusion_decay_start_frac,
+                        "snr_mode": (args.fusion_snr if args.fusion_snr != "off" else "row"),
+                        "snr_beta": args.fusion_snr_beta,
+                        "snr_floor": args.fusion_snr_floor,
+                        "snr_power": args.fusion_snr_power,
                         # per-DiT-layer update-weight schedule (None = uniform; splats to FusionOpt)
                         "layer_update_weights": load_layer_update_weights(args.layer_update_weights),
                     },
@@ -1029,6 +1048,26 @@ def main():
                         "include the AdaLN modulation emitter (MaP-DiT names AdaLN scale as the "
                         "other magnitude-non-preserving site). Matching nothing is a FATAL error, "
                         "not a warning — a silent no-op would look like a valid EDM2 arm.")
+    p.add_argument("--fusion-decay", dest="fusion_decay", default="none",
+                   choices=("none", "cosine", "linear", "wsd"),
+                   help="FusionOpt in-optimizer LR decay over the run's total optimizer steps (after "
+                        "warmup). The magnitude-blind spectral step (NS5->NorMuon) has no other way to "
+                        "slow down once the gradient is noise; SF's averaging only damps a random walk "
+                        "by 1/sqrt(3). Default none = unchanged.")
+    p.add_argument("--fusion-decay-min", dest="fusion_decay_min", type=float, default=0.0,
+                   help="final LR multiplier of the decay (0 = to zero, 0.1 = to 10%%)")
+    p.add_argument("--fusion-decay-start-frac", dest="fusion_decay_start_frac", type=float, default=0.8,
+                   help="wsd: fraction of the run kept flat before the linear tail")
+    p.add_argument("--fusion-snr", dest="fusion_snr", default="off", choices=("off", "row", "elem"),
+                   help="FusionOpt SNR gate: scale each row's (or element's) finalized spectral update by "
+                        "|EMA(U)|/RMS(U) — a data-driven brake that engages where the update stops "
+                        "being repeatable (0.23 on iid noise, 1 on a consistent direction). 'row' = per "
+                        "output neuron; 'elem' = per weight (Adam-like). Default off.")
+    p.add_argument("--fusion-snr-beta", dest="fusion_snr_beta", type=float, default=0.9)
+    p.add_argument("--fusion-snr-floor", dest="fusion_snr_floor", type=float, default=0.0,
+                   help="minimum gate (0 = may fully stop a noise-only row)")
+    p.add_argument("--fusion-snr-power", dest="fusion_snr_power", type=float, default=1.0,
+                   help="gate exponent (>1 = harder brake on noise)")
     p.add_argument("--hyperball", action="store_true",
                    help="FusionOpt only (arXiv 2606.16899): constrain each spectral 2D weight "
                         "matrix to the hypersphere of radius R=‖W0‖_F (the loaded weight's norm, "

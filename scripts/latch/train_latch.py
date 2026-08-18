@@ -186,6 +186,11 @@ def make_optimizer(args, model):
         components = (
             None if not args.components else set(args.components.split(","))
         )
+        # DAMPING (C 2026-08-19): in-optimizer decay over the run + optional SNR gate. train_latch's
+        # steps are epochs*len(loader)/grad_accum; the loader exists by the time make_optimizer runs.
+        _total = int(getattr(args, "_total_opt_steps", 0))
+        if args.fusion_snr != "off":
+            components = set(components or {"mona", "shampoo", "ns5", "normuon", "sf", "cautious"}) | {"snr"}
         opt = FusionOpt(
             groups,
             lr=args.lr,
@@ -193,6 +198,9 @@ def make_optimizer(args, model):
             hot_dtype=args.hot_dtype,
             fp32_audit_period=args.fp32_audit_period,
             components=components,
+            decay_schedule=args.fusion_decay, total_steps=_total, decay_min=args.fusion_decay_min,
+            snr_mode=(args.fusion_snr if args.fusion_snr != "off" else "row"),
+            snr_beta=args.fusion_snr_beta,
         )
         print(f"FusionOpt components: {sorted(opt.components)}  "
               f"uses_sf_averaging={opt.uses_sf_averaging}  "
@@ -263,6 +271,7 @@ def train(args):
                         num_workers=args.num_workers, collate_fn=collate_varlen,
                         persistent_workers=args.num_workers > 0)
 
+    args._total_opt_steps = (len(loader) // max(1, args.grad_accum)) * args.epochs   # for --fusion-decay
     model = LatCH(in_channels=256, out_channels=out_channels,
                   dim=args.dim, depth=args.depth, num_heads=args.num_heads,
                   t_injection=args.t_injection).to(device)
@@ -572,6 +581,13 @@ if __name__ == "__main__":
     p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
     p.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw")
+    p.add_argument("--fusion-decay", dest="fusion_decay", default="none",
+                   choices=("none", "cosine", "linear", "wsd"),
+                   help="FusionOpt in-optimizer LR decay over the run (see train_lora --fusion-decay)")
+    p.add_argument("--fusion-decay-min", dest="fusion_decay_min", type=float, default=0.0)
+    p.add_argument("--fusion-snr", dest="fusion_snr", default="off", choices=("off", "row", "elem"),
+                   help="FusionOpt SNR gate per row|elem (see train_lora --fusion-snr)")
+    p.add_argument("--fusion-snr-beta", dest="fusion_snr_beta", type=float, default=0.9)
     p.add_argument("--hot-dtype", choices=["fp32", "bf16", "fp16_safe"], default="bf16",
                    help="FusionOpt NS5 dtype. bf16 = ~1.65x faster than fp32; "
                         "fp16_safe = ~1.3-1.5x faster than bf16 with fp32 polynomial accumulation. "
