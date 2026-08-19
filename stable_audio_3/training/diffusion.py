@@ -37,6 +37,79 @@ class Profiler:
         rep += 80 * "=" + "\n\n\n"
         return rep
 
+def get_alphas_sigmas(t):
+    """Cosine noise schedule for the v-prediction objective (t in [0,1]: t=0 clean, t=1 noise;
+    noised = x0*alpha + noise*sigma, v-target = noise*alpha - x0*sigma). This was CALLED by
+    validation_step (and needed by training_step) but DEFINED nowhere in this fork — the upstream
+    'v' objective (the factory default!) shipped gutted, so any v-pred run crashed with NameError.
+    Restored 2026-08-03 (additive; see stable-audio-3/CLAUDE.md). Needed by #65/#66 v-pred work."""
+    return torch.cos(t * torch.pi / 2), torch.sin(t * torch.pi / 2)
+
+
+class SimpleEMA(torch.nn.Module):
+    """Minimal self-contained weight-EMA (ema_pytorch was stripped from this SA3 fork; the
+    wrapper's .ema_model reads survived but the build+update did not). Shadows `model`'s params
+    with an exponential moving average. `.ema_model` is the shadow used for demos/eval/save.
+    Registered as a submodule so it round-trips through the Lightning checkpoint automatically.
+    Full-finetune only (LoRA keeps EMA off — see wrapper __init__)."""
+
+    def __init__(self, model, beta=0.9999, update_every=1, update_after_step=0):
+        super().__init__()
+        import copy
+        self.ema_model = copy.deepcopy(model).eval()
+        self.ema_model.requires_grad_(False)
+        self.beta = float(beta)
+        self.update_every = int(update_every)
+        self.update_after_step = int(update_after_step)
+        self.register_buffer("ema_step", torch.zeros((), dtype=torch.long))
+
+    @torch.no_grad()
+    def update(self, model):
+        self.ema_step += 1
+        step = int(self.ema_step.item())
+        # Warmup: hard-track the online weights so the EMA starts from a real point, not init.
+        if step <= self.update_after_step:
+            for ep, mp in zip(self.ema_model.parameters(), model.parameters()):
+                ep.copy_(mp.detach())
+            for eb, mb in zip(self.ema_model.buffers(), model.buffers()):
+                eb.copy_(mb)
+            return
+        if self.update_every > 1 and step % self.update_every != 0:
+            return
+        for ep, mp in zip(self.ema_model.parameters(), model.parameters()):
+            ep.lerp_(mp.detach().to(ep.dtype), 1.0 - self.beta)
+        for eb, mb in zip(self.ema_model.buffers(), model.buffers()):
+            eb.copy_(mb)
+
+
+@torch.no_grad()
+def agc_clip_grads_(params, agc_lambda: float, eps: float = 1e-3, eps2: float = 1e-6) -> None:
+    """Adaptive Gradient Clipping (NFNets / Brock et al.), in-place on .grad.
+
+    For each param p (ndim>=2) with grad g, per OUTPUT-UNIT (row = dim 0; reduce over all
+    other dims, keepdim) scale the gradient toward the param's own scale:
+
+        pn   = clamp(||p||_unit, min=eps)          # unit weight norm, floored
+        gn   = ||g||_unit                          # unit grad norm
+        coef = min(1, agc_lambda * pn / (gn+eps2))  # per-unit shrink factor
+        g   *= coef
+
+    Only large-grad-relative-to-scale units are reined in; small-weight/near-noise units keep
+    moving. ndim<2 params (biases, norms, scalars) are SKIPPED (left untouched — the caller's
+    norm-mode default handles them if desired). Norms are computed in fp32 for stability, then
+    the coefficient is cast back to the grad dtype. Mutates p.grad in place; returns nothing.
+    """
+    for p in params:
+        g = getattr(p, "grad", None)
+        if g is None or p.ndim < 2:
+            continue
+        dims = tuple(range(1, p.ndim))
+        pn = p.detach().float().pow(2).sum(dim=dims, keepdim=True).sqrt().clamp_min(eps)
+        gn = g.detach().float().pow(2).sum(dim=dims, keepdim=True).sqrt()
+        coef = (agc_lambda * pn / (gn + eps2)).clamp_max(1.0)
+        g.mul_(coef.to(g.dtype))
+
+
 class DiffusionCondTrainingWrapper(pl.LightningModule):
     '''
     Wrapper for training a conditional audio diffusion model.
@@ -49,6 +122,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             mask_padding_attention: bool = False,
             silence_extension_scale_seconds: float = 0.0,
             use_ema: bool = True,
+            ema_beta: float = 0.9999,
+            ema_update_every: int = 1,
+            ema_update_after_step: int = 0,
             log_loss_info: bool = False,
             optimizer_configs: dict = None,
             pre_encoded: bool = False,
@@ -70,10 +146,43 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             ot_coupling: bool = False,
             base_precision: tp.Optional[str] = None,
             familiarity_beta: float = 0.0,
+            stereo_loss_weight: float = 0.0,
+            stereo_loss_tmax: float = 0.3,
+            stereo_loss_subbatch: int = 2,
+            subspace_loss_basis: str = None,
+            subspace_loss_weight: float = 1.0,
+            subspace_loss_tgate: str = None,
+            subspace_loss_tgate_mode: str = "r2",
+            subspace_loss_tgate_floor: float = 0.05,
+            x0_equiv_loss: bool = False,
+            x0_loss_weight: float = 0.0,
+            grad_clip_mode: str = "norm",
+            agc_lambda: float = 0.01,
+            output_std_penalty: float = 0.0,
+            output_std_t_gate: float = 0.5,
     ):
         super().__init__()
 
         self.ot_coupling = ot_coupling
+
+        # Full-FT regularization A/B (2026-08-10, spec fullft-regularization-ab). Two levers
+        # for the FusionOpt full-FT latent-scale runaway, both OFF by default (byte-identical):
+        #   - grad_clip_mode "agc": scale-relative per-output-unit gradient clipping in
+        #     configure_gradient_clipping (NFNets AGC) instead of the global-norm clip. "norm"
+        #     (default) keeps Lightning's --gradient_clip_val behaviour.
+        #   - output_std_penalty (lambda_out) > 0: penalize the reconstructed clean latent's
+        #     per-channel std drifting off the real data's, gated to t < output_std_t_gate.
+        self.grad_clip_mode = grad_clip_mode
+        self.agc_lambda = agc_lambda
+        self.output_std_penalty = output_std_penalty
+        self.output_std_t_gate = output_std_t_gate
+
+        # Stereo-preservation auxiliary loss (training/stereo_loss.py). weight=0
+        # (default) => OFF and the training path is byte-identical to before.
+        # See the module docstring + MASTER §4 meter-in-the-gradient note.
+        self.stereo_loss_weight = stereo_loss_weight
+        self.stereo_loss_tmax = stereo_loss_tmax
+        self.stereo_loss_subbatch = stereo_loss_subbatch
 
         # Familiarity-normalized loss weighting (scripts/familiarity.py): per-crop
         # EMA of relative loss -> down-weight familiar crops, keep remote ones hot.
@@ -85,6 +194,52 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             _sys.path.insert(0, str(_Path(__file__).resolve().parents[2] / "scripts"))
             from familiarity import FamiliarityReweighter
             self.familiarity = FamiliarityReweighter(beta=familiarity_beta)
+
+        # Subspace-weighted RF loss (spectral-bias counter, tau ~ 1/lambda —
+        # arXiv 2503.03206): upweight the flow-matching error's component inside a
+        # measured latent subspace (e.g. the 15-dim melody subspace, 9.3% of corpus
+        # variance) so low-variance structure isn't gradient-starved. weight=1.0
+        # (default) => OFF, path byte-identical. Basis npz: rows of `basis15` (or the
+        # first k rows of `melody_basis`) = orthonormal components [k, C]. The extra
+        # term is computed on the RAW error (designed for loss_normalization="none").
+        # E1a: sigma^2-weighted v-loss == x0-space MSE for a v-output head (JLT port,
+        # spec 2026-07-31). False (default) = byte-identical path.
+        self.x0_equiv_loss = x0_equiv_loss
+
+        # x0-reconstruction ADD-a-term (distinct from x0_equiv_loss above, which
+        # REPLACES the v-loss with its sigma^2-weighted form). This ADDS an explicit
+        # clean-latent MSE term: lambda_x0 * MSE(z0_hat, z0), with z0_hat = noised -
+        # t*v_pred (rf_z0_hat, the SAME reconstruction the output-std/stereo blocks
+        # use). Predicting toward the clean latent removes the ambient isotropic-noise
+        # component that pressures output-scale growth (arXiv 2605.27102 JLT; the
+        # x0equiv thread). weight==0 (default) => NO-OP, loss byte-identical, zero
+        # overhead. RF objective only (z0_hat formula is RF-specific).
+        self.x0_loss_weight = x0_loss_weight
+
+        self.subspace_loss_weight = subspace_loss_weight
+        if subspace_loss_basis is not None and subspace_loss_weight != 1.0:
+            import numpy as _np
+            _z = _np.load(subspace_loss_basis)
+            _b = _z["basis15"] if "basis15" in _z.files else _z["melody_basis"][:15]
+            self.register_buffer(
+                "subspace_basis", torch.tensor(_b, dtype=torch.float32),
+                persistent=False)
+        else:
+            self.subspace_basis = None
+        # R²(t)-derived gate on the subspace term (C 2026-08-19; stable_audio_3/training/tgate.py):
+        # multiplies the per-sample subspace error energy by g(t), mean-1 over the measured grid,
+        # so K stays the AVERAGE multiplier and the budget moves to the noise levels where the
+        # melody subspace is actually recoverable. None (default) = flat gate = byte-identical.
+        self.subspace_tgate = None
+        if self.subspace_basis is not None and subspace_loss_tgate:
+            from .tgate import load_tgate
+            _gt, _gg = load_tgate(subspace_loss_tgate, mode=subspace_loss_tgate_mode,
+                                  floor=subspace_loss_tgate_floor)
+            self.register_buffer("subspace_tgate_t", _gt, persistent=False)
+            self.register_buffer("subspace_tgate_g", _gg, persistent=False)
+            self.subspace_tgate = subspace_loss_tgate
+            print(f"[subspace] t-gate {subspace_loss_tgate_mode} from {subspace_loss_tgate}: "
+                  f"grid {_gt.numel()} pts, gate range {float(_gg.min()):.2f}-{float(_gg.max()):.2f}")
 
         self.diffusion = model
 
@@ -100,6 +255,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             adapter_type = self.lora_config.get("adapter_type", "lora")
             include = self.lora_config.get("include", None)
             exclude = self.lora_config.get("exclude", None)
+            phm_n = self.lora_config.get("phm_n", 4)
             # Resolve legacy "dora" to rows/cols variant
             adapter_type = resolve_adapter_type(adapter_type, lora_state_dict)
             print(f"LoRA config: rank={rank}, alpha={lora_alpha}, adapter_type={adapter_type}")
@@ -116,10 +272,10 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 print("WARNING: -XS adapter without svd_bases_path — SVD will be computed per layer")
             lora_config = {
                 torch.nn.Linear: {
-                    "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=lora_alpha, adapter_type=adapter_type),
+                    "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=lora_alpha, adapter_type=adapter_type, phm_n=phm_n),
                 },
                 torch.nn.Conv1d: {
-                    "weight": partial(LoRAParametrization.from_conv1d, rank=rank, lora_alpha=lora_alpha, adapter_type=adapter_type),
+                    "weight": partial(LoRAParametrization.from_conv1d, rank=rank, lora_alpha=lora_alpha, adapter_type=adapter_type, phm_n=phm_n),
                 }
             }
             # Add LoRA to the model
@@ -145,6 +301,15 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                     )
 
         self.diffusion_ema = None
+        if use_ema:
+            # Full-finetune only (LoRA set use_ema=False above). Shadows the DiT weights; the
+            # demo/eval/save hooks already prefer diffusion_ema.ema_model when it's not None.
+            self.diffusion_ema = SimpleEMA(
+                self.diffusion.model, beta=ema_beta,
+                update_every=ema_update_every, update_after_step=ema_update_after_step,
+            )
+            print(f"[ema] SimpleEMA on the DiT: beta={ema_beta} update_every={ema_update_every} "
+                  f"warmup={ema_update_after_step}")
         self.mask_loss_weight = mask_loss_weight
 
         # Attention masking for padded tokens
@@ -281,6 +446,27 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         return [opt_diff]
 
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None,
+                                    gradient_clip_algorithm=None):
+        """Full-FT regularization A/B (2026-08-10). FusionOpt is a custom optimizer, so
+        Lightning's built-in AGC path isn't wired — override here.
+
+        grad_clip_mode == "agc": scale-relative Adaptive Gradient Clipping (per output-unit,
+        relative to the unit's own weight norm) via agc_clip_grads_, replacing the global-norm
+        clip. Runs after backward / before optimizer.step (grads populated; bf16-mixed has no
+        GradScaler so grads are true-scale here). ndim<2 params are left to the default below.
+
+        grad_clip_mode == "norm" (default): the stock Lightning behaviour — honours
+        --gradient_clip_val (None/0 => no-op), so existing runs are byte-identical."""
+        if self.grad_clip_mode == "agc":
+            for group in optimizer.param_groups:
+                agc_clip_grads_(group["params"], self.agc_lambda)
+            return
+        super().configure_gradient_clipping(
+            optimizer, gradient_clip_val=gradient_clip_val,
+            gradient_clip_algorithm=gradient_clip_algorithm,
+        )
+
     def training_step(self, batch, batch_idx):
         reals, metadata = batch
 
@@ -369,7 +555,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             t = torch.where(torch.rand_like(t) < self.p_one_shot, torch.ones_like(t), t)
 
         # Calculate the noise schedule parameters for those timesteps
-        if self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
+        if self.diffusion_objective == "v":
+            alphas, sigmas = get_alphas_sigmas(t)     # was missing -> NameError on the 'v' default (upstream-gutted)
+        elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
             alphas, sigmas = 1-t, t
 
         # Combine the ground truth data and the noise
@@ -439,7 +627,37 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         if self.mask_padding_attention:
             extra_args["padding_mask"] = augmented_padding_mask
 
-        if self.inpainting_config is not None:
+        # ARC-Forcing: batches whose metadata carry a precomputed clamp mask +
+        # masked input (ArcRolloutDataset) ship their OWN inpaint conditioning —
+        # the model's drifted rollout context — routed through the same
+        # conditioning keys inference uses ('inpaint_mask'/'inpaint_masked_input'
+        # -> local_add_cond). Takes precedence over random_inpaint_mask.
+        batch_inpaint = all(
+            "inpaint_mask" in md and "inpaint_masked_input" in md for md in metadata
+        )
+        if batch_inpaint:
+            inpaint_mask = torch.stack(
+                [md["inpaint_mask"][0] for md in metadata], dim=0
+            ).to(self.device, dtype=diffusion_input.dtype)  # (B, 1, T)
+            inpaint_masked_input = torch.stack(
+                [md["inpaint_masked_input"][0] for md in metadata], dim=0
+            ).to(self.device, dtype=diffusion_input.dtype)  # (B, C, T)
+
+            # Keep the visible context in the same (scaled) latent space as diffusion_input
+            if (self.pre_encoded and self.diffusion.pretransform is not None
+                    and hasattr(self.diffusion.pretransform, "scale")
+                    and self.diffusion.pretransform.scale != 1.0):
+                inpaint_masked_input = inpaint_masked_input / self.diffusion.pretransform.scale
+
+            conditioning['inpaint_mask'] = [inpaint_mask]
+            conditioning['inpaint_masked_input'] = [inpaint_masked_input]
+
+            # Loss on the free (mask=0) region ONLY — the clamped frames are
+            # drifted rollout latents, not reconstruction targets, so no context
+            # loss either (drift-recovery objective; see guard below)
+            loss_mask = loss_mask & ~inpaint_mask.squeeze(1).to(torch.bool)
+
+        elif self.inpainting_config is not None:
 
             # Max mask size is the full sequence length
             max_mask_length = diffusion_input.shape[2]
@@ -523,14 +741,54 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         )
         mse_loss = loss
 
+        # x0-equivalent loss weighting (E1a, spec 2026-07-31-reality-structured-model-
+        # experiments.md): with a v-output head, an x0-space MSE is EXACTLY a sigma^2-
+        # weighted v-loss (x_hat = z_t - t*v_hat is linear in v_hat with factor -t).
+        # This tests JLT's (arXiv 2605.27102) loss-geometry claim with ZERO inference
+        # changes; the E1 pre-test measured the v-trained base recovering low-variance
+        # eigendirections 2-8x worse per unit signal. weight OFF (False) = byte-identical.
+        if self.x0_equiv_loss:
+            _s2 = (sigmas.squeeze(-1).squeeze(-1) ** 2)[:, None, None].to(loss.dtype)
+            # renormalize so the EXPECTED loss scale matches plain v-loss (E[t^2]=1/3
+            # under uniform t) — keeps lr/optimizer tuning comparable across arms
+            x0_loss, _sig, _pad = compute_masked_loss(
+                mse_loss_full * _s2 * 3.0, loss_mask, self.mask_padding_attention,
+                self.mask_loss_weight)
+            loss = x0_loss
+            log_dict["train/x0equiv_loss"] = x0_loss.detach()
+
+        # Subspace-weighted RF loss (see __init__): add (K-1)x the error energy inside
+        # the measured subspace, masked like the main loss and scaled per-element (/C)
+        # so K literally multiplies that subspace's share of the MSE.
+        if self.subspace_basis is not None:
+            err32 = (output - targets).float()                       # [B, C, T]
+            proj = torch.einsum("kc,bct->bkt", self.subspace_basis, err32)
+            sub_energy = proj.pow(2).sum(dim=1)                      # [B, T]
+            if self.subspace_tgate is not None:
+                from .tgate import interp_gate
+                _tg = interp_gate(t.detach().float().reshape(-1), self.subspace_tgate_t,
+                                  self.subspace_tgate_g).to(sub_energy.dtype)   # [B]
+                sub_energy = sub_energy * _tg[:, None]
+                log_dict["train/subspace_tgate"] = _tg.mean().detach()
+            if loss_mask is not None and self.mask_padding_attention:
+                _m = loss_mask.to(sub_energy.dtype)
+                sub_mean = (sub_energy * _m).sum() / (_m.sum().clamp_min(1.0) * output.shape[1])
+            else:
+                sub_mean = sub_energy.mean() / output.shape[1]
+            loss = loss + (self.subspace_loss_weight - 1.0) * sub_mean
+            log_dict["train/subspace_loss"] = sub_mean.detach()
+
         p.tick("masked_loss")
 
         # When attention masking is on, compute_masked_loss excludes everything outside
         # loss_mask (which now excludes inpaint context). Add context reconstruction loss
         # so the model learns to preserve context regions during inpainting.
         # (When mask_padding_attention=False, context is already included via mask_loss_weight.)
+        # Skipped for ARC batch-supplied masks: their clamped frames are drifted
+        # rollout latents, not ground truth to reconstruct.
         context_loss_mean = torch.tensor(0.0, device=loss.device)
         if (self.inpainting_config is not None
+                and not batch_inpaint
                 and self.mask_padding_attention
                 and self.mask_loss_weight > 0):
             # Context = inpaint_mask=1 (keep) AND padding_mask=1 (real audio, not padding)
@@ -545,6 +803,58 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         log_dict["train/mse_signal"] = signal_mean
         log_dict["train/mse_masked_loss"] = padding_mean
         log_dict["train/mse_context_loss"] = context_loss_mean.detach()
+
+        # Stereo-preservation auxiliary loss (OFF when weight==0 -> path unchanged).
+        # Reconstruct the clean latent z0_hat = noised - t*v_pred, decode BOTH it
+        # and the ground-truth latent (diffusion_input) to stereo audio through the
+        # frozen pretransform, and match predicted SIDE (L-R)/2 to target side.
+        # Gated to low noise (t < tmax, z0_hat meaningful) + a K-row sub-batch for VRAM.
+        if self.stereo_loss_weight > 0 and self.diffusion.pretransform is not None:
+            from .stereo_loss import rf_z0_hat, compute_stereo_loss
+            z0_hat = rf_z0_hat(noised_inputs, output.to(noised_inputs.dtype), t)
+            stereo_loss = compute_stereo_loss(
+                self.diffusion.pretransform, z0_hat, diffusion_input, t,
+                t_max=self.stereo_loss_tmax, subbatch=self.stereo_loss_subbatch,
+            )
+            loss = loss + self.stereo_loss_weight * stereo_loss
+            log_dict["train/stereo_loss"] = stereo_loss.detach()
+
+        # Output-std penalty (2026-08-10 full-FT regularization A/B, spec fullft-regularization-ab).
+        # Directly bound the measured latent-scale runaway: penalize the reconstructed clean
+        # latent z0_hat's per-channel std drifting off the real data's per-channel std.
+        # RF convention (this file, above): noised = z0*(1-t) + noise*t, v = noise - z0
+        #   => z0_hat = noised - t*v_pred   (exact when v_pred exact; biased at high t -> t-gate).
+        # std_c = per-channel std over (batch,time); penalty applied only where t < t_gate (z0_hat
+        # reliable at low noise). Grad flows through z0_hat -> output -> DiT; the real latents are
+        # detached. weight==0 (default) => NO-OP, loss byte-identical + zero overhead.
+        if self.output_std_penalty > 0:
+            tb = t.view(-1, *([1] * (noised_inputs.ndim - 1))).to(noised_inputs.dtype)
+            z0_hat = noised_inputs - tb * output.to(noised_inputs.dtype)   # (B, C, T)
+            gate = t < self.output_std_t_gate
+            if bool(gate.any()):
+                zc = z0_hat[gate].float()                       # (Bg, C, T)
+                zr = diffusion_input[gate].detach().float()     # (Bg, C, T)
+                std_hat = zc.std(dim=(0, 2))                    # (C,) per-channel std over batch+time
+                std_real = zr.std(dim=(0, 2))                   # (C,)
+                out_std_loss = (std_hat - std_real).pow(2).mean()
+                loss = loss + self.output_std_penalty * out_std_loss
+                log_dict["train/out_std_loss"] = out_std_loss.detach()
+                # Log both stds so the A/B reads the runaway from the CSV without a render.
+                log_dict["train/std_z0hat_mean"] = std_hat.detach().mean()
+                log_dict["train/std_z0real_mean"] = std_real.detach().mean()
+
+        # x0-reconstruction ADD-a-term (see __init__): reconstruct the clean latent
+        # z0_hat = noised - t*v_pred (rf_z0_hat, SAME as the output-std/stereo blocks)
+        # and add lambda_x0 * MSE(z0_hat, z0) toward the ground-truth clean latent.
+        # This is the ADD form (loss += term), NOT the x0_equiv REPLACE form. Grad
+        # flows through z0_hat -> output -> DiT; the real latents are detached.
+        # weight==0 (default) => NO-OP (guarded), loss byte-identical + zero overhead.
+        if self.x0_loss_weight > 0 and self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
+            from .stereo_loss import rf_z0_hat
+            z0_hat = rf_z0_hat(noised_inputs, output.to(noised_inputs.dtype), t)
+            x0_recon_loss = F.mse_loss(z0_hat, diffusion_input.detach().to(z0_hat.dtype))
+            loss = loss + self.x0_loss_weight * x0_recon_loss
+            log_dict["train/x0_recon_loss"] = x0_recon_loss.detach()
 
         log_dict["train/mse_loss"] = mse_loss.detach()
         log_dict["train/loss"] = loss.detach()
@@ -688,6 +998,12 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         }
         save_lora_safetensors(state_dict, self.lora_config, path)
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # EMA update AFTER the optimizer step (Lightning fires this post-step). No-op unless
+        # use_ema (full-finetune) built the shadow. Cheap: one lerp over the DiT params/step.
+        if self.diffusion_ema is not None:
+            self.diffusion_ema.update(self.diffusion.model)
+
     def on_save_checkpoint(self, checkpoint):
         if self.lora_config is not None:
             # Preserve the resume-relevant keys Lightning populated (optimizer
@@ -734,7 +1050,13 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
     # batch — so any checkpoint Lightning saves at the end of the val epoch
     # captures the averaged x without us having to munge the state_dict keys.
     def _fusion_opt(self):
-        from stable_audio_tools.training.fusion_opt import FusionOpt
+        # guarded: FusionOpt is only importable where the stable-audio-tools fork
+        # is present (not on LUMI containers); without it the optimizer cannot be
+        # a FusionOpt, so the isinstance sweep below is vacuously None
+        try:
+            from stable_audio_tools.training.fusion_opt import FusionOpt
+        except ModuleNotFoundError:
+            return None
         opts = self.optimizers()
         if opts is None:
             return None

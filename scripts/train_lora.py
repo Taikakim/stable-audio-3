@@ -590,6 +590,9 @@ def train(args):
         stereo_loss_subbatch=args.stereo_loss_subbatch,
         subspace_loss_basis=args.subspace_loss_basis,
         subspace_loss_weight=args.subspace_loss_weight,
+        subspace_loss_tgate=args.subspace_loss_tgate,
+        subspace_loss_tgate_mode=args.subspace_loss_tgate_mode,
+        subspace_loss_tgate_floor=args.subspace_loss_tgate_floor,
         x0_equiv_loss=args.x0_equiv_loss,
         x0_loss_weight=args.x0_loss_weight,
         # Full-FT regularization A/B (2026-08-10): AGC grad-clip mode + targeted output-std
@@ -1176,6 +1179,18 @@ def main():
     p.add_argument("--subspace_loss_weight", "--subspace-loss-weight", dest="subspace_loss_weight",
                    type=float, default=1.0,
                    help="K multiplier for the subspace error share; 1.0 = off (byte-identical path)")
+    p.add_argument("--subspace-loss-tgate", "--subspace_loss_tgate", dest="subspace_loss_tgate", default=None,
+                   help="R²(t)-derived noise-level gate for the subspace term: json from "
+                        "eval/melody_r2_vs_t.py ({t, r2_melody, r2_rest, deficit}); the chosen curve is "
+                        "floored, normalised to mean 1 over its grid, interpolated at each sample's t and "
+                        "multiplied into the subspace error energy. Needs --subspace-loss-basis and K != 1. "
+                        "Default None = flat gate (byte-identical).")
+    p.add_argument("--subspace-loss-tgate-mode", dest="subspace_loss_tgate_mode", default="r2",
+                   choices=("r2", "r2sq", "deficit"),
+                   help="r2: weight where melody is recoverable; r2sq: sharper; deficit: weight where melody "
+                        "is UNDER-recovered relative to the rest of the latent (the E1 pre-test quantity)")
+    p.add_argument("--subspace-loss-tgate-floor", dest="subspace_loss_tgate_floor", type=float, default=0.05,
+                   help="minimum raw gate before normalisation (never zero a noise level entirely)")
     p.add_argument("--x0_equiv_loss", "--x0-equiv-loss", dest="x0_equiv_loss",
                    action="store_true",
                    help="E1a (JLT arXiv 2605.27102 port): weight the RF loss by sigma^2*3 "
