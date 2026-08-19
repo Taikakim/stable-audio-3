@@ -514,6 +514,7 @@ def train(args):
                         "decay_min": args.fusion_decay_min,
                         "decay_start_frac": args.fusion_decay_start_frac,
                         "snr_mode": (args.fusion_snr if args.fusion_snr != "off" else "row"),
+                        "snr_source": args.fusion_snr_source,
                         "snr_beta": args.fusion_snr_beta,
                         "snr_floor": args.fusion_snr_floor,
                         "snr_power": args.fusion_snr_power,
@@ -1063,6 +1064,10 @@ def main():
                         "|EMA(U)|/RMS(U) — a data-driven brake that engages where the update stops "
                         "being repeatable (0.23 on iid noise, 1 on a consistent direction). 'row' = per "
                         "output neuron; 'elem' = per weight (Adam-like). Default off.")
+    p.add_argument("--fusion-snr-source", dest="fusion_snr_source", default="grad", choices=("grad", "update"),
+                   help="what the gate measures: the raw gradient's row SNR (default; the quantity that "
+                        "is actually ~1e-3 at bs1) or the post-momentum update's (inert — momentum makes "
+                        "it ~1 by construction; kept for the record)")
     p.add_argument("--fusion-snr-beta", dest="fusion_snr_beta", type=float, default=0.9)
     p.add_argument("--fusion-snr-floor", dest="fusion_snr_floor", type=float, default=0.0,
                    help="minimum gate (0 = may fully stop a noise-only row)")
