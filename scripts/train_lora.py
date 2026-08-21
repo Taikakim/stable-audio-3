@@ -254,6 +254,37 @@ def train(args):
         print(f"[glitch] {_recipe['name']}: {_gsum['params_touched']} params, "
               f"blocks {_gsum['blocks_touched'][:6]}..")
 
+    if args.init_state_ckpt:
+        # FULL-FT WARM-START (Kim direct 2026-08-21: "suomisoundi full ft over our best avp
+        # and old goa full ft"): load a finished full-FT's WEIGHTS as the starting point —
+        # fresh optimizer/schedule/epoch counters, unlike --resume_ckpt. EMA shadow preferred
+        # when present (it's what deploys); prefix logic is the render-proven one
+        # (render_matrix_cells 2026-07-21 coverage bug). Runs BEFORE adapter injection, so a
+        # DoRA-on-warm-start also works.
+        _ck = torch.load(args.init_state_ckpt, map_location="cpu", weights_only=False)
+        _sd_raw = _ck.get("state_dict", _ck)
+        _has_ema = any(k.startswith("diffusion_ema.ema_model.") for k in _sd_raw)
+        _prefixes = ("diffusion_ema.ema_model.",) if _has_ema else ("diffusion.model.", "model.")
+        _best = None
+        for _tgt in (model.model, model):
+            _want = set(dict(_tgt.named_parameters())) | set(dict(_tgt.named_buffers()))
+            for _pfx in _prefixes:
+                _sd = {(k[len(_pfx):] if k.startswith(_pfx) else k): v
+                       for k, v in _sd_raw.items()}
+                _n = sum(1 for k in _sd if k in _want)
+                if _best is None or _n > _best[0]:
+                    _best = (_n, _tgt, _sd, _want, _pfx)
+        _, _tgt, _sd, _want, _pfx = _best
+        _missing, _ = _tgt.load_state_dict(
+            {k: v.to(next(_tgt.parameters()).dtype) for k, v in _sd.items() if k in _want},
+            strict=False)
+        _cov = 1 - len(_missing) / max(1, len(list(_tgt.state_dict())))
+        assert _cov > 0.99, (f"--init_state_ckpt covers only {_cov:.1%} of the target "
+                             f"({len(_missing)} missing keys, prefix tried '{_pfx}')")
+        print(f"[init] full-FT warm-start from {args.init_state_ckpt} "
+              f"(prefix '{_pfx}', ema={_has_ema}, cov {_cov:.2%})")
+        del _ck, _sd_raw, _sd
+
     if args.full_finetune:
         # FULL fine-tune (no adapter). load_model() froze EVERYTHING
         # (requires_grad_(False)); here we unfreeze ONLY the DiT (model.model =
@@ -928,6 +959,10 @@ def main():
         description="Simple LoRA fine-tuning for Stable Audio 3"
     )
     p.add_argument("--model", choices=list(base_models), default="medium-base")
+    p.add_argument("--init_state_ckpt", "--init-state-ckpt", dest="init_state_ckpt", default=None,
+                   help="WARM-START: load this full-FT checkpoint's weights (EMA shadow preferred) "
+                        "into the model before training — fresh optimizer/schedule, unlike "
+                        "--resume_ckpt. For training a corpus full-FT on top of another full-FT.")
     p.add_argument(
         "--data_dir",
         default=None,
