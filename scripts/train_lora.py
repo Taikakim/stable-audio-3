@@ -291,6 +291,21 @@ def train(args):
         print(f"[full-finetune] DiT trainable params: {_dit:,} "
               f"(pretransform {_pt:,} frozen, conditioner {_cond:,} frozen)")
 
+    if args.mir_ctrl_pack:
+        # B7 (Kim 2026-08-21): MIR curves -> native modular local-cond inlet (zero-init
+        # projection, per-frame additive) + the adapter/full-FT the run already carries.
+        from mir_control import (MirCtrlConditioner, install_mir_control,
+                                 pack_channel_index)
+        _n_ch = len(pack_channel_index(args.mir_ctrl_pack))
+        _tfm = model.model.model.transformer
+        _ctrl_params = install_mir_control(model, _tfm, n_channels=_n_ch,
+                                           blocks=args.mir_ctrl_blocks)
+        model.conditioner.conditioners["mir_ctrl"] = MirCtrlConditioner(
+            n_channels=_n_ch, dropout_prob=args.mir_ctrl_dropout)
+        print(f"[mir_ctrl] pack={args.mir_ctrl_pack} ({_n_ch} ch) source={args.mir_ctrl_source} "
+              f"dropout={args.mir_ctrl_dropout} -> modular local-cond proj "
+              f"({sum(p.numel() for p in _ctrl_params):,} new trainable params)")
+
     sample_rate = model.sample_rate
     ds_ratio = model.pretransform.downsampling_ratio
 
@@ -367,6 +382,14 @@ def train(args):
             if sc:
                 print(f"[captions] source {i} ({os.path.basename(d)}): tiers "
                       f"t1/t2/t3 = {probs_list[i]}  sidecar={os.path.basename(sc)}")
+            if args.mir_ctrl_pack:
+                from mir_control import make_ctrl_metadata_wrapper
+                _stats = None
+                if args.mir_ctrl_source == "timeseries":
+                    _sp = os.path.join(d, "ctrl_stats.json")
+                    _stats = json.load(open(_sp)) if os.path.exists(_sp) else None
+                fn = make_ctrl_metadata_wrapper(fn, ctrl_source=args.mir_ctrl_source,
+                                                pack=args.mir_ctrl_pack, stats=_stats)
             configs.append(LatentDatasetConfig(id=f"train{i}", path=d, weight=weights[i],
                                                custom_metadata_fn=fn))
         dataset = PreEncodedDataset(
@@ -687,7 +710,68 @@ def train(args):
         demo_dl=demo_dl,
     )
 
+    class _MirCtrlAblationCB(pl.Callback):
+        """B7 in-training control-usage meter: on a FIXED batch (the demo batch) with
+        FIXED noise/t, measure RF loss under {true, shuffled, zero} mir_ctrl. Appends
+        control_ablation.jsonl via mir_control.ControlAblationCallback (unit-tested
+        core); rank 0 only. control_gain = loss(shuffled)-loss(true) > 0 <=> the model
+        exploits the time-ALIGNED control (the B7 kill-criterion input)."""
+
+        def __init__(self, save_dir, every, batch):
+            from mir_control import ControlAblationCallback
+            self.core = ControlAblationCallback(save_dir, every)
+            self.lat, self.meta = batch
+            self.every = every
+            self._last = -every  # measure once at step ~0 for the baseline
+            self._noise = None
+
+        def on_train_batch_end(self, trainer, module, *a, **kw):
+            step = trainer.global_step
+            if step - self._last < self.every or trainer.global_rank != 0:
+                return
+            self._last = step
+            import torch.nn.functional as F
+            dev = module.device
+            diff = module.diffusion
+            cond_mod = diff.conditioner.conditioners["mir_ctrl"]
+            was_training = cond_mod.training
+            cond_mod.eval()   # no control dropout inside the measurement
+            try:
+                with torch.no_grad():
+                    z0 = self.lat.to(dev, torch.float32)
+                    if z0.ndim == 4:
+                        z0 = z0.squeeze(1)
+                    if self._noise is None:
+                        g = torch.Generator(device="cpu").manual_seed(1234)
+                        self._noise = torch.randn(z0.shape, generator=g).to(dev)
+                        self._t = torch.linspace(0.2, 0.8, z0.shape[0]).to(dev)
+                    noise, t = self._noise, self._t
+                    noised = z0 * (1 - t)[:, None, None] + noise * t[:, None, None]
+                    target = noise - z0
+                    cond = diff.conditioner(self.meta, dev)
+                    true_ctrl = cond["mir_ctrl"][0]
+
+                    def loss_fn(ctrl):
+                        c = dict(cond)
+                        c["mir_ctrl"] = [ctrl, cond["mir_ctrl"][1]]
+                        v = diff(noised, t, cond=c, cfg_dropout_prob=0.0)
+                        return F.mse_loss(v.float(), target).item()
+
+                    rec = self.core.measure(loss_fn, true_ctrl)
+                    self.core.append_record(rec, step=step)
+                    print(f"[mir_ctrl:ablation] step {step} true {rec['loss_true']:.4f} "
+                          f"shuffled {rec['loss_shuffled']:.4f} zero {rec['loss_zero']:.4f} "
+                          f"gain {rec['loss_shuffled']-rec['loss_true']:+.4f}", flush=True)
+            except Exception as ex:   # never kill training over the meter
+                print(f"[mir_ctrl:ablation] SKIPPED at step {step}: {type(ex).__name__} {ex}",
+                      flush=True)
+            finally:
+                cond_mod.train(was_training)
+
     callbacks = [ckpt_callback, exc_callback]
+    if args.mir_ctrl_pack and args.save_dir:
+        callbacks.append(_MirCtrlAblationCB(args.save_dir, args.mir_ctrl_ablation_every,
+                                            demo_batch))
     if not args.no_demos:
         callbacks.append(demo_callback)
     if args.warm_start_ckpt:
@@ -782,6 +866,17 @@ def train(args):
                       "that arm fresh instead of resuming.")
     trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt)
 
+    if args.mir_ctrl_pack and args.save_dir and trainer.global_rank == 0:
+        # B7 self-reporting: the arm writes its own report (loss curve + control-ablation
+        # trajectory) so LUMI runs are judgeable after the allocation ends.
+        from mir_control import write_report
+        rp = write_report(args.save_dir, arm_meta={
+            "pack": args.mir_ctrl_pack, "source": args.mir_ctrl_source,
+            "dropout": args.mir_ctrl_dropout, "blocks": args.mir_ctrl_blocks,
+            "adapter": args.adapter_type,
+            "rank": args.rank, "name": args.name})
+        print(f"[mir_ctrl] report -> {rp}")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -828,6 +923,21 @@ def main():
         default=None,
         help="LoRA alpha scaling factor (default: same as rank)",
     )
+    p.add_argument("--mir_ctrl_pack", default=None,
+                   help="B7 MIR-timeseries conditioning: pack name (rhythm|dynamics|melody|"
+                        "stems|spectral|f0|structure|all). Installs a zero-init modular "
+                        "local-cond projection fed from per-crop control arrays; combine "
+                        "with a small adapter (e.g. dora-rows rank 32) or full-FT.")
+    p.add_argument("--mir_ctrl_source", default="ctrl", choices=("ctrl", "timeseries"),
+                   help="'ctrl' = prebuilt <stem>.ctrl.npy superset arrays (LUMI path, "
+                        "build_ctrl_packs.py); 'timeseries' = read .TIMESERIES.npz directly")
+    p.add_argument("--mir_ctrl_dropout", type=float, default=0.2,
+                   help="per-item control dropout prob (the control's CFG null)")
+    p.add_argument("--mir_ctrl_blocks", default="12-23",
+                   help="DiT blocks receiving the control projection ('lo-hi' or 'all'); "
+                        "default 12-23 = W's layer-map union (rhythm 12-19, acoustic 16-23)")
+    p.add_argument("--mir_ctrl_ablation_every", type=int, default=500,
+                   help="steps between control-ablation measurements (true/shuffled/zero)")
     p.add_argument(
         "--adapter_type",
         choices=[
