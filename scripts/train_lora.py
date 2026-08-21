@@ -465,7 +465,12 @@ def train(args):
         "adapter_type": args.adapter_type,
         "dropout": args.dropout,
         "include": args.include,
-        "exclude": args.exclude,
+        # B7 mir_ctrl: the control projections are their OWN trainable modules — the
+        # wrapper's add_lora must never DoRA-wrap them (a dora-rows wrap of a zero-init
+        # Linear freezes the zero base and row-scales zeros: the inlet stays dead
+        # forever; cost a morning of bit-zero ablation gains to find, 2026-08-21).
+        "exclude": ((list(args.exclude) if args.exclude else []) + ["modular_local_embeds"]
+                    if args.mir_ctrl_pack else args.exclude),
         "phm_n": args.phm_n,
     }
     # Decoupled weight decay: None => optimiser-appropriate default preserving prior
@@ -771,12 +776,21 @@ def train(args):
                           f"shuffled {rec['loss_shuffled']:.4f} zero {rec['loss_zero']:.4f} "
                           f"gain {rec['loss_shuffled']-rec['loss_true']:+.4f}", flush=True)
             except Exception as ex:   # never kill training over the meter
-                import traceback
                 print(f"[mir_ctrl:ablation] SKIPPED at step {step}: {type(ex).__name__} {ex}",
                       flush=True)
-                traceback.print_exc()
             finally:
                 cond_mod.train(was_training)
+
+    if args.mir_ctrl_pack:
+        # The wrapper's LoRA branch just ran self.diffusion.model.requires_grad_(False)
+        # (training/diffusion.py:251) which re-froze the control projections installed
+        # above; flip them back on so configure_optimizers picks them up.
+        _n_on = 0
+        for _n, _p in model.model.named_parameters():
+            if "modular_local_embeds" in _n:
+                _p.requires_grad_(True)
+                _n_on += 1
+        print(f"[mir_ctrl] re-enabled {_n_on} projection param tensors after wrapper freeze")
 
     callbacks = [ckpt_callback, exc_callback]
     if args.mir_ctrl_pack and args.save_dir:

@@ -427,6 +427,14 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 print(summarise_groups(opt_params))
         elif self.lora_config is not None:
             opt_params = [*get_lora_params(self.diffusion.model), *get_lora_params(self.diffusion.conditioner)]
+            # B7 mir_ctrl (2026-08-21): modular local-cond projections are trainable
+            # non-LoRA params installed post-load; get_lora_params cannot see them,
+            # and __init__'s LoRA freeze cleared their requires_grad (train_lora
+            # re-enables after wrapper construction). Without this append they are
+            # silently excluded and stay exactly zero-init — caught by the in-training
+            # control-ablation meter (gain pinned at 0.0000, proj weights bit-zero).
+            opt_params += [p for n, p in self.diffusion.model.named_parameters()
+                           if "modular_local_embeds" in n and p.requires_grad]
         elif opt_type == 'MuonAdamW':
             # Pass (name, param) tuples so MuonAdamW can match fused layer patterns
             opt_params = [(n, p) for n, p in self.diffusion.named_parameters() if p.requires_grad]
