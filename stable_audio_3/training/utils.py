@@ -86,6 +86,14 @@ def create_optimizer_from_config(optimizer_config, parameters):
     elif optimizer_type == "MuonAdamW":
         from stable_audio_tools.training.optims import MuonAdamW
         optimizer = MuonAdamW(parameters, **optimizer_config["config"])
+    elif optimizer_type == "AdamWSR":
+        # Stochastic-Rounding bf16 AdamW: bf16 master weights + bf16 Adam states,
+        # fp32 update math, param written back via stochastic rounding so sub-ULP
+        # updates accumulate instead of truncating. Desktop-GPU (16 GB) full-FT
+        # enabler; expects bf16 params (--precision bf16). NOT for LUMI (FusionOpt-SF
+        # keeps an fp32 master there). Self-contained, dep-free.
+        from .stochastic_rounding import AdamWSR
+        optimizer = AdamWSR(parameters, **optimizer_config["config"])
     elif optimizer_type == "FusionOpt":
         # Muon (NS5) + MONA + KL-Shampoo + ScheduleFree+ bifurcated optimiser.
         # Expects `parameters` to already be the spectral/scalar groups produced
@@ -110,6 +118,26 @@ def create_scheduler_from_config(scheduler_config, optimizer):
     """
     if scheduler_config["type"] == "InverseLR":
         scheduler_fn = InverseLR
+    elif scheduler_config["type"] == "WSD":
+        # Warmup-Stable-Decay (2026-08-21, Kim's 4-arm A/B): linear warmup to step w,
+        # flat at base lr until the knee, cosine to min_frac by total_steps. The first
+        # LR schedule AdamW train_lora has ever had (every prior run was constant-LR —
+        # the A2/A10 walk finding).
+        import math
+        from torch.optim.lr_scheduler import LambdaLR
+        c = scheduler_config["config"]
+        w, k, T = int(c["warmup_steps"]), int(c["knee_step"]), int(c["total_steps"])
+        mn = float(c.get("min_frac", 0.1))
+        def _wsd(step):
+            if w > 0 and step < w:
+                return (step + 1) / w
+            if step < k:
+                return 1.0
+            if step >= T:
+                return mn
+            prog = (step - k) / max(1, T - k)
+            return mn + (1.0 - mn) * 0.5 * (1.0 + math.cos(math.pi * prog))
+        return LambdaLR(optimizer, _wsd)
     else:
         scheduler_fn = getattr(torch.optim.lr_scheduler, scheduler_config["type"])
     scheduler = scheduler_fn(optimizer, **scheduler_config["config"])

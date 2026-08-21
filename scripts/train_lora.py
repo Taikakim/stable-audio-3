@@ -481,7 +481,11 @@ def train(args):
         args.warmup_steps, args.warmup_frac, len(dataset), args.batch_size,
         args.accumulate_grad_batches, args.epochs, args.steps)
     # total OPTIMIZER steps of this run (same units as warmup) — the horizon for --fusion-decay
-    _spe_total = len(dataset) // args.batch_size // max(1, args.accumulate_grad_batches)
+    # steps are OPTIMIZER steps as Lightning counts them: divide by DDP world size too
+    # (torchrun sets WORLD_SIZE; =1 for single-GPU). Without this, every schedule horizon
+    # (WSD knee/total, --fusion-decay) is world_size x too long under real DDP.
+    _world = int(os.environ.get("WORLD_SIZE", "1"))
+    _spe_total = len(dataset) // (args.batch_size * _world) // max(1, args.accumulate_grad_batches)
     _total_steps = _spe_total * args.epochs if args.epochs else args.steps
     if args.fusion_decay != "none":
         print(f"[fusion] decay: {args.fusion_decay} over {_total_steps} steps -> x{args.fusion_decay_min}"
@@ -585,6 +589,18 @@ def train(args):
                 }
             }
         }
+        if args.lr_schedule == "wsd":
+            _spe = _spe_total  # optimizer steps per epoch (computed above)
+            _knee_ep = args.lr_knee_epoch if args.lr_knee_epoch is not None else 0.25 * (args.epochs or 1)
+            optimizer_config["diffusion"]["scheduler"] = {
+                "type": "WSD",
+                "config": {"warmup_steps": _warmup_steps,
+                           "knee_step": int(_knee_ep * _spe),
+                           "total_steps": _total_steps,
+                           "min_frac": args.lr_min_frac},
+            }
+            print(f"[lr] WSD: warmup {_warmup_steps} steps -> flat -> knee ep{_knee_ep:g} "
+                  f"(step {int(_knee_ep*_spe)}) -> cosine to {args.lr_min_frac}x by step {_total_steps}")
 
     training_wrapper = DiffusionCondTrainingWrapper(
         model,
@@ -947,6 +963,14 @@ def main():
         default=None,
         help="LoRA alpha scaling factor (default: same as rank)",
     )
+    p.add_argument("--lr_schedule", default="none", choices=("none", "wsd"),
+                   help="AdamW LR schedule (2026-08-21): 'wsd' = linear warmup (--warmup_*), "
+                        "flat to --lr_knee_epoch, cosine to --lr_min_frac by end. 'none' = the "
+                        "historical constant LR. AdamW only; Fusion damps via --fusion-decay.")
+    p.add_argument("--lr_knee_epoch", type=float, default=None,
+                   help="epoch at which the WSD cosine decay starts (default: 25%% of --epochs)")
+    p.add_argument("--lr_min_frac", type=float, default=0.1,
+                   help="WSD final LR as a fraction of --lr")
     p.add_argument("--mir_ctrl_pack", default=None,
                    help="B7 MIR-timeseries conditioning: pack name (rhythm|dynamics|melody|"
                         "stems|spectral|f0|structure|all). Installs a zero-init modular "
