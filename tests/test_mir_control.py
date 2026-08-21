@@ -93,6 +93,7 @@ def test_pack_channel_index_covers_all_and_disjoint_core():
     assert len(seen) == len(set(seen)), "core packs must not overlap"
     for p in PACKS:
         assert len(pack_channel_index(p)) > 0
+    assert len(pack_channel_index("pianoroll")) == 128   # special pack: own 128-ch sidecar
 
 
 # ---------------------------------------------------------------- metadata wrapper

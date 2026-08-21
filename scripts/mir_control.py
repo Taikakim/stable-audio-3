@@ -78,6 +78,10 @@ PACKS = {
     "f0": ["f0_bass_ts", "f0_bass_voiced_ts", "f0_other_ts", "f0_other_voiced_ts"],
     "structure": ["relative_position_ts"],
     "all": list(CTRL_FIELDS),
+    # SPECIAL pack (2026-08-21, Kim's piano-roll lane): 128-ch MuScriptor note roll from the
+    # SIBLING dir <latent_dir>_proll/<stem>.ctrl.npy (build_pianoroll_ctrl.py) — full-file
+    # load, no channel indexing into the 36-ch superset.
+    "pianoroll": None,
 }
 
 
@@ -94,6 +98,8 @@ _OFFSETS = _field_channel_offsets()
 
 def pack_channel_index(pack: str):
     """Channel indices (into the superset ctrl array) for a named pack."""
+    if pack == "pianoroll":
+        return list(range(128))          # its own 128-ch sidecar, not the 36-ch superset
     idx = []
     for f in PACKS[pack]:
         lo, hi = _OFFSETS[f]
@@ -154,13 +160,14 @@ def make_ctrl_metadata_wrapper(base_fn, ctrl_source: str, pack: str, stats,
         stem = stem[: stem.rfind(".")]
         if ctrl_source == "ctrl":
             base = os.path.basename(stem) + ".ctrl.npy"
-            d = ctrl_dir or (os.path.dirname(stem).rstrip("/") + "_ctrl")
+            suffix = "_proll" if pack == "pianoroll" else "_ctrl"
+            d = ctrl_dir or (os.path.dirname(stem).rstrip("/") + suffix)
             full = np.load(os.path.join(d, base))
         else:
             full = build_ctrl_array(stem + ".TIMESERIES.npz", stats)
         s = int(info.get("latent_crop_start", 0))
         L = int(info.get("latent_crop_length", full.shape[1]))
-        out["mir_ctrl"] = full[idx][:, s:s + L]
+        out["mir_ctrl"] = (full[:, s:s + L] if pack == "pianoroll" else full[idx][:, s:s + L])
         return out
 
     return fn
