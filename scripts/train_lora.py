@@ -749,6 +749,14 @@ def train(args):
                     noised = z0 * (1 - t)[:, None, None] + noise * t[:, None, None]
                     target = noise - z0
                     cond = diff.conditioner(self.meta, dev)
+                    # native local_add inlet (inpaint_mask + masked_input) is t2a-zeros
+                    # by convention (CLAUDE.md: zeros, not None — projected with bias);
+                    # the training wrapper injects these in training_step, so the
+                    # measurement path must supply them itself.
+                    B, C, T = z0.shape
+                    for _id, _c in (("inpaint_mask", 1), ("inpaint_masked_input", C)):
+                        if _id in getattr(diff, "local_add_cond_ids", []) and _id not in cond:
+                            cond[_id] = [torch.zeros(B, _c, T, device=dev)]
                     true_ctrl = cond["mir_ctrl"][0]
 
                     def loss_fn(ctrl):
@@ -763,8 +771,10 @@ def train(args):
                           f"shuffled {rec['loss_shuffled']:.4f} zero {rec['loss_zero']:.4f} "
                           f"gain {rec['loss_shuffled']-rec['loss_true']:+.4f}", flush=True)
             except Exception as ex:   # never kill training over the meter
+                import traceback
                 print(f"[mir_ctrl:ablation] SKIPPED at step {step}: {type(ex).__name__} {ex}",
                       flush=True)
+                traceback.print_exc()
             finally:
                 cond_mod.train(was_training)
 
