@@ -33,26 +33,72 @@ def slerp(a: torch.Tensor, b: torch.Tensor, t):
     return (w_a * a32 + w_b * b32).to(a.dtype)
 
 
+def swap_join(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """SaFa latent-swap join over an aligned overlap: frame-interleave a and b.
+
+    Ref: "Latent Swap Joint Diffusion for 2D Long-Form Latent Generation"
+    (arXiv:2502.05130, SaFa), Self-Loop Latent Swap, Eq. 9-10 with swap interval
+    w=1: the overlap is merged with a BINARY operator — even time-frames verbatim
+    from `a`, odd time-frames verbatim from `b` — instead of an averaging/slerp
+    ramp. Every output frame is an exact copy of one input frame, so per-frame
+    variance (incl. the high-frequency latent components that interpolation
+    cancels) is fully preserved. Deterministic, seed-free.
+
+    HONEST SCOPE NOTE — join-level, NOT the paper's per-step joint diffusion.
+    SaFa applies the swap in the overlap of PARALLEL window trajectories at every
+    denoising step, so each window's later steps are conditioned on the exchanged
+    frames (step-wise differentiated trajectories keep the two sides mutually
+    consistent). Our LongFormRenderer generates windows SEQUENTIALLY through
+    ChunkGenerator.generate(), which runs the whole sample_diffusion loop as a
+    closed call — there is no per-step hook, so we can only exchange frames in
+    the fully-denoised latents post-hoc. What carries over: exchange-not-
+    interpolate ⇒ no amplitude/HF-variance shrinkage at the seam (the failure
+    mode of slerp joins). What is lost: the per-step mutual conditioning that
+    lets the model smooth the interleave itself; adjacent frames here come from
+    two independent trajectories, relying on the clamped shared prefix (Approach
+    A) for their similarity. a, b: (..., n) with equal shapes.
+    """
+    if a.shape != b.shape:
+        raise ValueError(f"swap_join: shape mismatch {tuple(a.shape)} vs {tuple(b.shape)}")
+    out = a.clone()
+    out[..., 1::2] = b[..., 1::2]
+    return out
+
+
 class CrossfadeStitcher:
-    def __init__(self, blend_frames: int = 3):
+    """Joins window latents at the seam. join_mode: 'slerp' (default, the original
+    ramped spherical crossfade) or 'swap' (SaFa w=1 frame-interleave — see
+    swap_join for mechanism + scope caveats)."""
+
+    JOIN_MODES = ("slerp", "swap")
+
+    def __init__(self, blend_frames: int = 3, join_mode: str = "slerp"):
         self.blend_frames = int(blend_frames)
+        if join_mode not in self.JOIN_MODES:
+            raise ValueError(f"join_mode must be one of {self.JOIN_MODES}, got {join_mode!r}")
+        self.join_mode = join_mode
 
     def _ramp(self, n, device, dtype):
         # ramp t over n frames, shape (1,1,n) for broadcast over (1,C,n)
         return torch.linspace(0.0, 1.0, n, device=device, dtype=dtype).view(1, 1, n)
 
+    def _join(self, a, b):
+        # a: outgoing side, b: incoming side; aligned (..., n) overlap slices
+        if self.join_mode == "swap":
+            return swap_join(a, b)
+        t = self._ramp(a.shape[-1], b.device, b.dtype)
+        return slerp(a, b, t)
+
     def continuation_join(self, current_tail, new_region):
         b = min(self.blend_frames, current_tail.shape[-1], new_region.shape[-1])
         if b == 0:
             return new_region
-        t = self._ramp(b, new_region.device, new_region.dtype)
-        head = slerp(current_tail[..., -b:], new_region[..., :b], t)
+        head = self._join(current_tail[..., -b:], new_region[..., :b])
         return torch.cat([head, new_region[..., b:]], dim=-1)
 
     def transition_join(self, out_tail, in_head, n):
         n = min(n, out_tail.shape[-1], in_head.shape[-1])
-        t = self._ramp(n, in_head.device, in_head.dtype)
-        return slerp(out_tail[..., -n:], in_head[..., :n], t)
+        return self._join(out_tail[..., -n:], in_head[..., :n])
 
 
 class PromptSchedule:
@@ -146,21 +192,28 @@ class LongFormRenderer:
     """
 
     def __init__(self, generator, channels, fps, window_frames, overlap_frames,
-                 blend_frames=3, stitcher=None, monitor=None):
+                 blend_frames=3, stitcher=None, monitor=None, join_mode="slerp"):
         self.gen = generator
         self.channels = channels
         self.fps = float(fps)
         self.window = int(window_frames)
         self.overlap = int(overlap_frames)
-        self.stitcher = stitcher or CrossfadeStitcher(blend_frames=blend_frames)
+        self.stitcher = stitcher or CrossfadeStitcher(blend_frames=blend_frames,
+                                                      join_mode=join_mode)
         self.monitor = monitor or DriftMonitor()
         self.drift_log: list[dict] = []
         if self.overlap >= self.window:
             raise ValueError("overlap_frames must be < window_frames")
 
-    def render_latents(self, schedule, total_frames, base_seed=0):
-        out = None
-        prev_tail = None
+    def render_latents(self, schedule, total_frames, base_seed=0, init_latents=None):
+        """init_latents: optional (1, C, T0) prefix to CONTINUE from — e.g. a prior
+        render's own saved z0 latent — instead of starting from nothing. Only the
+        last `overlap` frames condition the next window (InpaintContinuationGenerator's
+        prefix_frames), matching the same seam used between any two windows; the full
+        init_latents is kept in the returned tensor. total_frames is the FINAL total
+        (existing + new), not the amount to add."""
+        out = init_latents
+        prev_tail = None if init_latents is None else init_latents[..., -self.overlap:]
         k = 0
         while out is None or out.shape[-1] < total_frames:
             t_sec = (out.shape[-1] / self.fps) if out is not None else 0.0
