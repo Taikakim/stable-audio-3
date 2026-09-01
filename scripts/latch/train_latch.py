@@ -470,6 +470,14 @@ def train(args):
                 "grad_accum": args.grad_accum,
                 "effective_batch": args.batch_size * max(1, args.grad_accum),
                 "feature_name": args.feature,
+                # Provenance for the TARGET itself. Before 2026-08-24 only
+                # feature_name was saved, so a 12-d head could not be traced back
+                # to WHICH chroma readout it was trained against (Kim, 2026-08-24) --
+                # eval/head_meta.py reports readout_source="not-recorded" for those.
+                "target_source": args.target_source,
+                "chroma_dir": args.chroma_dir,
+                "chroma_key": args.chroma_key,
+                "db_path": args.db_path,
                 "noise_schedule": "rectified_flow",
                 "loss_type": loss_type,
                 "optimizer": args.optimizer,
