@@ -11,6 +11,11 @@ from stable_audio_3.inference.latch_targets import build_target as _build_latch_
 from stable_audio_3.models.latch import load_latch_from_checkpoint
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
 from stable_audio_3.model_configs import ae_models, all_models
+
+# Default generation window: 5292032 samples = 120.0 s @ 44.1 kHz (1292 latent frames).
+# Kept as the auto-mode STARTING size only — generate() grows the window to fit the
+# requested duration unless the caller passes an explicit sample_size cap.
+DEFAULT_SAMPLE_SIZE = 5292032
 from stable_audio_3.models.lora import (
     set_lora_strength as _set_lora_strength,
     load_and_apply_loras,
@@ -87,7 +92,7 @@ class StableAudioModel:
         steps: int = 8,
         cfg_scale: float = 1.0,
         batch_size: int = 1,
-        sample_size: int = 5292032,
+        sample_size: tp.Optional[int] = None,
         truncate_output_to_duration: bool = True,
         # Low-level path: pass pre-built conditioning dicts
         conditioning: tp.Optional[tp.List[dict]] = None,
@@ -129,7 +134,12 @@ class StableAudioModel:
             steps: The number of diffusion steps to use.
             cfg_scale: Classifier-free guidance scale
             batch_size: The batch size to use for generation.
-            sample_size: The length of the audio to generate, in samples.
+            sample_size: The generation window length in samples. None (default) = auto:
+                start from the 120 s default window and GROW it to fit the requested
+                duration (seconds_total + padding). Passing an explicit value restores the
+                old hard-cap behavior: the window never exceeds it and longer requests are
+                clamped with a warning. (The silent 120 s clamp cost two eval campaigns —
+                2026-07-15 POOL item, closed 2026-07-22.)
             truncate_output_to_duration: If True, truncate the output audio to the specified duration.
             conditioning: A dictionary of conditioning parameters to use for generation.
             conditioning_tensors: A dictionary of precomputed conditioning tensors to use for generation.
@@ -168,13 +178,18 @@ class StableAudioModel:
                 prompt, negative_prompt, duration, batch_size
             )
 
-        # Adapt sample size based on seconds_total in conditioning
-        audio_sample_size = sample_size
+        # Adapt sample size based on seconds_total in conditioning.
+        # sample_size=None -> auto window: default 120s, GROWN to fit the request;
+        # explicit sample_size -> hard cap (old behavior, clamp + warning).
+        explicit_cap = sample_size is not None
+        base_sample_size = sample_size if explicit_cap else DEFAULT_SAMPLE_SIZE
+        audio_sample_size = base_sample_size
         if conditioning is not None:
             audio_sample_size = self._adapt_sample_size(
                 conditioning,
-                sample_size,
+                base_sample_size,
                 duration_padding_sec,
+                allow_grow=not explicit_cap,
             )
 
         # Convert audio sample size to latent size
@@ -621,8 +636,14 @@ class StableAudioModel:
 
         return conditioning, negative_conditioning
 
-    def _adapt_sample_size(self, conditioning, sample_size, duration_padding_sec):
-        """Returns audio_sample_size adapted from conditioning, clamped to sample_size."""
+    def _adapt_sample_size(self, conditioning, sample_size, duration_padding_sec,
+                           allow_grow=False):
+        """Returns audio_sample_size adapted from conditioning.
+
+        allow_grow=False (explicit-cap mode): never exceeds sample_size; longer requests
+        are clamped with a warning. allow_grow=True (auto mode): the window GROWS past
+        sample_size to fit seconds_total + padding — the silent-120s-clamp fix
+        (2026-07-15 POOL item; the clamp cost the LUMI native-cells campaign 103 renders)."""
         max_seconds = 0.0
         for cond_dict in conditioning:
             if "seconds_total" in cond_dict:
@@ -652,6 +673,14 @@ class StableAudioModel:
 
         if target_audio_samples > sample_size:
             sr = self.model.sample_rate
+            if allow_grow:
+                print(
+                    f"[generate] window auto-grown to {target_audio_samples / sr:.2f}s "
+                    f"({target_audio_samples} samples) to fit seconds_total={max_seconds:.1f} "
+                    f"+ pad {duration_padding_sec:.1f} (default window is "
+                    f"{sample_size / sr:.2f}s; pass sample_size explicitly to cap)."
+                )
+                return target_audio_samples
             print(
                 f"Warning: requested duration {target_audio_samples / sr:.2f}s "
                 f"(seconds_total={max_seconds:.1f} + pad {duration_padding_sec:.1f}) exceeds the "
