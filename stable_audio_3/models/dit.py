@@ -1,5 +1,6 @@
 import typing as tp
 import math
+import os
 import torch
 
 from einops import rearrange
@@ -7,7 +8,16 @@ from torch import nn
 from torch.nn import functional as F
 
 from .blocks import FourierFeatures, ExpoFourierFeatures
-from .transformer import ContinuousTransformer        
+from .transformer import ContinuousTransformer
+
+# Gated re-enable of the T5Gemma text cross-attention padding mask.
+# Default OFF ("0") reproduces the shipped behaviour byte-for-byte (the mask is
+# nulled just after it is computed, so cross-attention attends over padded tokens).
+# Set SA3_ENABLE_CROSS_ATTN_MASK=1 to keep the mask and thread it into cross-attn as
+# an additive key mask on the SDPA backend (pair with SA3_DISABLE_FLASH_ATTN=1).
+_SA3_ENABLE_CROSS_ATTN_MASK = os.environ.get(
+    "SA3_ENABLE_CROSS_ATTN_MASK", ""
+).strip().lower() in ("1", "true", "yes", "on")
 from .lora import LoRAParametrization, set_lora_strength, has_lora, enable_lora, disable_lora, filter_lora_layers
 
 class DiffusionTransformer(nn.Module):
@@ -152,6 +162,7 @@ class DiffusionTransformer(nn.Module):
         return ((self._LOGSNR_MAX - logsnr) / self._LOGSNR_RANGE).to(t.dtype)
 
     def _call_transformer(self, x, *, prepend_inputs=None, cross_attn_cond=None,
+                         cross_attn_cond_mask=None,
                          mask=None, prepend_mask=None, return_info=False,
                          exit_layer_ix=None, local_add_cond=None,
                          modular_local_cond=None, padding_mask=None,
@@ -159,6 +170,7 @@ class DiffusionTransformer(nn.Module):
         """Helper method to call transformer and handle early exit logic."""
 
         output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond,
+                                    cross_attn_context_mask=cross_attn_cond_mask,
                                     return_info=return_info, exit_layer_ix=exit_layer_ix,
                                     local_add_cond=local_add_cond, modular_local_cond=modular_local_cond,
                                     padding_mask=padding_mask,
@@ -277,6 +289,7 @@ class DiffusionTransformer(nn.Module):
             x,
             prepend_inputs=prepend_inputs,
             cross_attn_cond=cross_attn_cond,
+            cross_attn_cond_mask=cross_attn_cond_mask,
             mask=mask,
             prepend_mask=prepend_mask,
             return_info=return_info,
@@ -411,7 +424,8 @@ class DiffusionTransformer(nn.Module):
         if cross_attn_cond_mask is not None:
             cross_attn_cond_mask = cross_attn_cond_mask.bool()
 
-            cross_attn_cond_mask = None # Temporarily disabling conditioning masks due to kernel issue for flash attention
+            if not _SA3_ENABLE_CROSS_ATTN_MASK:
+                cross_attn_cond_mask = None # Temporarily disabling conditioning masks due to kernel issue for flash attention
 
         if prepend_cond_mask is not None:
             prepend_cond_mask = prepend_cond_mask.bool()

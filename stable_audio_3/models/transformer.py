@@ -614,7 +614,7 @@ class Attention(nn.Module):
         return q, k
 
 
-    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None, padding_mask = None, varlen_metadata = None):
+    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None, padding_mask = None, varlen_metadata = None, context_mask = None):
 
         if self.num_heads != self.kv_heads:
              # Repeat interleave kv_heads to match q_heads for grouped query attention
@@ -623,6 +623,24 @@ class Attention(nn.Module):
 
         flash_attn_available = flash_attn_func is not None
         flash_attn_varlen_available = flash_attn_varlen_func is not None and index_first_axis is not None
+
+        # Gated cross-attention key-padding mask (SA3_ENABLE_CROSS_ATTN_MASK=1 in dit.py).
+        # context_mask is [B, M] bool (True = real key token, False = padded). It is only
+        # supported on the SDPA backend (the flash-attn kernel can't take this key mask —
+        # the original reason the mask was disabled). If we're on a flash path, route this
+        # single call through SDPA so the mask actually takes effect. Pair the flag with
+        # SA3_DISABLE_FLASH_ATTN=1 for a clean A/B where both arms already run on SDPA.
+        if context_mask is not None:
+            if flash_attn_available or varlen_metadata is not None:
+                if not getattr(Attention, "_cross_attn_mask_warned", False):
+                    logging.warning(
+                        "SA3 cross-attn context_mask is set but flash-attn is active; "
+                        "routing masked cross-attention through SDPA. Set "
+                        "SA3_DISABLE_FLASH_ATTN=1 for a consistent masked-vs-unmasked A/B."
+                    )
+                    Attention._cross_attn_mask_warned = True
+                flash_attn_available = False
+                varlen_metadata = None
 
         if causal and (flex_attention_block_mask is not None or flex_attention_score_mod is not None):
             flex_attention_block_mask = None
@@ -715,7 +733,33 @@ class Attention(nn.Module):
                     add_mask = _sliding_window_additive_mask(seq_q, seq_k, wl, wr, q.device, q.dtype)
                     out = F.scaled_dot_product_attention(q, k, v, attn_mask=add_mask, is_causal=False)
             else:
-                out = F.scaled_dot_product_attention(q, k, v, is_causal=causal if causal is not None else False)
+                # SA3_SDPA_CAST_BF16=1: run the attention kernel in bf16 even when the
+                # model is fp32 (mirrors the flash_attn path above, which always casts
+                # fp32 inputs down — line ~680). Needed on ROCm/aotriton where the fused
+                # SDPA backends reject fp32: the math fallback saves the full T×T
+                # softmax per layer for backward (≈2 GB/layer/sample at T=4096) and OOMs.
+                sdpa_dtype_in = q.dtype
+                if sdpa_dtype_in == torch.float32 and os.environ.get("SA3_SDPA_CAST_BF16") == "1":
+                    q, k, v = (t.to(torch.bfloat16) for t in (q, k, v))
+                # Additive key-padding mask for gated cross-attention. context_mask is
+                # [B, M] bool (True = real key token); build [B, 1, 1, M] with a large
+                # negative value at padded key columns so those keys get ~zero softmax
+                # weight. Uses finfo.min (not literal -inf) to avoid NaNs if a row were
+                # ever fully masked; effectively -inf for real keys present.
+                sdpa_attn_mask = None
+                sdpa_is_causal = causal if causal is not None else False
+                if context_mask is not None:
+                    neg = torch.finfo(q.dtype).min
+                    key_pad = (~context_mask.to(torch.bool))[:, None, None, :].to(q.device)
+                    sdpa_attn_mask = torch.zeros(
+                        context_mask.shape[0], 1, 1, context_mask.shape[1],
+                        device=q.device, dtype=q.dtype,
+                    ).masked_fill(key_pad, neg)
+                    # attn_mask and is_causal are mutually exclusive in SDPA; cross-attn
+                    # is non-causal so this is a no-op, but guard it defensively.
+                    sdpa_is_causal = False
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_attn_mask, is_causal=sdpa_is_causal)
+                out = out.to(sdpa_dtype_in)
         return out
 
 
@@ -732,6 +776,7 @@ class Attention(nn.Module):
         flash_attn_sliding_window = None,
         padding_mask = None,
         varlen_metadata = None,
+        context_mask = None,
     ):
         h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
 
@@ -809,11 +854,11 @@ class Attention(nn.Module):
         if self.differential:
             q, q_diff = q.unbind(dim = 1)
             k, k_diff = k.unbind(dim = 1)
-            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
-            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata, context_mask = context_mask)
+            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata, context_mask = context_mask)
             out = out - out_diff
         else:
-            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata, context_mask = context_mask)
         # merge heads
         out = rearrange(out, ' b h n d -> b n (h d)')
 
@@ -1030,6 +1075,7 @@ class TransformerBlock(nn.Module):
         cross_attention_flash_sliding_window = None,
         padding_mask = None,
         varlen_metadata = None,
+        cross_attn_context_mask = None,
     ):
         if rotary_pos_emb is None and self.add_rope:
             rotary_pos_emb = self.rope.forward_from_seq_len(x.shape[-2])
@@ -1049,9 +1095,9 @@ class TransformerBlock(nn.Module):
 
             if context is not None and self.cross_attend:
                 if cross_attn_rotary_pos_emb is not None:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, context_mask = cross_attn_context_mask))
                 else:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, context_mask = cross_attn_context_mask))
 
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
@@ -1072,9 +1118,9 @@ class TransformerBlock(nn.Module):
 
             if context is not None and self.cross_attend:
                 if cross_attn_rotary_pos_emb is not None:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = cross_attn_rotary_pos_emb, context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, context_mask = cross_attn_context_mask))
                 else:
-                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window))
+                    x = x + self.cross_attn_scale(self.cross_attn(self.cross_attend_norm(x), context = context, flex_attention_block_mask = cross_attention_block_mask, flex_attention_score_mod = cross_attention_score_mod, flash_attn_sliding_window = cross_attention_flash_sliding_window, context_mask = cross_attn_context_mask))
                     
             if self.conformer is not None:
                 x = x + self.conformer_scale(self.conformer(x))
@@ -1189,6 +1235,7 @@ class ContinuousTransformer(nn.Module):
         use_checkpointing = True,
         exit_layer_ix = None,
         padding_mask: Optional[torch.Tensor] = None,
+        cross_attn_context_mask: Optional[torch.Tensor] = None,
         **kwargs
     ):
         batch, seq, device = *x.shape[:2], x.device
@@ -1262,7 +1309,8 @@ class ContinuousTransformer(nn.Module):
                 "modular_local_cond": modular_local_cond,
                 "self_attention_flash_sliding_window": self.sliding_window,
                 "padding_mask": extended_padding_mask,
-                "varlen_metadata": varlen_metadata
+                "varlen_metadata": varlen_metadata,
+                "cross_attn_context_mask": cross_attn_context_mask,
             }
 
             if use_checkpointing:
