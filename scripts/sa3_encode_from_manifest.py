@@ -335,17 +335,27 @@ def main():
                      help="prompt = deterministic aavepyora/aavepyörä trigger word per parent "
                           "track (avp personal-style LoRA), instead of the §3.5 artist/title/bpm prompt")
     args = ap.parse_args()
-
-    if args.out.resolve() == Path("/home/kim/Projects/latents_sa3").resolve():
-        print("REFUSING: --out points at latents_sa3, the pristine Goa corpus. "
-              "Use a per-source sibling dir instead.", file=sys.stderr)
-        sys.exit(1)
+    is_pristine = args.out.resolve() == Path("/home/kim/Projects/latents_sa3").resolve()
 
     if args.companion_only:
         # CPU-only companion rebuild -- no model, no manifest. Returns before any GPU work.
+        # The pristine-corpus guard is about writing LATENTS. companion-only never writes a .npy;
+        # in --additive mode it only MERGES fields into the existing companion (legacy fields +
+        # latents both preserved, verified byte-identical), so it is safe on latents_sa3. A
+        # non-additive full companion rebuild on the pristine corpus is refused -- use --additive.
+        if is_pristine and not args.additive:
+            print("REFUSING: full companion rebuild on latents_sa3 (the pristine Goa corpus). "
+                  "Use --additive so existing companion fields are preserved (latent-safe).", file=sys.stderr)
+            sys.exit(1)
         wl = {f.strip() for f in args.fields.split(",") if f.strip()} if args.fields else None
         rebuild_companions(args.out, args.timeseries_root, fields=wl, additive=args.additive)
         return
+
+    # Full-encode path writes NEW latents -> the pristine-corpus guard applies here.
+    if is_pristine:
+        print("REFUSING: --out points at latents_sa3, the pristine Goa corpus. "
+              "Use a per-source sibling dir instead.", file=sys.stderr)
+        sys.exit(1)
 
     if args.manifest is None:
         print("REFUSING: --manifest is required (unless --companion-only).", file=sys.stderr)
