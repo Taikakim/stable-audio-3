@@ -392,6 +392,7 @@ def sample_diffusion(
     disable_tqdm: bool = False,
     decode: bool = True,
     chunked_decode: tp.Optional[bool] = None,
+    latents_sink: tp.Optional[list] = None,
     **sampler_kwargs
 ) -> torch.Tensor:
     """
@@ -425,6 +426,8 @@ def sample_diffusion(
         callback: Optional callback for progress reporting
         disable_tqdm: Whether to disable progress bar
         decode: Whether to decode latents using pretransform
+        latents_sink: optional list; the pre-decode latents are appended to it.
+            Does not change what is returned.
         **sampler_kwargs: Additional kwargs passed to sampler
 
     Returns:
@@ -512,6 +515,15 @@ def sample_diffusion(
 
     else:
         raise ValueError(f"Unknown diffusion_objective: {diffusion_objective}")
+
+    # Optional NON-INVASIVE latent capture (SAO, 2026-08-26). The caller gets exactly
+    # the audio it would have got; the sink additionally receives the z0 that produced
+    # it. Placed BEFORE the decode and before the padding mask so what lands in the
+    # sink is byte-for-byte what decode=False would have returned -- the alternative
+    # (call again with return_latents=True) would either double the compute or make
+    # the server reimplement this decode, which is how two paths silently diverge.
+    if latents_sink is not None:
+        latents_sink.append(sampled.detach())
 
     # Decode if requested
     if decode and pretransform is not None:

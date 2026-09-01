@@ -114,11 +114,17 @@ def sample_flow_euler_multi_latch_guided(
     b = x.shape[0]
 
     alpha = (1.0 - sigmas[:-1]).clamp(min=0.0)
-    sum_alphas = alpha.sum().clamp(min=1e-8)
 
     for g in guides:
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"] = int(num_steps * g["end_pct"])
+        # PER-GUIDE budget, normalised over THIS guide's own window (Kim 2026-08-27).
+        # Each guide spends all of rho/mu*weight inside its window instead of only the
+        # window's share of a whole-schedule budget -- see _st_weights for the numbers
+        # and the 10.8x legacy-gain caveat.
+        _m = torch.zeros_like(alpha)
+        _m[g["_start"]:g["_end"]] = 1.0
+        g["_scale"] = (alpha * _m) / (alpha * _m).sum().clamp(min=1e-8)
         g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
                                                 w_sec=g.get("w_sec"), fps=g.get("fps"))
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
@@ -135,11 +141,12 @@ def sample_flow_euler_multi_latch_guided(
         t_curr = sigmas[i]
         t_prev = sigmas[i + 1]
         t_b = t_curr * torch.ones(b, device=x.device, dtype=torch.float32)
-        s_t = float(alpha[i]) / float(sum_alphas)
-        rho_t = rho * s_t
-        mu_t = mu * s_t
-
         active = [g for g in guides if g["_start"] <= i < g["_end"]]
+        # the per-step scale now lives PER GUIDE (folded into the loss below), so the
+        # outer step is just rho/mu. grad is linear in the loss, so scaling each
+        # guide's term is identical to scaling its gradient.
+        rho_t = rho if active else 0.0
+        mu_t = mu if active else 0.0
 
         if callback is not None:
             # same contract as sample_discrete_euler's callback: live x, per-batch t.
@@ -154,7 +161,8 @@ def sample_flow_euler_multi_latch_guided(
             x = x.detach().requires_grad_(True)
             t_ten = torch.full((b,), float(t_curr), device=x.device)
             loss_var = sum(
-                g["weight"] * g["_criterion"](g["head"](x, t_ten), g["target"])
+                g["weight"] * float(g["_scale"][i])
+                * g["_criterion"](g["head"](x, t_ten), g["target"])
                 for g in active
             )
             grad_var = torch.autograd.grad(loss_var, x)[0]
@@ -179,7 +187,8 @@ def sample_flow_euler_multi_latch_guided(
                 if gamma > 0:
                     z_in = z0 + gamma * torch.randn_like(z0)
                 loss_mean = sum(
-                    g["weight"] * g["_criterion"](g["head"](z_in, t0), g["target"])
+                    g["weight"] * float(g["_scale"][i])
+                    * g["_criterion"](g["head"](z_in, t0), g["target"])
                     for g in active
                 )
                 grad_mean = torch.autograd.grad(loss_mean, z0)[0]
@@ -199,9 +208,31 @@ def sample_flow_euler_multi_latch_guided(
     return x
 
 
-def _st_weights(sigmas_1d):
-    """Per-step s_t = alpha / sum(alpha), alpha = 1 - t. sigmas_1d: (steps+1,)."""
+def _st_weights(sigmas_1d, active_mask=None):
+    """Per-step s_t = alpha / sum(alpha over the ACTIVE steps), alpha = 1 - t (the
+    RF signal coefficient). sigmas_1d: (steps+1,).
+
+    WINDOW NORMALISATION (Kim 2026-08-27). This used to divide by the sum over ALL
+    steps, which made rho/mu a budget spread over the whole schedule and then only
+    PARTLY spent when a guide was windowed. Because alpha is small at high noise,
+    the loss was brutal and invisible: measured on a real 24-step schedule, the
+    first 20% of steps carried 0.2% of the budget, the first 60% -- the GUI default
+    window -- carried 9.3%, and the last 20% carried ~62%. So a narrow early window
+    delivered almost nothing while looking like "guide for the first 60% of steps",
+    and the paper's own recommendation (Pons et al. 2603.04366: guide the first 20%)
+    was not even expressible here.
+
+    Normalising over the ACTIVE steps makes rho/mu mean the same thing regardless of
+    where the window sits: the guide spends its whole budget inside its own window,
+    shaped by alpha within it. Windows now change WHERE guidance acts, not HOW MUCH.
+
+    ⚠ This is a deliberate behaviour change: with the old default window (0.0-0.6) a
+    given gain now delivers ~10.8x the guidance it used to. Divide legacy gains by
+    ~10 to reproduce pre-2026-08-27 renders.
+    """
     alpha = (1.0 - sigmas_1d[:-1]).clamp(min=0.0)
+    if active_mask is not None:
+        alpha = alpha * active_mask.to(alpha.dtype)
     denom = alpha.sum().clamp(min=1e-8)
     return alpha / denom
 
@@ -239,8 +270,13 @@ def sample_flow_euler_latch_guided(
     target = target.to(x.device)
 
     sigmas_1d = sigmas[0] if per_element else sigmas
-    st = _st_weights(sigmas_1d).to(x.device)
     lo, hi = window
+    # Normalise the budget over the steps this window actually covers, so the gain
+    # means the same thing at any window. This sampler gates on a SIGMA interval
+    # (lo <= sigma <= hi) rather than step fractions, so build the mask that way.
+    _sig = sigmas_1d[:-1]
+    _mask = ((_sig >= lo) & (_sig <= hi)).to(_sig.dtype)
+    st = _st_weights(sigmas_1d, active_mask=_mask).to(x.device)
 
     # Pre-warm the adaln_zero time cache if applicable. Only meaningful in the
     # non-per_element path — per_element batches use varying t per item and
