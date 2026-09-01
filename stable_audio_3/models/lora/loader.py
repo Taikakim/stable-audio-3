@@ -78,14 +78,15 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
         alpha = config_dict.get("alpha", rank)
         include = config_dict.get("include", None)
         exclude = config_dict.get("exclude", None)
+        phm_n = config_dict.get("phm_n", 4)
         is_xs = adapter_type.endswith("-xs")
 
         lora_config = {
             torch.nn.Linear: {
-                "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=i),
+                "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=i, phm_n=phm_n),
             },
             torch.nn.Conv1d: {
-                "weight": partial(LoRAParametrization.from_conv1d, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=i),
+                "weight": partial(LoRAParametrization.from_conv1d, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=i, phm_n=phm_n),
             },
         }
         if is_cond:

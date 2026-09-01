@@ -77,7 +77,8 @@ def name_is_lora(name):
     return (
         len(name.split(".")) >= 4
         and (name.split(".")[-4]) == "parametrizations"
-        and name.split(".")[-1] in ["lora_A", "lora_B", "M_xs", "magnitude", "magnitude_r", "magnitude_c"]
+        and name.split(".")[-1] in ["lora_A", "lora_B", "M_xs", "magnitude", "magnitude_r", "magnitude_c",
+                                    "phm_A", "phm_B_left", "phm_B_right"]
     )
 
 
@@ -141,6 +142,8 @@ def infer_global_rank(lora_sd: dict) -> int:
             candidates.append(v.shape[1])
         elif k.endswith(".M_xs"):
             candidates.append(v.shape[0])
+        elif k.endswith(".phm_B_left"):
+            candidates.append(v.shape[-1])  # (n, fan_out/n, k) — k is the rank-flag budget knob
     if not candidates:
         raise ValueError("No LoRA/LoRA-XS tensors found to infer rank")
     r = candidates[0]
@@ -305,6 +308,8 @@ def _get_adapter_param_names(lora_layer):
         return ["M_xs", "magnitude"]
     elif lora_layer.adapter_type == "bora-xs":
         return ["M_xs", "magnitude_r", "magnitude_c"]
+    elif lora_layer.adapter_type in ("phm", "phm2"):
+        return ["phm_A", "phm_B_left", "phm_B_right"]
     return []
 
 

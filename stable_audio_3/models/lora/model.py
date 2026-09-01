@@ -16,6 +16,13 @@ from torch import nn
 from ...verbose import vprint
 
 
+class AdapterShapeError(ValueError):
+    """Raised when a module's weight shape is incompatible with the requested
+    adapter type (e.g. PHM with fan_in/fan_out not divisible by n). Callers
+    (apply_lora / add_lora) catch this and SKIP the module with a warning."""
+    pass
+
+
 def _canonicalize_svd_signs(U, Vh):
     """Enforce deterministic sign convention: largest-magnitude element of each U column is positive."""
     max_abs_idx = U.abs().argmax(dim=0)
@@ -26,7 +33,7 @@ def _canonicalize_svd_signs(U, Vh):
 
 class LoRAParametrization(nn.Module):
     def __init__(self, fan_in, fan_out, fan_in_fan_out=False, rank=4, lora_dropout_p=0.0, lora_alpha=1,
-                adapter_type="lora", W0=None, lora_index=0, svd_bases=None
+                adapter_type="lora", W0=None, lora_index=0, svd_bases=None, phm_n=4
                 ):
         super().__init__()
         dtype = torch.get_default_dtype()
@@ -178,6 +185,53 @@ class LoRAParametrization(nn.Module):
             self.forward_fn = self.bora_xs_forward
             self._adapter_forward_fn = self.forward_fn
 
+        elif self.adapter_type in ("phm", "phm2"):
+            # PHM (parameterized hypercomplex multiplication, Compacter-style with a
+            # LEARNED algebra — spec E2, 2026-07-31-reality-structured-model-experiments):
+            #   delta_W = sum_{i=1..n} A_i kron B_i
+            # A_i (n x n) are the LEARNED multiplication-table ("algebra") tensors —
+            # init = scaled random normal std 0.02, deliberately NOT a known algebra:
+            # whether they drift toward Clifford/quaternion structure constants during
+            # training IS the experiment's measurement. Saved per checkpoint as .phm_A.
+            # B_i ((fan_out/n) x (fan_in/n)) are low-rank factorized Compacter/LPHM-style
+            # as B_left_i @ B_right_i so the config's rank flag sizes the param budget:
+            #
+            #   Param-parity formula vs LoRA at the same rank flag r:
+            #     LoRA params/module: r * (fan_in + fan_out)
+            #     PHM  params/module: n^3                       [algebra: n tensors n x n]
+            #                       + n*((fan_out/n)*k + k*(fan_in/n))
+            #                       = n^3 + k * (fan_out + fan_in)   with k = r
+            #     => ratio = 1 + n^3 / (r * (fan_in + fan_out))
+            #        (n=4, r=128, 1536x1536: 1 + 64/393216 ~ 1.0002 — well within 20%;
+            #         k is capped at min(fan_out/n, fan_in/n) for small modules, which
+            #         only ever LOWERS the PHM count.)
+            #
+            # No-op start: mirrors the zoo's lora_B-side zero-init convention — the
+            # output-side factor (phm_B_left) is zero, the input-side factor
+            # (phm_B_right) gets the lora_A-style kaiming init => delta == 0 at init.
+            n = 2 if self.adapter_type == "phm2" else int(phm_n)
+            if fan_in % n != 0 or fan_out % n != 0:
+                raise AdapterShapeError(
+                    f"PHM n={n} incompatible with weight shape (fan_out={fan_out}, fan_in={fan_in}): "
+                    f"both dims must be divisible by n"
+                )
+            self.phm_n = n
+            self.phm_fan_in_fan_out = fan_in_fan_out
+            p_dim, q_dim = fan_out // n, fan_in // n
+            k = min(rank, p_dim, q_dim)
+            if k < rank:
+                vprint(f"PHM: rank flag {rank} capped to k={k} for shape ({fan_out},{fan_in}), n={n}")
+            self.phm_rank = k
+            # LEARNED algebra: stacked (n, n, n) so offline analysis extracts every
+            # module's A tensors from any checkpoint with a '.phm_A' key filter.
+            self.phm_A = nn.Parameter(torch.randn(n, n, n, dtype=dtype, device=device) * 0.02)
+            self.phm_B_left = nn.Parameter(torch.zeros(n, p_dim, k, dtype=dtype, device=device))
+            self.phm_B_right = nn.Parameter(torch.zeros(n, k, q_dim, dtype=dtype, device=device))
+            for i in range(n):
+                nn.init.kaiming_uniform_(self.phm_B_right[i], a=math.sqrt(5))
+            self.forward_fn = self.phm_forward
+            self._adapter_forward_fn = self.forward_fn
+
 
     def lora_forward(self, W):
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A)))).view(W.shape)
@@ -238,6 +292,18 @@ class LoRAParametrization(nn.Module):
         intermediate = self.magnitude_r.unsqueeze(1) * V_r
         H_c = intermediate / (intermediate.norm(dim=0, keepdim=True) + 1e-12)
         return (H_c * self.magnitude_c.unsqueeze(0)).view(orig_shape).to(W.dtype)
+
+    def phm_forward(self, W):
+        # B_i = B_left_i @ B_right_i  (Compacter/LPHM low-rank factorization)
+        B = torch.bmm(self.phm_B_left, self.phm_B_right)          # (n, p, q)
+        # sum_i A_i kron B_i: kron(A,B)[a*p+c, b*q+d] = A[a,b]*B[c,d]
+        delta = torch.einsum("iab,icd->acbd", self.phm_A, B)      # (n, p, n, q)
+        delta = delta.reshape(self.phm_A.shape[1] * B.shape[1], self.phm_A.shape[2] * B.shape[2])
+        if self.phm_fan_in_fan_out:
+            delta = delta.T                                        # embeddings store (fan_in, fan_out)
+        delta = self.dropout_fn(delta)
+        delta = self.scaling * self.lora_strength * delta
+        return (W + delta.reshape(W.shape).to(W.dtype))
 
     def forward(self, X):
         return self.forward_fn(X)
@@ -354,7 +420,12 @@ def apply_lora(layer, register=True, merge=False, lora_config=default_lora_confi
         matched_type = _match_layer_type(layer, lora_config)
         if matched_type is not None:
             for attr_name, parametrization in lora_config[matched_type].items():
-                parametrize.register_parametrization(layer, attr_name, parametrization(layer), unsafe=True)
+                try:
+                    param = parametrization(layer)
+                except AdapterShapeError as e:
+                    print(f"Skipping adapter on {layer.__class__.__name__}{tuple(getattr(layer, attr_name).shape)}: {e}")
+                    continue
+                parametrize.register_parametrization(layer, attr_name, param, unsafe=True)
     else:  # this will remove all parametrizations, use with caution
         if hasattr(layer, "parametrizations"):
             # list(...) -- remove_parametrizations deletes from layer.parametrizations,
@@ -399,7 +470,11 @@ def add_lora(model, lora_config=default_lora_config, include=None, exclude=None,
                 if svd_bases is not None:
                     bases_key = f"{name}.{attr_name}"
                     layer_bases = svd_bases.get(bases_key)
-                param = parametrization_fn(module, svd_bases=layer_bases)
+                try:
+                    param = parametrization_fn(module, svd_bases=layer_bases)
+                except AdapterShapeError as e:
+                    print(f"Skipping adapter on {name}.{attr_name}: {e}")
+                    continue
                 parametrize.register_parametrization(module, attr_name, param, unsafe=True)
                 if hasattr(param, 'U'):  # -XS layer that needs SVD bases
                     if layer_bases is not None:
