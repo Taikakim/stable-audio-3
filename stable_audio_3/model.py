@@ -109,6 +109,7 @@ class StableAudioModel:
         latch_configs: tp.Optional[tp.List[dict]] = None,
         latch_hparams: tp.Optional[dict] = None,
         return_latents: bool = False,
+        latents_sink: tp.Optional[list] = None,
         chunked_decode: tp.Optional[bool] = None,
         **sampler_kwargs,
     ) -> torch.Tensor:
@@ -148,6 +149,11 @@ class StableAudioModel:
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
             return_latents: Whether to return the latents used for generation instead of the decoded audio.
+            latents_sink: optional list; the latents are APPENDED to it while the
+                normal audio is still returned. Use this rather than a second
+                return_latents=True call -- that would double the compute, and
+                re-decoding outside generate() means reimplementing two different
+                decode paths (latch-guided vs sample_diffusion) that then drift.
             chunked_decode: Whether to decode latents in overlapping chunks to reduce peak VRAM. True forces
                 chunked decoding on, False forces it off, None (default) uses the value set in the model config.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
@@ -310,10 +316,25 @@ class StableAudioModel:
 
         model_dtype = next(self.model.model.parameters()).dtype
         noise = noise.type(model_dtype)
-        conditioning_inputs = {
-            k: v.type(model_dtype) if v is not None else v
-            for k, v in conditioning_inputs.items()
-        }
+        # A modular local cond ("mir_ctrl", the pianoroll/note-roll inlet) arrives
+        # here as a DICT {cond_id: tensor}, not a tensor -- diffusion.py builds it
+        # that way and passes it through as one conditioning input. The old blind
+        # `v.type(...)` therefore raised
+        #   AttributeError: 'dict' object has no attribute 'type'
+        # and generate() could never carry a modular local cond at all, which is
+        # why the note-roll control had no inference path (SAO gap 3, C 2026-08-26).
+        # Tensors and None behave exactly as before; only the dict case is new.
+        def _cast(v):
+            if v is None or isinstance(v, (str, int, float, bool)):
+                return v
+            if isinstance(v, dict):
+                return {k2: (v2.type(model_dtype) if torch.is_tensor(v2) else v2)
+                        for k2, v2 in v.items()}
+            if torch.is_tensor(v):
+                return v.type(model_dtype)
+            return v
+
+        conditioning_inputs = {k: _cast(v) for k, v in conditioning_inputs.items()}
 
         cond_inputs = {**conditioning_inputs, **negative_conditioning_tensors}
 
@@ -342,6 +363,7 @@ class StableAudioModel:
                 if dist_shift is not None
                 else self.model.sampling_dist_shift,
                 return_latents=return_latents,
+                latents_sink=latents_sink,
                 callback=sampler_kwargs.pop("callback", None),
             )
         else:
@@ -369,6 +391,7 @@ class StableAudioModel:
                 init_noise_level=init_noise_level,
                 decode=not return_latents,
                 chunked_decode=chunked_decode,
+                latents_sink=latents_sink,
                 **sampler_kwargs,
             )
 
@@ -414,6 +437,7 @@ class StableAudioModel:
         latent_sample_size,
         dist_shift,
         return_latents,
+        latents_sink=None,
         callback=None,
     ):
         """Run flow-matching Euler sampling with one or more LatCH guides.
@@ -557,6 +581,9 @@ class StableAudioModel:
                 callback=callback, **hp, **cond_inputs,
             )
 
+            # Non-invasive capture: same audio out, z0 also handed to the caller.
+            if latents_sink is not None:
+                latents_sink.append(latents.detach())
             if return_latents:
                 return latents.detach()
             decode_dtype = next(self.model.pretransform.parameters()).dtype
