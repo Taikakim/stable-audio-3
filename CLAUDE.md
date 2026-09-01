@@ -33,6 +33,73 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Package manager**: uv (required for dependency management)
 - **Hardware**: CPU (Small models), CUDA (Medium models), Apple Silicon (via CoreML)
 
+## ⚠️ Fork ↔ upstream: Stability shipped SA3 with features GUTTED (2026-08-03)
+
+This is a thin fork. **Authoritative upstream = the `upstream` remote → `https://github.com/Stability-AI/stable-audio-3.git`**
+(added 2026-08-03; `git fetch upstream` for fresh Stability commits). `origin`/`fork` are Kim's *mirror*
+(`Taikakim/stable-audio-3`). As of 2026-08-03 our working branch is **127 commits behind `upstream/main`**
+(their recent work is mostly TensorRT/NVIDIA quant tiers — scan before pulling). The gutted features below are
+**still present in current `upstream/main`** (e.g. `rescale_cfg: bool = False` at diffusion.py:230), so they're
+upstream-vestigial, not our regressions, and reportable against their live tree.
+Audit OUR changes with `git diff origin/main...HEAD` (vs the mirror point we forked from: 114 commits, mostly
+*new* files; real source deletions ~90 lines of refactor-*replacements*; the "−2250" is 96% regenerated `uv.lock`).
+
+But the bigger gotcha is **upstream itself ships features half-wired** — hooks/flags present, the
+actual build/wiring stripped, so they silently no-op:
+- **EMA was gutted**: `DiffusionCondTrainingWrapper` had `use_ema=True`, `self.diffusion_ema = None`,
+  and defensive `diffusion_ema.ema_model if not None` reads — but the `EMA(...)` build + `ema_pytorch`
+  dep were **absent from the entire repo history** (pickaxe-confirmed: never ours to strip). So every
+  run silently had no EMA (and `train_lora` also hardcoded `use_ema=False`). **FIXED 2026-08-03**:
+  added a self-contained `SimpleEMA` (no dep) + build + `on_train_batch_end` update + `train_lora`
+  `--use-ema/--ema-beta/--ema-warmup-steps` flags — **full-finetune only** (LoRA force-disables EMA).
+  The full-FT ckpt now carries BOTH online (`diffusion.model.*`) and EMA (`diffusion_ema.ema_model.*`)
+  weights → **render/audition must load the EMA set** (TODO in the render path).
+- **`generate()` no longer clamps output**: upstream did `result.to(float32).clamp(-1, 1)`; we kept only
+  `.to(float32)` (model.py ~L395). Intentional — the clamp moved to peak-normalize-at-save
+  (`sa3_control.audio_io.save_audio()`, better: preserves transients). **Any path doing raw
+  `torchaudio.save()` on `generate()`'s output will clip** — always go through the save helper.
+
+**Two more confirmed by the 2026-08-03 package-wide sweep (24 gutted features found; these two matter):**
+- **`rescale_cfg` is a silent no-op — and `generate()` passes it `True`.** The boolean is threaded through
+  `sample_diffusion` (documented) and set `True` by `model.py:381` (generate) + `:568` (LatCH), but
+  `DiTWrapper.forward` (diffusion.py:230) forwards only `scale_phi`, dropping `rescale_cfg`; the rescale
+  math (dit.py:616) fires ONLY on `scale_phi != 0`. So **`model.generate()` / all batch eval renderers ran
+  PLAIN CFG, not rescaled** — the whole eval corpus is plain-CFG. Rescaled CFG DOES work via `scale_phi`
+  (the Gradio "cfg_rescale" slider → diffusion_cond.py:271). Upstream-vestigial (since initial commit).
+  **Decision pending:** wire `rescale_cfg=True → scale_phi≈0.7` (changes output vs corpus) or drop it and
+  pass `scale_phi` directly. Reportable to Stability.
+- **`"v"` diffusion objective (the factory DEFAULT) used to crash training — FIXED.** `training_step` had no
+  `"v"` schedule branch (used `alphas` unconditionally → NameError) and `validation_step` called
+  `get_alphas_sigmas`, which was defined/imported NOWHERE (upstream-gutted). **Resolved**: `get_alphas_sigmas`
+  is now defined locally (`training/diffusion.py:40`) and both `training_step`/`validation_step` branch on
+  `diffusion_objective == "v"` correctly. No live run hits this path (all real ckpts are `rectified_flow`),
+  but #65/#66 (v-pred + ZTSNR HF recovery) can now build on it without re-deriving the fix. Still worth a
+  report to Stability since their upstream never got the fix, but it is no longer blocking on our side.
+
+**Semantic-gutting sweep (2026-08-03, wired-but-INERT values) found 2 that matter:**
+- **`cross_attn_cond_mask` is unconditionally NULLED (dit.py:414)** — `cross_attn_cond_mask = None` right after
+  it's computed, comment "Temporarily disabling conditioning masks due to kernel issue for flash attention."
+  So text (T5Gemma) cross-attention attends over PADDED tokens on every gen; all our auditions/evals ran unmasked.
+  **RESOLVED 2026-08-04 — do NOT re-enable, it is intentional + redundant.** We built a gated re-enable
+  (`SA3_ENABLE_CROSS_ATTN_MASK=1`, off by default) + A/B'd it (`eval/cross_attn_mask_ab.py`): the masked arm
+  **DISINTEGRATES to spectral artifacts** — masking the padding rebalances the softmax and over-amplifies the
+  real-token conditioning ~N× (the DiT was trained WITHOUT the mask, so it's OOD). **Zach @ Stability confirmed:**
+  "we don't really use the cross-attention mask — turned it off when I switched to flash attention (didn't support
+  masking), never turned it back on. The learned padding token for T5Gemma is kind of doing a similar thing." So
+  the learned pad token IS the built-in soft-mask; explicit masking is OOD + redundant. The gated flag stays as a
+  documented OFF toggle; do not enable it at inference OR bake it into training. (Negative-result autopsy logged.)
+- **`use_effective_length_for_schedule` reads True but is INERT** — shipped `LogSNRShift` has `rate=0`, which
+  zero-multiplies the only seq_len term → noise schedule is byte-identical for every length. Length-adaptive
+  scheduling LOOKS on, does nothing. **Null-result trap for #50/#54 long-context work** — want it real? need
+  `rate>0` / distinct-min/max Flux shift, not just the flag. (Minor also-rans: negative-GLOBAL cond dead
+  end-to-end [near-zero effect, negative cross-attn works]; self-attn `mask` param vestigial [padding_mask is live].)
+
+**Lesson: before relying on any SA3 `use_*`/`enable_*` flag or config key, confirm it's actually
+WIRED *and* that its value actually reaches the math (rescale_cfg & cross_attn_cond_mask both passed the
+"declared" test but were inert).** Two sweeps done 2026-08-03 (structural + semantic; 24+9 findings, tiered
+in the workflow outputs). NOT yet swept: sampler solver internals, pretransform/VAE chain, LatCH/sa3_control,
+training-side loss/schedule configs — a third pass would close those.
+
 ## Common Commands
 
 ### Setup & Installation
