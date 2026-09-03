@@ -566,7 +566,10 @@ def train(args):
                                         else ["mona", "ns5", "normuon", "sf"])
                                        + (["shampoo"] if args.fusion_shampoo else [])
                                        + (["cautious"] if args.cautious else [])
-                                       + (["snr"] if args.fusion_snr != "off" else [])),
+                                       + (["snr"] if args.fusion_snr != "off" else [])
+                                       + (["autoscale"] if args.fusion_autoscale else [])),
+                        "autoscale_slice_p": args.fusion_autoscale_slice_p,
+                        "autoscale_growth_rate": args.fusion_autoscale_growth_rate,
                         "hyperball": args.hyperball,
                         "hot_dtype": "bf16",
                         "warmup_steps": _warmup_steps,
@@ -600,6 +603,22 @@ def train(args):
                                      **({"force_scalar": _force_scalar} if _force_scalar else {}),
                                      **({"spectral_wd": args.weight_decay}
                                         if args.weight_decay is not None else {})},
+                }
+            }
+        }
+    elif args.optimizer == "lion":
+        # LionSR: bf16 master + single bf16 momentum buffer + stochastic-rounded
+        # writeback (see lion_optimizer.py). Always SR -- there is no plain-Lion
+        # fallback here, so --stochastic-rounding is a no-op for this optimizer.
+        optimizer_config = {
+            "diffusion": {
+                "optimizer": {
+                    "type": "LionSR",
+                    "config": {
+                        "lr": args.lr,
+                        "weight_decay": _wd,
+                        "betas": [0.9, 0.99],
+                    },
                 }
             }
         }
@@ -1096,13 +1115,18 @@ def main():
                         "steps × ~4 s ≈ 10 min). Use for short tuning runs.")
     p.add_argument(
         "--optimizer",
-        choices=["adamw", "fusion"],
+        choices=["adamw", "fusion", "lion"],
         default="adamw",
         help="Optimizer for the trainable LoRA params. 'adamw' (default) = "
              "AdamW(lr, wd=0.01, betas=[0.9,0.95]). 'fusion' = FusionOpt with "
              "ALL components on (Muon NS5 + SF-NorMuon + Schedule-Free + MONA + "
              "KL-Shampoo, hot_dtype=bf16); routes the LoRA params into "
-             "spectral/scalar groups automatically.",
+             "spectral/scalar groups automatically. 'lion' = LionSR: bf16 master + "
+             "bf16 single momentum buffer (half AdamWSR's state, since Lion tracks "
+             "only one moment vs Adam's two) with stochastic-rounded writeback -- "
+             "always SR regardless of --stochastic-rounding (there is no non-SR "
+             "variant). Wants a smaller --lr and larger --weight_decay than AdamW "
+             "(paper: ~3-10x in each direction).",
     )
     p.add_argument(
         "--stochastic-rounding", "--stochastic_rounding",
@@ -1255,6 +1279,33 @@ def main():
                    help="final LR multiplier of the decay (0 = to zero, 0.1 = to 10%%)")
     p.add_argument("--fusion-decay-start-frac", dest="fusion_decay_start_frac", type=float, default=0.8,
                    help="wsd: fraction of the run kept flat before the linear tail")
+    p.add_argument(
+        "--fusion-autoscale", action="store_true",
+        help="FusionOpt only: enable the D-Adaptation (Prodigy-style) global step-size "
+             "multiplier folded into gamma_t alongside the Polyak ratio (Kim 2026-09-01, "
+             "'snatch a principle from Prodigy for Fusion' — see fusion_opt.py's "
+             "_update_autoscale). Starts at 1.0 (no-op) and only grows, driven by how "
+             "much gradient correlates with displacement-from-init. Unlike real "
+             "prodigyopt.Prodigy (which clones the full init weights + a full accumulator "
+             "per param, ~2x AdamW's state), this keeps only every --fusion-autoscale-slice-p "
+             "-th coordinate, so the memory/compute overhead is small. Off by default; "
+             "expect a rough early-training patch while d ramps up (known Prodigy behavior) "
+             "-- pair with --gradient_clip_val and/or --warmup_steps.",
+    )
+    p.add_argument(
+        "--fusion-autoscale-slice-p", dest="fusion_autoscale_slice_p", type=int, default=16,
+        help="FusionOpt autoscale: keep every Nth coordinate of the per-param init-clone + "
+             "accumulator (memory/compute is O(numel/N)). Default 16; Prodigy's own docs "
+             "call ~11 reasonable. No effect unless --fusion-autoscale.",
+    )
+    p.add_argument(
+        "--fusion-autoscale-growth-rate", dest="fusion_autoscale_growth_rate", type=float,
+        default=float("inf"),
+        help="FusionOpt autoscale: cap on how fast d can grow per step (multiplicative). "
+             "Default inf (unrestricted, matches Prodigy's default). A value like 1.02 "
+             "gives a warmup-like damping effect on the ramp-up. No effect unless "
+             "--fusion-autoscale.",
+    )
     p.add_argument("--fusion-snr", dest="fusion_snr", default="off", choices=("off", "row", "elem"),
                    help="FusionOpt SNR gate: scale each row's (or element's) finalized spectral update by "
                         "|EMA(U)|/RMS(U) — a data-driven brake that engages where the update stops "

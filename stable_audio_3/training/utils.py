@@ -80,6 +80,12 @@ def create_optimizer_from_config(optimizer_config, parameters):
     elif optimizer_type == "CLion":
         from stable_audio_tools.training.optims import CLion
         optimizer = CLion(parameters, **optimizer_config["config"])
+    elif optimizer_type == "LionSR":
+        # Lion with bf16 master + bf16 single momentum buffer, fp32 update math,
+        # stochastic-rounded writeback (same rationale as AdamWSR, half its state
+        # size since Lion only tracks one moment). Self-contained, dep-free.
+        from .lion_optimizer import LionSR
+        optimizer = LionSR(parameters, **optimizer_config["config"])
     elif optimizer_type == "AdamW8bit":
         from bitsandbytes.optim import AdamW8bit
         optimizer = AdamW8bit(parameters, **optimizer_config["config"])
