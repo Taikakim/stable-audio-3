@@ -562,8 +562,9 @@ def train(args):
                         # HYPERBALL is its own norm-constrained iterate → incompatible with
                         # Schedule-Free ('sf'); when --hyperball is set we DROP 'sf' (=>
                         # ['mona','ns5','normuon']) and pass hyperball=True. Off => unchanged.
-                        "components": ((["mona", "ns5", "normuon"] if args.hyperball
-                                        else ["mona", "ns5", "normuon", "sf"])
+                        "components": ((args.fusion_components.split(",") if args.fusion_components
+                                        else (["mona", "ns5", "normuon"] if args.hyperball
+                                              else ["mona", "ns5", "normuon", "sf"]))
                                        + (["shampoo"] if args.fusion_shampoo else [])
                                        + (["cautious"] if args.cautious else [])
                                        + (["snr"] if args.fusion_snr != "off" else [])
@@ -602,7 +603,24 @@ def train(args):
                                      "split_adaln": args.fusion_split_adaln,
                                      **({"force_scalar": _force_scalar} if _force_scalar else {}),
                                      **({"spectral_wd": args.weight_decay}
-                                        if args.weight_decay is not None else {})},
+                                        if args.weight_decay is not None else {}),
+                                     # DECOUPLED PER-GROUP LR (C, 2026-09-04, Kim's ask after
+                                     # Zach/Stability: "I run Muon at 1e-3 for pretraining...
+                                     # around 10x what I would use for AdamW. I keep the AdamW
+                                     # parameters at normal AdamW LR"). Until now ONE lr drove
+                                     # BOTH groups -- the builder has always accepted
+                                     # spectral_lr/scalar_lr and NOTHING ever passed them. That
+                                     # coupling means the spectral (Muon/NS5) rate cannot be
+                                     # raised without dragging norms/biases up with it, which
+                                     # is a candidate explanation for why our empirical optimum
+                                     # (5e-6) sits ~200x below Zach's rule of thumb: we may have
+                                     # been tuning around the coupling rather than finding
+                                     # Fusion's operating point. Omit both => byte-identical to
+                                     # every run before this.
+                                     **({"spectral_lr": args.spectral_lr}
+                                        if args.spectral_lr is not None else {}),
+                                     **({"scalar_lr": args.scalar_lr}
+                                        if args.scalar_lr is not None else {})},
                 }
             }
         }
@@ -1196,6 +1214,17 @@ def main():
              "forces them SCALAR. Merged with (does not override) any --force-scalar "
              "patterns. Off by default. No effect for adamw.",
     )
+    # Decoupled Muon/AdamW learning rates (Zach/Stability rule of thumb: Muon ~10x the AdamW
+    # rate, with the AdamW-handled params LEFT at the normal AdamW rate). The builder has
+    # always supported these; nothing passed them until 2026-09-04, so every Fusion run to
+    # date used ONE lr for both groups. Omit both to reproduce that exactly.
+    p.add_argument("--spectral-lr", "--spectral_lr", dest="spectral_lr", type=float, default=None,
+                   help="LR for the SPECTRAL (Muon/NS5) group -- the 2D matrices. Default: --lr.")
+    p.add_argument("--scalar-lr", "--scalar_lr", dest="scalar_lr", type=float, default=None,
+                   help="LR for the SCALAR (ScheduleFree-AdamW) group -- norms/biases/1D. "
+                        "Default: --lr. Keep this at your normal AdamW rate when raising "
+                        "--spectral-lr, per Zach's rule of thumb.")
+
     p.add_argument(
         "--layer-update-weights", default=None, metavar="PATH[#CURVE]",
         help="FusionOpt only: per-DiT-layer update-weight schedule. PATH to a JSON "
@@ -1240,6 +1269,15 @@ def main():
                    help="add cautious masking (C-Muon) to FusionOpt: zero update coords that "
                         "fight the gradient, rescale survivors. Otherwise identical to --optimizer "
                         "fusion. No effect for adamw.")
+    p.add_argument("--fusion-components", dest="fusion_components", default=None,
+                   help="Comma-separated component set, REPLACING the default (mona,ns5,normuon,sf; "
+                        "mona,ns5,normuon under --hyperball). For fitting a FULL-FINETUNE on one 16 GB "
+                        "card: the per-param state cost is m (always) + A + g_prev (mona) + z + x (sf, "
+                        "fp32 clones). ns5 allocates NOTHING -- it is a transform on the momentum and is "
+                        "the actual Muon step, so it is the wrong thing to drop. MONA is the expensive "
+                        "one: two full-size buffers. 'ns5,normuon' keeps the Muon geometry at one buffer. "
+                        "Measured 2026-09-04: 1.5B-trainable full-FT OOMs on 16 GB with the default set "
+                        "AND with --hyperball (14.87 GiB, short by 144 MiB).")
     p.add_argument("--fusion-shampoo", "--fusion_shampoo", dest="fusion_shampoo",
                    action="store_true",
                    help="add the KL-Shampoo two-sided preconditioner to FusionOpt's components "
