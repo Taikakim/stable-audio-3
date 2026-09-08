@@ -224,6 +224,22 @@ Models are defined in `stable_audio_3/model_configs.py`:
 
 **Base models** (`-base` suffix) are un-fine-tuned checkpoints used for LoRA training.
 
+**⚠ The post-trained `medium` runs at 8 STEPS and cfg 1 — `medium-base` does not** (Kim direct
+2026-09-08). Stability post-trained/distilled `medium` to that operating point; `medium-base` wants
+~24 steps and cfg 7. Getting it wrong is silent, not an error:
+- a **ptm** arm rendered at 24 steps / cfg 7 is off-config (cfg>1 reportedly "cooks" PT output);
+- a **base / full-FT** arm rendered at 8 steps / cfg 1 is under-sampled, and the grainy percussion
+  and bass it produces — like sample-rate reduction or quantisation — reads as a fault of the
+  checkpoint when it is really the step count.
+
+They also differ in sampler: `medium` is `diffusion_objective: rf_denoiser` (**ping-pong**),
+`medium-base` is `rectified_flow` (**euler**). A soup/blend loads medium-base's config whatever
+its alpha, so blends always sample as rectified_flow — **compare only within a sampler.**
+
+⇒ When judging or A/B-ing clips, run each checkpoint AT ITS OWN native config. Two clips whose
+filenames differ in `__st<N>` are not automatically an unfair comparison; a clip rendered off its
+model's native config is.
+
 ### Package Structure
 
 ```
