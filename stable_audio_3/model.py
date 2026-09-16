@@ -6,7 +6,11 @@ from torch.nn.functional import interpolate
 
 from stable_audio_3.inference.audio_utils import prepare_audio, numpy_audio_to_tensor
 from stable_audio_3.inference.sampling import sample_diffusion, build_schedule
-from stable_audio_3.inference.latch_guided import sample_flow_euler_multi_latch_guided
+from stable_audio_3.inference.latch_guided import (
+    resolve_guided_sampler,
+    sample_flow_euler_multi_latch_guided,
+    sample_flow_pingpong_multi_latch_guided,
+)
 from stable_audio_3.inference.latch_targets import build_target as _build_latch_target
 from stable_audio_3.models.latch import load_latch_from_checkpoint
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
@@ -380,6 +384,9 @@ class StableAudioModel:
                 return_latents=return_latents,
                 latents_sink=latents_sink,
                 callback=sampler_kwargs.pop("callback", None),
+                # generate()-level sampler_type reaches the guided path too, so a
+                # caller does not need a second dialect to say the same thing.
+                sampler_type=sampler_type,
             )
         else:
             result = sample_diffusion(
@@ -454,6 +461,7 @@ class StableAudioModel:
         return_latents,
         latents_sink=None,
         callback=None,
+        sampler_type=None,
     ):
         """Run flow-matching Euler sampling with one or more LatCH guides.
 
@@ -587,7 +595,20 @@ class StableAudioModel:
                 "log_norms": bool(latch_hparams.get("log_norms", False)),
             }
 
-            latents = sample_flow_euler_multi_latch_guided(
+            # SAMPLER CHOICE MUST FOLLOW THE MODEL'S OBJECTIVE (W, 2026-09-16).
+            # sampling.py:445 picks pingpong for rf_denoiser (the post-trained
+            # "medium") and euler otherwise. This path used to hardcode euler, so
+            # asking for ANY guidance silently swapped the post-trained model's
+            # native sampler for a mismatched one -- 8 Euler steps on a model
+            # distilled for 8-step pingpong -- before a head was ever consulted.
+            # Keep this condition identical to sampling.py's; two places deciding
+            # the same thing by different rules is how that bug arose.
+            _sampler = resolve_guided_sampler(
+                self.model.diffusion_objective, latch_hparams, sampler_type)
+            _guided_sampler = (sample_flow_pingpong_multi_latch_guided
+                               if _sampler == "pingpong"
+                               else sample_flow_euler_multi_latch_guided)
+            latents = _guided_sampler(
                 self.model.model, noise, sigmas, guides,
                 cfg_scale=cfg_scale, batch_cfg=True, rescale_cfg=True, apg_scale=apg_scale,
                 # lands in **model_kwargs -> DiT forward, gated at dit.py

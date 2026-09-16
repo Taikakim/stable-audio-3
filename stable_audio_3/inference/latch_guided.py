@@ -208,6 +208,166 @@ def sample_flow_euler_multi_latch_guided(
     return x
 
 
+def resolve_guided_sampler(objective, latch_hparams=None, sampler_type=None):
+    """Which guided sampler to use for a model objective. ONE definition, two callers.
+
+    The rule must match ``sampling.py``'s unguided choice
+    (``pingpong`` iff ``rf_denoiser``), because a guided render that silently picks a
+    different sampler than the unguided one is not comparable to its own baseline --
+    which is exactly the bug this function exists to prevent recurring.
+
+    Precedence:
+      1. ``latch_hparams["sampler_type"]`` -- most specific; lets one checkpoint be
+         A/B'd across both samplers with a single seed, so sampler and model family
+         are not confounded.
+      2. ``sampler_type`` -- the generate()-level argument, so callers need only one
+         dialect for the guided and unguided paths.
+      3. native, derived from ``objective``.
+
+    Raises on anything outside {euler, pingpong}: ``rk4``/``dpmpp`` are real
+    ``sample_diffusion`` samplers with no guided implementation, and were previously
+    accepted and silently downgraded to euler.
+    """
+    native = "pingpong" if objective == "rf_denoiser" else "euler"
+    override = (latch_hparams or {}).get("sampler_type")
+    name = str(override or sampler_type or native).lower()
+    if name not in ("euler", "pingpong"):
+        raise ValueError(
+            f"guided sampling supports 'euler' or 'pingpong', got {name!r} "
+            f"(model objective {objective!r} -> native {native!r})")
+    return name
+
+
+@torch.enable_grad()
+def sample_flow_pingpong_multi_latch_guided(
+    model, x, sigmas, guides, *,
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4,
+    log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
+):
+    """Ping-pong sampler with multiple LatCH guides — the rf_denoiser twin of
+    ``sample_flow_euler_multi_latch_guided``.
+
+    WHY THIS EXISTS (W, 2026-09-16). ``sampling.py`` picks the sampler from the
+    model's objective: ``pingpong`` for ``rf_denoiser`` (the post-trained "medium"
+    checkpoint), ``euler`` otherwise. But ``model.py`` routed ANY non-empty
+    ``latch_configs`` into the Euler guided sampler, and no guided ping-pong sampler
+    existed. So merely ASKING for guidance silently converted an 8-step ping-pong
+    render into an 8-step Euler render — badly under-resolved for a model distilled
+    to ping-pong, and it happened before any head was consulted. That is the most
+    likely cause of the "every guided render is over-damped vs baseline, and
+    identical to every other guided render" result recorded in WORKLOG 2026-09-16.
+
+    NOT A NEW METHOD — the guidance math is byte-for-byte the Euler sibling's. Only
+    the state update differs, and only in the last line of the loop:
+
+        euler    : x <- z0 + t_next * v          (reuses the model's implied noise)
+        pingpong : x <- (1-t_next) * z0 + t_next * randn_like(x)   (FRESH noise)
+
+    Both are the same ``z_t = (1-t)·z0 + t·noise`` form — ping-pong redraws the noise
+    each step, which is what the few-step distillation was trained against. Guidance
+    therefore attaches at the identical two seams:
+      1. variance guidance on x at t_curr, before the model forward;
+      2. mean guidance on the clean estimate z0 at t=0, before the re-noise.
+    Because ping-pong re-noises FROM the clean estimate, seam 2 is the load-bearing
+    one here: whatever mean guidance writes into z0 is what the next step builds on.
+
+    Args mirror the Euler sibling exactly; see its docstring for the ``guides`` dict
+    contract. ``rho``/``mu`` are the global variance/mean strengths and are spent
+    inside each guide's own step window (``_st_weights`` window normalisation).
+    """
+    model_dtype = x.dtype
+    x = x.detach().float()
+    sigmas = sigmas.to(device=x.device, dtype=torch.float32)
+    num_steps = sigmas.shape[-1] - 1
+    b = x.shape[0]
+
+    # Per-element schedules (B, steps+1) are a sample_diffusion feature; the guided
+    # path builds one global schedule. Fail loudly rather than broadcasting wrongly.
+    if sigmas.dim() != 1:
+        raise ValueError(
+            f"guided ping-pong expects a global 1-D schedule, got shape {tuple(sigmas.shape)}")
+
+    alpha = (1.0 - sigmas[:-1]).clamp(min=0.0)
+
+    for g in guides:
+        g["_start"] = int(num_steps * g["start_pct"])
+        g["_end"] = int(num_steps * g["end_pct"])
+        _m = torch.zeros_like(alpha)
+        _m[g["_start"]:g["_end"]] = 1.0
+        g["_scale"] = (alpha * _m) / (alpha * _m).sum().clamp(min=1e-8)
+        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
+                                                w_sec=g.get("w_sec"), fps=g.get("fps"))
+        g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
+
+    _t_values = sigmas[:-1].tolist() + [0.0]
+    for g in guides:
+        _ensure_time_cache(g["head"], _t_values, x.device)
+
+    log_rows = [] if log_norms else None
+
+    for i in tqdm(range(num_steps), disable=disable_tqdm):
+        t_curr = sigmas[i]
+        t_next = sigmas[i + 1]
+        t_b = t_curr * torch.ones(b, device=x.device, dtype=torch.float32)
+        active = [g for g in guides if g["_start"] <= i < g["_end"]]
+        rho_t = rho if active else 0.0
+        mu_t = mu if active else 0.0
+
+        if callback is not None:
+            callback({'x': x, 't': t_b, 'sigma': t_b, 'i': i, 'denoised': None})
+
+        # --- seam 1: variance guidance on x at the true t_curr ------------------
+        if active and rho_t > 0:
+            x = x.detach().requires_grad_(True)
+            t_ten = torch.full((b,), float(t_curr), device=x.device)
+            loss_var = sum(
+                g["weight"] * float(g["_scale"][i])
+                * g["_criterion"](g["head"](x, t_ten), g["target"])
+                for g in active
+            )
+            grad_var = torch.autograd.grad(loss_var, x)[0]
+            if log_rows is not None:
+                log_rows.append({
+                    "i": i, "sigma": float(t_curr),
+                    "gv_norm": grad_var.detach().norm().item(),
+                    "x_norm": x.detach().norm().item(), "rho_t": rho_t,
+                })
+            x = (x - rho_t * grad_var).detach()
+
+        with torch.no_grad():
+            v = model(x.to(model_dtype), t_b.to(model_dtype), **model_kwargs).float()
+        z0 = x - t_curr * v
+
+        # --- seam 2: mean guidance on the clean estimate (head queried at t=0) --
+        # Ping-pong re-noises FROM z0, so this is what the next step inherits.
+        if active and mu_t > 0:
+            t0 = torch.zeros(b, device=x.device)
+            for _ in range(n_iter):
+                z0 = z0.detach().requires_grad_(True)
+                z_in = z0
+                if gamma > 0:
+                    z_in = z0 + gamma * torch.randn_like(z0)
+                loss_mean = sum(
+                    g["weight"] * float(g["_scale"][i])
+                    * g["_criterion"](g["head"](z_in, t0), g["target"])
+                    for g in active
+                )
+                grad_mean = torch.autograd.grad(loss_mean, z0)[0]
+                z0 = (z0 - mu_t * grad_mean).detach()
+
+        # --- the ONE line that differs from Euler: renoise with FRESH noise -----
+        x = ((1.0 - t_next) * z0 + t_next * torch.randn_like(z0)).detach()
+
+    x = x.to(model_dtype)
+
+    if log_rows:
+        print("\n[LatCH/pingpong] per-step grad norms:")
+        for r in log_rows:
+            print(f"  i={r['i']:>3} sigma={r['sigma']:.4f} "
+                  f"||grad_var||={r['gv_norm']:.4e} ||x||={r['x_norm']:.4e} rho_t={r['rho_t']:.4e}")
+    return x
+
+
 def _st_weights(sigmas_1d, active_mask=None):
     """Per-step s_t = alpha / sum(alpha over the ACTIVE steps), alpha = 1 - t (the
     RF signal coefficient). sigmas_1d: (steps+1,).
