@@ -97,8 +97,31 @@ def audit_args(args) -> list[str]:
 class MechanismAuditCallback(pl.Callback):
     """Track whether each mechanism's multiplier ever leaves its identity value."""
 
-    def __init__(self, report_every: int = 500):
+    @staticmethod
+    def _requested(args) -> dict:
+        """Which mechanisms the user actually asked for.
+
+        A mechanism that was never requested is OFF, not INERT. Reporting it as INERT is
+        crying wolf, and a checker that cries wolf is one people learn to skim past.
+        """
+        if args is None:
+            return {}
+        g = lambda n, d=None: getattr(args, n, d)
+        vadd = g("var_dampening") is not None
+        return {
+            "comp/ev_d": bool(g("modular_ev", False)),
+            "comp/snr_gate": bool(g("modular_snr_gate", False)),
+            "comp/var_damp_kappa": bool(vadd and g("var_damp_opt", False)),
+            "comp/radial_brake_scale": float(g("modular_radial_brake", 1.0) or 1.0) < 1.0,
+            "comp/sf_ck": bool(g("modular_schedule_free", False)),
+            "comp/normuon_gain": bool(g("modular_normuon", True)),
+            "_vadd_tier1": bool(vadd and (g("var_barrier_weight", 0.0) or 0.0) > 0),
+        }
+
+    def __init__(self, report_every: int = 500, args=None):
         self.report_every = report_every
+        self.args = args
+        self.requested = self._requested(args)
         # key -> [ever_moved, max_abs_deviation, n_samples]
         self.seen: dict[str, list] = {}
         self.barrier_nonzero = False
@@ -134,6 +157,31 @@ class MechanismAuditCallback(pl.Callback):
                 and self.max_latent_std > self.barrier_thresh):
             self.barrier_nonzero = True
 
+    def on_train_start(self, trainer, pl_module):
+        """Catch a Schedule-Free burn-in longer than the run itself.
+
+        `ck` is pinned to 1.0 while step_count < c_warmup, which means x tracks z exactly
+        and NO averaging happens. If c_warmup exceeds the total optimizer steps the run
+        will ever take, Schedule-Free is decorative for its whole length -- and because
+        y = (1-b)z + b*x collapses to z when x == z, the eval-time iterate swap is an
+        identity too. Seen for real: c_warmup 150 against a 129-step run.
+        """
+        if not self.requested.get("comp/sf_ck"):
+            return
+        c_warmup = getattr(self.args, "modular_sf_c_warmup", None)
+        if c_warmup is None:
+            return
+        try:
+            total = int(trainer.estimated_stepping_batches)
+        except Exception:
+            return
+        if total and c_warmup >= total:
+            print(f"\n[MECHANISM AUDIT] WARNING: --modular-sf-c-warmup {c_warmup} >= the "
+                  f"{total} optimizer steps this run will take. Schedule-Free averaging "
+                  f"never leaves burn-in (ck stays 1.0, x == z), so SF is inert for the "
+                  f"entire run and the eval-time x/y swap is an identity. Lower c_warmup "
+                  f"or lengthen the run.\n", flush=True)
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # Sample BEFORE diffusion.py's on_train_batch_end clears _comp_telem. Callback hooks
         # run before the LightningModule hook, so this ordering holds.
@@ -157,6 +205,8 @@ class MechanismAuditCallback(pl.Callback):
             rec = self.seen.get(key)
             if rec is None:
                 continue
+            if self.requested and not self.requested.get(key, True):
+                continue  # never asked for: OFF, not INERT
             moved, maxdev, n = rec
             if moved:
                 lines.append(f"    ACTIVE  {name:<32} max deviation from {identity}: {maxdev:.4g}  ({n} samples)")
@@ -164,7 +214,10 @@ class MechanismAuditCallback(pl.Callback):
                 lines.append(f"    INERT   {name:<32} never left {identity} in {n} samples  [{flag}]")
                 inert.append((name, flag))
 
-        if self.barrier_weight <= 0 or self.barrier_thresh <= 0:
+        skip_t1 = self.requested and not self.requested.get("_vadd_tier1", True)
+        if skip_t1:
+            detail = None
+        elif self.barrier_weight <= 0 or self.barrier_thresh <= 0:
             detail = "disabled (weight or barrier is 0)"
         elif self.barrier_nonzero:
             detail = (f"latent std reached {self.max_latent_std:.3f} > barrier "
@@ -172,10 +225,11 @@ class MechanismAuditCallback(pl.Callback):
         else:
             detail = (f"max latent std {self.max_latent_std:.3f} never exceeded barrier "
                       f"{self.barrier_thresh:.3f}, so the hinge stayed 0.0")
-        lines.append(f"    {'ACTIVE ' if self.barrier_nonzero else 'INERT  '} "
-                     f"{'VADD tier 1 (barrier loss)':<32} {detail}")
-        if not self.barrier_nonzero:
-            inert.append(("VADD tier 1 (barrier loss)", "--var-barrier-weight"))
+        if detail is not None:
+            lines.append(f"    {'ACTIVE ' if self.barrier_nonzero else 'INERT  '} "
+                         f"{'VADD tier 1 (barrier loss)':<32} {detail}")
+            if not self.barrier_nonzero:
+                inert.append(("VADD tier 1 (barrier loss)", "--var-barrier-weight"))
         if inert:
             lines.append(f"    => {len(inert)} mechanism(s) had NO effect on this run. Any conclusion "
                          f"attributing behaviour to them is unsupported.")
@@ -189,4 +243,4 @@ def maybe_build(args=None, report_every: int = 500):
     if args is not None:
         for w in audit_args(args):
             print(f"[MECHANISM AUDIT] WARNING: {w}", flush=True)
-    return MechanismAuditCallback(report_every=report_every)
+    return MechanismAuditCallback(report_every=report_every, args=args)
