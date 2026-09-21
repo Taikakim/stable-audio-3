@@ -160,6 +160,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             agc_lambda: float = 0.01,
             output_std_penalty: float = 0.0,
             output_std_t_gate: float = 0.5,
+            latent_var_barrier: float = 0.0,
+            latent_var_weight: float = 0.0,
     ):
         super().__init__()
 
@@ -176,6 +178,11 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         self.agc_lambda = agc_lambda
         self.output_std_penalty = output_std_penalty
         self.output_std_t_gate = output_std_t_gate
+
+        # Variance-Aware Dynamic Dampening (VADD): quadratic hinge barrier on reconstructed latent std
+        self.latent_var_barrier = latent_var_barrier
+        self.latent_var_weight = latent_var_weight
+        self.running_latent_std = 1.13
 
         # Stereo-preservation auxiliary loss (training/stereo_loss.py). weight=0
         # (default) => OFF and the training path is byte-identical to before.
@@ -851,6 +858,24 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 log_dict["train/std_z0hat_mean"] = std_hat.detach().mean()
                 log_dict["train/std_z0real_mean"] = std_real.detach().mean()
 
+        # Variance-Aware Dynamic Dampening (VADD): quadratic hinge barrier on latent std
+        if self.latent_var_barrier > 0:
+            tb = t.view(-1, *([1] * (noised_inputs.ndim - 1))).to(noised_inputs.dtype)
+            z0_hat = noised_inputs - tb * output.to(noised_inputs.dtype)
+            gate = t < self.output_std_t_gate
+            if bool(gate.any()):
+                zc = z0_hat[gate].float()
+                std_hat = zc.std(dim=(0, 2))  # (C,) per-channel std
+                cur_mean_std = float(std_hat.mean().item())
+                self.running_latent_std = 0.95 * getattr(self, "running_latent_std", cur_mean_std) + 0.05 * cur_mean_std
+                log_dict["train/running_latent_std"] = self.running_latent_std
+
+                if self.latent_var_weight > 0:
+                    excess = torch.relu(std_hat - self.latent_var_barrier)
+                    var_barrier_loss = excess.pow(2).mean()
+                    loss = loss + self.latent_var_weight * var_barrier_loss
+                    log_dict["train/var_barrier_loss"] = var_barrier_loss.detach()
+
         # x0-reconstruction ADD-a-term (see __init__): reconstruct the clean latent
         # z0_hat = noised - t*v_pred (rf_z0_hat, SAME as the output-std/stereo blocks)
         # and add lambda_x0 * MSE(z0_hat, z0) toward the ground-truth clean latent.
@@ -1006,11 +1031,42 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         }
         save_lora_safetensors(state_dict, self.lora_config, path)
 
+    def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
+        """Arm FusionOpt's per-component telemetry for this step (if logging interval is hit).
+        _telem_on=True tells FusionOpt to accumulate per-stage update norms during its
+        _spectral_group_step / _scalar_group_step calls, so we can read them back in
+        on_train_batch_end. Cleared after each logged step. No-op when opt is not FusionOpt."""
+        opt = self._fusion_opt()
+        n = self._staggered_logger.every_n_steps
+        if opt is not None and (self.global_step % n == 0):
+            opt._telem_on = True
+
+        # VADD: Forward observed latent variance to ModularOptimizer if supported
+        if hasattr(optimizer, "set_observed_variance") and hasattr(self, "running_latent_std"):
+            optimizer.set_observed_variance(self.running_latent_std)
+
+        # Arm per-stage component telemetry
+        if hasattr(optimizer, "_telem_on"):
+            optimizer._telem_on = True
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # EMA update AFTER the optimizer step (Lightning fires this post-step). No-op unless
         # use_ema (full-finetune) built the shadow. Cheap: one lerp over the DiT params/step.
         if self.diffusion_ema is not None:
             self.diffusion_ema.update(self.diffusion.model)
+
+        # Component telemetry (FusionOpt / ModularOptimizer): log per-stage update profile to WandB/logger
+        opts = self.optimizers()
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts] if opts is not None else []
+        for opt_inst in opts:
+            if hasattr(opt_inst, "_comp_telem") and opt_inst._comp_telem:
+                telem = opt_inst._comp_telem
+                for k, v in telem.items():
+                    log_metric(self.logger, k, float(v), step=self.global_step)
+                opt_inst._comp_telem = {}
+                if hasattr(opt_inst, "_telem_on"):
+                    opt_inst._telem_on = False
 
     def on_save_checkpoint(self, checkpoint):
         if self.lora_config is not None:
