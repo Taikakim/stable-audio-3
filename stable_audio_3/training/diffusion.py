@@ -1114,9 +1114,17 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
     # batch — so any checkpoint Lightning saves at the end of the val epoch
     # captures the averaged x without us having to munge the state_dict keys.
     def _fusion_opt(self):
-        # guarded: FusionOpt is only importable where the stable-audio-tools fork
-        # is present (not on LUMI containers); without it the optimizer cannot be
-        # a FusionOpt, so the isinstance sweep below is vacuously None
+        # Returns the optimiser that needs Schedule-Free x/y iterate swapping.
+        #
+        # This used to isinstance-check FusionOpt ONLY, which silently excluded
+        # ModularOptimizer: its train()/eval() swap methods existed but were never
+        # called, so a --modular-schedule-free run stayed permanently on the training
+        # iterate y and rendered/checkpointed the wrong weights (CONTINUITY 2026-09-21).
+        # Duck-type on the contract instead, so any future optimiser implementing it
+        # is picked up without editing this function again.
+        #
+        # FusionOpt is only importable where the stable-audio-tools fork is present
+        # (not on LUMI containers), so its import stays guarded and non-fatal.
         try:
             from stable_audio_tools.training.fusion_opt import FusionOpt
         except ModuleNotFoundError:
@@ -1132,14 +1140,35 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 return inner
         return None
 
+    def _sf_opt(self):
+        """Return the optimiser needing Schedule-Free x/y iterate swapping, or None.
+
+        Deliberately SEPARATE from _fusion_opt(): that accessor's other callers invoke
+        FusionOpt-only API (set_loss, _telem_on), so widening it to ModularOptimizer
+        crashes them. This one is used solely by the train()/eval() swap sites and
+        duck-types the contract, so any optimiser implementing it is picked up.
+        """
+        opts = self.optimizers()
+        if opts is None:
+            return None
+        if not isinstance(opts, (list, tuple)):
+            opts = [opts]
+        for o in opts:
+            inner = getattr(o, "optimizer", o)
+            if (getattr(inner, "uses_sf_averaging", False)
+                    and callable(getattr(inner, "train", None))
+                    and callable(getattr(inner, "eval", None))):
+                return inner
+        return None
+
     def on_validation_epoch_start(self):
-        opt = self._fusion_opt()
-        if opt is not None and opt.uses_sf_averaging:
+        opt = self._sf_opt()
+        if opt is not None:
             opt.eval()
 
     def on_train_batch_start(self, batch, batch_idx):
-        opt = self._fusion_opt()
-        if opt is not None and opt.uses_sf_averaging:
+        opt = self._sf_opt()
+        if opt is not None:
             opt.train()  # idempotent if already in train mode
 
 class DiffusionCondInpaintDemoCallback(pl.Callback):

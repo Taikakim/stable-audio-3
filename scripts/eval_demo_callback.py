@@ -249,6 +249,22 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
 
         was_training = pl_module.training
         pl_module.eval()
+
+        # Schedule-Free: training keeps params at the y iterate; the DEPLOYABLE weights
+        # are the averaged x. Demos rendered without this swap judge the wrong weights.
+        # pl_module.eval() does NOT do it -- the swap lives on the optimiser, and the
+        # existing hook (diffusion.py on_validation_epoch_start) never fires here because
+        # demos render from on_train_batch_end, not from a validation loop.
+        sf_opt = None
+        for _o in (getattr(trainer, "optimizers", None) or []):
+            _inner = getattr(_o, "optimizer", _o)
+            if getattr(_inner, "uses_sf_averaging", False) and callable(getattr(_inner, "eval", None)):
+                sf_opt = _inner
+                break
+        if sf_opt is not None:
+            print("[DEMO] Schedule-Free: swapping to averaged iterate x for rendering.", flush=True)
+            sf_opt.eval()
+
         t0 = time.time()
         prompts = CANONICAL_DEMO_PROMPTS[:self.num_prompts]
         total_clips = len(prompts) * (4 if self.render_continuations else 2)
@@ -371,6 +387,10 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         finally:
             T.flash_attn_func = orig_fa
             T.flash_attn_varlen_func = orig_fa_varlen
+            # Swap back to y BEFORE the module returns to train mode, so training never
+            # resumes from the averaged iterate. Must run even if rendering raised.
+            if sf_opt is not None:
+                sf_opt.train()
             if was_training:
                 pl_module.train()
 

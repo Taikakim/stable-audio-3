@@ -423,6 +423,13 @@ def train(args):
     if _tripwire is not None:
         callbacks.append(_tripwire)
 
+    # Mechanism audit: report which optimizer mechanisms actually affect the run.
+    # ON by default (print-only, reads already-computed telemetry); SA3_MECHANISM_AUDIT=0 silences.
+    from scripts.mechanism_audit import maybe_build as _maybe_audit
+    _audit = _maybe_audit(args, report_every=max(500, (args.log_every or 1) * 10))
+    if _audit is not None:
+        callbacks.append(_audit)
+
     if args.eval_demos:
         from scripts.eval_demo_callback import ModularDemoAndLossGuardCallback
         eval_cb = ModularDemoAndLossGuardCallback(

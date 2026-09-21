@@ -44,6 +44,18 @@ class NaNTripwireCallback(pl.Callback):
         self.check_params = check_params
         self.check_grads = check_grads
         self.tripped = False
+        self._announced = False
+
+    def _announce(self, pl_module):
+        """Say how many tensors are watched, so a silent run means 'clean', not 'inert'."""
+        if self._announced:
+            return
+        self._announced = True
+        n = sum(1 for _, p in pl_module.named_parameters() if p.requires_grad)
+        print(f"[NaN TRIPWIRE] watching {n} trainable tensors.", flush=True)
+        if n == 0:
+            print("[NaN TRIPWIRE] WARNING: watching NOTHING — this tripwire cannot fire. "
+                  "A silent run proves nothing.", flush=True)
 
     def _report(self, trainer, stage, hit):
         if hit is None or self.tripped:
@@ -63,6 +75,7 @@ class NaNTripwireCallback(pl.Callback):
         return True
 
     def on_after_backward(self, trainer, pl_module):
+        self._announce(pl_module)
         if self.tripped or not self.check_grads:
             return
         grads = ((n, p.grad) for n, p in pl_module.named_parameters() if p.requires_grad)
