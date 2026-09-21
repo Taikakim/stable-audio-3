@@ -221,3 +221,22 @@ model.set_lora_strength(0.3, lora_index=1)
 ```
 
 For full details on LoRA training see [LoRA Training](lora.md).
+
+### ⚠ Swapping to a different-RANK LoRA on a live model object fails silently-then-loudly
+
+`model.load_lora([...])` does not tear down and rebuild the adapter layers on a model
+instance that already has LoRA attached — it re-populates the EXISTING parametrized
+weight tensors in place. Loading a second checkpoint with a **different rank** than the
+first (e.g. a rank-16 LoRA onto a model that still has rank-128 adapter layers from an
+earlier `load_lora` call) raises `size mismatch for ...lora_A/lora_B: copying a param
+with shape [...,16] ... current model is [...,128]` — a `RuntimeError` from
+`load_state_dict`, not a hang or wrong output, so at least it's loud. Found 2026-09-15
+batch-testing outpaint/inpaint behavior across 4 clips trained at different ranks
+(rank128 DoRA vs a rank16 DoRA) reusing one `StableAudioModel` instance in a loop.
+
+**Fix: when iterating checkpoints of possibly different LoRA rank, call
+`StableAudioModel.from_pretrained(...)` fresh before each `load_lora`, rather than
+reusing one model object across ranks.** Same-rank swaps on a live object are fine (this
+is what `set_lora_strength`/multi-LoRA stacking above already assumes); it is only a
+RANK change that breaks. `eval/outpaint_precede_probe.py` has the working pattern
+(rebuild-on-checkpoint-change, keyed by checkpoint path).

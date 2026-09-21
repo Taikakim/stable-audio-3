@@ -440,3 +440,7 @@ This is intentional to avoid false positives on complex numerical code.
 - **Public API**: Exported via `stable_audio_3/__init__.py` — only `StableAudioModel` and `AutoencoderModel`
 - **Model loading**: Always use `from_pretrained()` class method, never load checkpoints manually
 - **LoRA paths**: Can be single path or list of paths; applied in order and can be blended with `set_lora_strength()`
+- **⚠ LoRA rank swap**: `model.load_lora([...])` on an already-loaded model cannot switch to a
+  *different rank* (rank16 onto existing rank128 layers → `size mismatch` `RuntimeError` on
+  `lora_A`/`lora_B`). Looping over checkpoints of mixed rank must call `from_pretrained` fresh
+  per checkpoint, not reuse one model object. Details: `docs/workflows/inference.md`.

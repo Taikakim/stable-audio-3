@@ -36,3 +36,9 @@ prefer the SAO copy. `eval_dora_*` and `soup_*` are canonical in `SAO/eval/`.
 Cross-repo findings → `SAO/WORKLOG.md`. Local analyses (e.g.
 `checkpoint_steering_analysis.md`) stay here. Append when you finish, so the next
 instance doesn't redo it.
+
+⚠ **`model.load_lora([...])` on a live `StableAudioModel` cannot swap to a different LoRA
+RANK** (size-mismatch `RuntimeError` on `lora_A`/`lora_B`, e.g. rank16 onto rank128
+adapter layers) — reusing one model instance across checkpoints of different rank in a
+loop breaks; rebuild via `from_pretrained` fresh whenever rank changes. Full writeup +
+the fix pattern: `docs/workflows/inference.md` § "Swapping to a different-RANK LoRA".
