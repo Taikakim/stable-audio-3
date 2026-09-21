@@ -61,39 +61,58 @@ TRACK_TYPE_MUSIC = "TrackType: Music, VocalType: Instrumental, "
 
 
 def make_caption_sampler(sidecar_path, probs=(0.6, 0.3, 0.1), seed=None,
-                         track_type_prob=0.0):
-    """custom_metadata_fn for PreEncodedDataset: sample a caption tier per call.
+                         track_type_prob=0.0, caption_dropout_prob=0.0,
+                         case_aug_prob=0.0, tag_shuffle_prob=0.0, key_fn=None):
+    """custom_metadata_fn for PreEncodedDataset AND LocalDataset (live-encode).
 
-    Tiers with missing text fall back to t1. Unknown index -> {} (dataset keeps
-    its stored prompt). Deterministic when `seed` is given (own RNG stream, so
-    worker seeding elsewhere is untouched). Closure state survives dill.
+    Samples a caption tier per call; tiers with missing text fall back to t1;
+    unknown index -> {} (dataset keeps its stored prompt). Deterministic when
+    `seed` is given (own RNG stream). Closure state survives dill.
 
-    track_type_prob: probability of prepending the SA3-paper TrackType prefix
-    ("TrackType: Music, VocalType: Instrumental, ") to the sampled caption.
-    The base model trained with AudioSparx metadata prefixes present ~50% of
-    the time and Stability recommends them at inference (SA3 paper §5.1) —
-    0.5 mirrors base training; default 0.0 preserves existing behaviour.
+    track_type_prob: prob of prepending the SA3-paper TrackType prefix
+      ("TrackType: Music, VocalType: Instrumental, "). Base model saw AudioSparx
+      prefixes ~50% (SA3 paper §5.1); 0.4-0.5 stays in-distribution. Default 0.0.
+    caption_dropout_prob: prob of emitting the EMPTY prompt for CFG-uncond training.
+      Leave 0.0 if the training wrapper already applies conditioning dropout (avoid
+      double-dropping); set here (~0.1) for the --data_dir path if it does not.
+    case_aug_prob: prob of lowercasing the whole caption (case-robustness).
+    tag_shuffle_prob: prob of shuffling the comma-separated segments (order-robustness);
+      applied to the BASE caption BEFORE the TrackType prefix, so the prefix stays front.
+    key_fn: info->sidecar-key. Default resolves the basename-stem of the first present
+      of latent_filename / path / relpath / filename (so PreEncoded=latent stem,
+      Local=audio stem). Pass a custom one when sidecar keys are e.g. relpaths/hashes.
     """
     with open(sidecar_path) as f:
         table = json.load(f)
     rng = random.Random(seed)
     p1, p2, p3 = probs
 
-    def sampler(info, latents):
-        stem = os.path.splitext(os.path.basename(info["latent_filename"]))[0]
-        entry = table.get(stem)
+    def _default_key(info):
+        for f in ("latent_filename", "path", "relpath", "filename", "audio_filename"):
+            v = info.get(f) if isinstance(info, dict) else None
+            if v:
+                return os.path.splitext(os.path.basename(v))[0]
+        return None
+    keyf = key_fn or _default_key
+
+    def sampler(info, audio_or_latents):
+        if caption_dropout_prob > 0 and rng.random() < caption_dropout_prob:
+            return {"prompt": ""}
+        key = keyf(info)
+        entry = table.get(key) if key is not None else None
         if entry is None:
             return {}
         r = rng.random() * (p1 + p2 + p3)
-        if r < p1:
-            tier = "t1"
-        elif r < p1 + p2:
-            tier = "t2"
-        else:
-            tier = "t3"
+        tier = "t1" if r < p1 else ("t2" if r < p1 + p2 else "t3")
         prompt = entry.get(tier) or entry.get("t1")
         if not prompt:
             return {}
+        if tag_shuffle_prob > 0 and ", " in prompt and rng.random() < tag_shuffle_prob:
+            parts = [s for s in prompt.split(", ") if s]
+            rng.shuffle(parts)
+            prompt = ", ".join(parts)
+        if case_aug_prob > 0 and rng.random() < case_aug_prob:
+            prompt = prompt.lower()
         if track_type_prob > 0 and rng.random() < track_type_prob:
             prompt = TRACK_TYPE_MUSIC + prompt
         return {"prompt": prompt}

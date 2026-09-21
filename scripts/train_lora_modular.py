@@ -7,7 +7,7 @@ mir_ctrl, traj_sketch, subspace loss, familiarity) and extended with:
   - --subset300: shortcut to /home/kim/Projects/latents_sa3_subset300
   - Modular sub-flags: --modular-whitening, --modular-escape-velocity, etc.
 
-ZERO modifications to any existing production file. This file is entirely standalone.
+Origin: Kim & Antigravity.Neuromancer
 """
 
 import os
@@ -385,18 +385,17 @@ def train(args):
 
     # ---- Callbacks ----
     exc_callback = ExceptionCallback()
-    checkpoint_dir = args.save_dir if args.save_dir else None
+    run_dir = os.path.join(args.save_dir, args.name) if (args.save_dir and args.name) else (args.save_dir or "./")
+    os.makedirs(run_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
 
     if args.logger == "wandb":
         wandb_proj = getattr(args, "wandb_project", None) or os.environ.get("WANDB_PROJECT") or args.name
         logger = pl.loggers.WandbLogger(
             project=wandb_proj, name=args.name)
         logger.watch(training_wrapper)
-        if args.save_dir and isinstance(logger.experiment.id, str):
-            checkpoint_dir = os.path.join(
-                args.save_dir, logger.experiment.project, logger.experiment.id, "checkpoints")
     elif args.logger == "csv":
-        logger = pl.loggers.CSVLogger(args.save_dir or "./logs")
+        logger = pl.loggers.CSVLogger(run_dir)
     else:
         logger = None
 
@@ -418,10 +417,16 @@ def train(args):
 
     callbacks = [ckpt_callback, exc_callback, pl.callbacks.ModelSummary(max_depth=2)]
 
+    # Opt-in NaN localisation: inert unless SA3_NAN_TRIPWIRE=1 is exported.
+    from scripts.nan_tripwire_callback import maybe_build as _maybe_tripwire
+    _tripwire = _maybe_tripwire()
+    if _tripwire is not None:
+        callbacks.append(_tripwire)
+
     if args.eval_demos:
         from scripts.eval_demo_callback import ModularDemoAndLossGuardCallback
         eval_cb = ModularDemoAndLossGuardCallback(
-            save_dir=args.save_dir or "./",
+            save_dir=run_dir,
             loss_guard_threshold=args.loss_guard_threshold,
             step_milestones=tuple(args.eval_milestones) if args.eval_milestones else (100, 300, 600, 1200, 1800, 2400, 3000),
             demo_steps=24,

@@ -10,26 +10,27 @@ tunings_root: /home/kim/pytorch-tunings-7.2.3
 
 # Applied in every profile.
 common:
-  PYTORCH_TUNABLEOP_ENABLED: "1"
-  PYTORCH_TUNABLEOP_VERBOSE: "1"
+  PYTORCH_TUNABLEOP_ENABLED: "0"
+  PYTORCH_TUNABLEOP_TUNING: "0"
+  PYTORCH_TUNABLEOP_VERBOSE: "0"
   PYTORCH_TUNABLEOP_FILENAME: "${tunings_root}/tunableop_results.csv"
   PYTORCH_SDP_KERNEL_VERBOSE: "1"
   PYTORCH_ALLOC_CONF: "garbage_collection_threshold:0.6,max_split_size_mb:512"
   PYTORCH_HIP_FREE_MEMORY_THRESHOLD_MB: "1024"
   HIP_FORCE_DEV_KERNARG: "1"
-  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
+  FLASH_ATTENTION_TRITON_AMD_ENABLE: "FALSE"
   TRITON_CACHE_DIR: "${tunings_root}/triton_cache"
   MIOPEN_CUSTOM_CACHE_DIR: "${tunings_root}/miopen/cache"
   MIOPEN_USER_DB_PATH: "${tunings_root}/miopen/db"
   OMP_NUM_THREADS: "8"
-  TRITON_PRINT_AUTOTUNING: "1"
+  TRITON_PRINT_AUTOTUNING: "0"
 
 profiles:
   # Short startup, read-only GEMM cache — for the gradio UI / generation.
   inference:
     MIOPEN_FIND_MODE: "2"            # FAST
-    PYTORCH_TUNABLEOP_TUNING: "1"    # read existing CSV, don't tune
-  # Long runs — best steady-state perf, tune & persist GEMMs.
+    PYTORCH_TUNABLEOP_TUNING: "0"
+  # Long runs — best steady-state perf per RUNBOOK.md (mode 6 crashes SA3-medium DiT).
   training:
-    MIOPEN_FIND_MODE: "6"            # TRUST_VERIFY
-    PYTORCH_TUNABLEOP_TUNING: "1"    # tune on miss, write CSV
+    MIOPEN_FIND_MODE: "2"            # FAST (mode 6 crashes SA3 DiT)
+    PYTORCH_TUNABLEOP_TUNING: "0"

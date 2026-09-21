@@ -13,6 +13,8 @@ Integrates:
    renders demo clips, and aborts training.
 6. OOM Guard: catches VRAM OOM, temporarily offloads optimizer buffers to CPU,
    and retries render cleanly.
+
+Origin: Kim & Antigravity.Neuromancer
 """
 
 import os
@@ -180,11 +182,16 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         self.epoch_losses: list[float] = []
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # Lightning divides the training-step loss by accumulate_grad_batches before
+        # it reaches this hook (loops/optimization/automatic.py: closure_loss / normalize),
+        # so the raw value here is 1/N of the real loss. Undo it, or the monitor reports
+        # a fraction of the truth and loss_guard_threshold is silently N times looser.
+        accum = max(1, int(getattr(trainer, "accumulate_grad_batches", 1) or 1))
         if outputs is not None:
             if isinstance(outputs, dict) and "loss" in outputs:
-                self.epoch_losses.append(outputs["loss"].item())
+                self.epoch_losses.append(outputs["loss"].item() * accum)
             elif torch.is_tensor(outputs):
-                self.epoch_losses.append(outputs.item())
+                self.epoch_losses.append(outputs.item() * accum)
 
         step = trainer.global_step
         if step in self.step_milestones and step not in self.rendered_steps:
