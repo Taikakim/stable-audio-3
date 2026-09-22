@@ -21,6 +21,7 @@ import argparse
 import itertools
 import json
 import resource
+import sys
 from pathlib import Path
 
 # Bump open file descriptor limit to avoid "Too many open files" across epochs/workers
@@ -171,6 +172,72 @@ class ModularTrainingWrapper(DiffusionCondTrainingWrapper):
                     remapped_sd[f"diffusion.{k}"] = v
             checkpoint["state_dict"] = remapped_sd
             print(f"[on_load_checkpoint] Remapped {len(remapped_sd)} checkpoint keys to wrapper hierarchy.")
+
+
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+_PROJECT_MEMO = Path.home() / ".cache" / "sa3" / "last_wandb_project"
+
+
+def _remembered_project() -> str | None:
+    try:
+        v = _PROJECT_MEMO.read_text().strip()
+        return v or None
+    except OSError:
+        return None
+
+
+def _remember_project(name: str) -> None:
+    try:
+        _PROJECT_MEMO.parent.mkdir(parents=True, exist_ok=True)
+        _PROJECT_MEMO.write_text(name)
+    except OSError:
+        pass
+
+
+def _resolve_wandb_project(args) -> str:
+    """Explicit flag, then env, then ASK -- offering the last project as the default.
+
+    Asking only happens on a real terminal. An unattended run must never block on a
+    prompt, so without a tty it silently reuses the remembered project.
+    """
+    explicit = getattr(args, "wandb_project", None) or os.environ.get("WANDB_PROJECT")
+    if explicit:
+        _remember_project(explicit)
+        return explicit
+
+    previous = _remembered_project() or "sa3-lora-dev"
+    if not sys.stdin.isatty():
+        print(f"[logger] no --wandb-project and no tty; reusing '{previous}'.", flush=True)
+        return previous
+    try:
+        reply = input(f"[logger] W&B project [{previous}]: ").strip()
+    except EOFError:
+        reply = ""
+    chosen = reply or previous
+    _remember_project(chosen)
+    return chosen
+
+
+def _build_logger(args, run_dir, training_wrapper):
+    """Default to W&B. 'csv' and 'none' remain available."""
+    choice = (getattr(args, "logger", None) or "wandb").lower()
+    if choice in ("none", "off", "false"):
+        return None
+    if choice == "csv":
+        return pl.loggers.CSVLogger(run_dir)
+    try:
+        logger = pl.loggers.WandbLogger(project=_resolve_wandb_project(args), name=args.name)
+        logger.watch(training_wrapper)
+        return logger
+    except Exception as e:
+        # Never lose a run to a logging problem; degrade to CSV in the run dir.
+        print(f"[logger] W&B unavailable ({type(e).__name__}: {e}); falling back to CSV in "
+              f"{run_dir}.", flush=True)
+        return pl.loggers.CSVLogger(run_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -391,15 +458,7 @@ def train(args):
     os.makedirs(run_dir, exist_ok=True)
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
 
-    if args.logger == "wandb":
-        wandb_proj = getattr(args, "wandb_project", None) or os.environ.get("WANDB_PROJECT") or args.name
-        logger = pl.loggers.WandbLogger(
-            project=wandb_proj, name=args.name)
-        logger.watch(training_wrapper)
-    elif args.logger == "csv":
-        logger = pl.loggers.CSVLogger(run_dir)
-    else:
-        logger = None
+    logger = _build_logger(args, run_dir, training_wrapper)
 
     ckpt_callback = pl.callbacks.ModelCheckpoint(
         every_n_train_steps=args.checkpoint_every, dirpath=checkpoint_dir, save_top_k=-1
@@ -703,7 +762,7 @@ def main():
                    help="Full Lightning checkpoint to resume from")
 
     # ---- Logging & Evaluation ----
-    p.add_argument("--logger", type=str, default=None,
+    p.add_argument("--logger", type=str, default="wandb",
                    choices=["wandb", "csv", None])
     p.add_argument("--wandb-project", "--wandb_project", type=str, default=None,
                    dest="wandb_project", help="W&B project name (overrides WANDB_PROJECT env var)")

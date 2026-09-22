@@ -146,6 +146,7 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         self,
         save_dir: str,
         loss_guard_threshold: float = 0.8,
+        loss_log_every: int = 10,
         step_milestones: tuple[int, ...] = (100,),
         demo_steps: int = 24,
         demo_cfg: float = 7.0,
@@ -165,6 +166,7 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         self.demos_dir = self.save_dir / "demos"
         self.demos_dir.mkdir(parents=True, exist_ok=True)
         self.loss_guard_threshold = loss_guard_threshold
+        self.loss_log_every = loss_log_every
         self.step_milestones = set(step_milestones)
         self.rendered_steps = set()
         self.demo_steps = demo_steps
@@ -216,8 +218,33 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
             return
 
         mean_loss = float(np.mean(self.epoch_losses))
-        print(f"\n[LOSS MONITOR] Epoch {epoch} complete. Mean loss: {mean_loss:.4f} "
-              f"(loss guard threshold: {self.loss_guard_threshold})", flush=True)
+        # The guard must evaluate every epoch, but it need not SAY so every epoch: at 160
+        # epochs that was 320 lines burying everything else. Speak on a cadence, on the
+        # first and last epoch, and always when something is wrong.
+        self._epoch_losses_seen = getattr(self, "_epoch_losses_seen", [])
+        self._epoch_losses_seen.append(mean_loss)
+        noteworthy = (not math.isfinite(mean_loss)) or (mean_loss > self.loss_guard_threshold)
+        cadence = max(1, int(getattr(self, "loss_log_every", 10)))
+        last = getattr(trainer, "max_epochs", None)
+        speak = noteworthy or epoch == 0 or epoch % cadence == 0 or (last and epoch == last - 1)
+        if speak:
+            # Window stats over FINITE values only: a single NaN epoch otherwise poisons
+            # the rolling average and the trend for every later report, which is how a
+            # summary stops being readable exactly when you most need it.
+            fin = lambda xs: [v for v in xs if math.isfinite(v)]
+            window = fin(self._epoch_losses_seen[-cadence:])
+            prev = fin(self._epoch_losses_seen[-2 * cadence:-cadence])
+            n_bad = len(self._epoch_losses_seen[-cadence:]) - len(window)
+            parts = [f"mean {mean_loss:.4f}"]
+            if window:
+                parts.append(f"last {len(window)} avg {sum(window)/len(window):.4f}")
+                if prev:
+                    d = sum(window) / len(window) - sum(prev) / len(prev)
+                    parts.append(f"{d:+.4f} vs previous {len(prev)}")
+            if n_bad:
+                parts.append(f"{n_bad} NON-FINITE epoch(s) in window")
+            parts.append(f"guard {self.loss_guard_threshold}")
+            print(f"[LOSS MONITOR] Epoch {epoch}: " + ", ".join(parts), flush=True)
 
         # NaN/Inf must trip the guard: `nan > threshold` is False, so a bare
         # `>` comparison routes a diverged run into the "healthy" branch.
@@ -237,8 +264,8 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         elif self.render_between_epochs and trainer.global_step >= 100:
             print(f"[DEMO TRIGGER] Epoch {epoch} complete (loss healthy). Rendering between-epoch demos...")
             self._render_demos(trainer, pl_module, tag=f"ep{epoch}")
-        else:
-            print(f"[LOSS MONITOR] Epoch {epoch} complete. Loss healthy ({mean_loss:.4f} <= {self.loss_guard_threshold}).")
+        # No "loss healthy" line: it doubled the log volume to say what the line above
+        # already says. Silence means healthy.
 
         self.epoch_losses.clear()
 

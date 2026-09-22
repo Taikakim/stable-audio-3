@@ -156,11 +156,23 @@ def logger_project_name(logger) -> str:
         return logger.name
 
 def log_metric(logger, key, value, step=None):
+    """Log one scalar to whatever logger is attached.
+
+    The Wandb/Comet branches used to be the ONLY branches, so with a CSVLogger or
+    TensorBoardLogger this function fell off the end and did nothing -- silently. Every
+    comp/* optimizer-telemetry series was computed each step (paying its .item() sync)
+    and then discarded unless the run happened to use W&B. The generic fallback uses
+    Logger.log_metrics, which every Lightning logger implements.
+    """
     from pytorch_lightning.loggers import WandbLogger, CometLogger
+    if logger is None:
+        return
     if isinstance(logger, WandbLogger):
         logger.experiment.log({key: value})
     elif isinstance(logger, CometLogger):
         logger.experiment.log_metrics({key: value}, step=step)
+    elif hasattr(logger, "log_metrics"):
+        logger.log_metrics({key: value}, step=step)
 
 def log_audio(logger, key, audio_path, sample_rate, caption=None, step=None):
     if isinstance(logger, WandbLogger):
