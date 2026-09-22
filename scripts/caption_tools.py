@@ -120,6 +120,108 @@ def make_caption_sampler(sidecar_path, probs=(0.6, 0.3, 0.1), seed=None,
     return sampler
 
 
+# ---------------------------------------------------------------------------
+# Pre-encoded multi-source caption routing (C, 2026-09-23). train_lora.py solved per-source tiers
+# for --encoded_dir but its sidecar KEY is the latent stem, which matches nothing in the goa bigset
+# (sidecar keyed by source path relative to the archive root; every stored prompt is the string
+# "None"), so that corpus trained on the word "None" wherever it was used pre-encoded. These helpers
+# are shared by train_lora_modular.py.
+# ---------------------------------------------------------------------------
+
+_EMPTY_PROMPTS = (None, "", "None", "none", "null")
+
+
+def parse_caption_probs(spec, n_sources):
+    """One (t1,t2,t3) tuple for every source, or semicolon-separated tuples in --encoded_dir order.
+    Raises on a count mismatch rather than recycling (same contract as train_lora.py)."""
+    parts = [p.strip() for p in str(spec).split(";") if p.strip()]
+    out = []
+    for p in parts:
+        t = tuple(float(x) for x in p.split(","))
+        if len(t) != 3 or any(v < 0 for v in t) or sum(t) <= 0:
+            raise ValueError(f"--caption_probs tuple {p!r} must be 3 non-negative values, not all 0")
+        out.append(t)
+    if len(out) == 1:
+        return out * n_sources
+    if len(out) != n_sources:
+        raise ValueError(f"--caption_probs has {len(out)} tuples for {n_sources} encoded_dirs")
+    return out
+
+
+def make_suffix_key_fn(table_keys):
+    """Find an item's sidecar key whatever the sidecar was keyed by: latent stem, relpath, or ANY
+    trailing sub-path of the source path (which covers keys relative to an archive root that only
+    existed on another machine, e.g. /scratch/.../goa_archive/<key>)."""
+    keys = frozenset(table_keys)
+
+    def key_fn(info):
+        cands = []
+        for f in ("latent_filename", "path", "relpath", "filename", "audio_filename"):
+            v = info.get(f) if isinstance(info, dict) else None
+            if v:
+                cands.append(os.path.splitext(os.path.basename(str(v)))[0])
+        for f in ("relpath", "path", "source_path"):
+            v = info.get(f) if isinstance(info, dict) else None
+            if v:
+                parts = str(v).strip("/").split("/")
+                cands.extend("/".join(parts[i:]) for i in range(len(parts)))
+        for c in cands:
+            if c in keys:
+                return c
+        return None
+    return key_fn
+
+
+_SOURCE_TABLES = {}   # per-process cache: sidecar path -> (table, key_fn)
+
+
+class SourceCaptionFn:
+    """custom_metadata_fn for one pre-encoded source. With a sidecar: tier-sample it via the
+    suffix-key lookup. Either way: REJECT an item whose final prompt is empty or the literal 'None',
+    so a caption miss resamples instead of training on a placeholder.
+
+    A top-level class holding only the PATH, not a closure over the table: PreEncodedDataset
+    dill-loads the metadata fn on EVERY item (dataset.py:591), and a closure would carry the whole
+    sidecar (54 MB for the goa bigset) through that on each sample. The table loads once per
+    worker process into _SOURCE_TABLES."""
+
+    def __init__(self, sidecar_path, probs=(0.0, 0.9, 0.1), track_type_prob=0.0):
+        self.sidecar_path = sidecar_path
+        self.probs = tuple(probs)
+        self.track_type_prob = float(track_type_prob)
+
+    def _lookup(self):
+        hit = _SOURCE_TABLES.get(self.sidecar_path)
+        if hit is None:
+            with open(self.sidecar_path) as f:
+                table = json.load(f)
+            hit = (table, make_suffix_key_fn(table.keys()))
+            _SOURCE_TABLES[self.sidecar_path] = hit
+        return hit
+
+    def __call__(self, info, latents):
+        out = {}
+        if self.sidecar_path:
+            table, key_fn = self._lookup()
+            entry = table.get(key_fn(info))
+            if entry:
+                p1, p2, p3 = self.probs
+                r = random.random() * (p1 + p2 + p3)
+                tier = "t1" if r < p1 else ("t2" if r < p1 + p2 else "t3")
+                prompt = entry.get(tier) or entry.get("t1")
+                if prompt:
+                    if self.track_type_prob > 0 and random.random() < self.track_type_prob:
+                        prompt = TRACK_TYPE_MUSIC + prompt
+                    out = {"prompt": prompt}
+        prompt = out.get("prompt", info.get("prompt") if isinstance(info, dict) else None)
+        if prompt in _EMPTY_PROMPTS:
+            return {"__reject__": True}
+        return out
+
+
+def make_source_caption_fn(sidecar_path, probs, track_type_prob=0.0):
+    return SourceCaptionFn(sidecar_path, probs, track_type_prob)
+
 def generate_sidecar(rows, out_path):
     """Write a T1-only sidecar (t2/t3 = None, filled by the Flamingo pass).
 

@@ -205,6 +205,44 @@ def _remember_project(name: str) -> None:
 # run's file and no run dir carried one.
 # ---------------------------------------------------------------------------
 
+def _audit_source_captions(i, d, sidecar, probs, fn, n=200):
+    """Print what one source will actually train on: caption hit rate and examples. A corpus that
+    silently trains on 'None' or a single artist name is invisible in the loss."""
+    import glob as _glob
+    import random as _random
+    items = [f for f in _glob.glob(os.path.join(d, "*.npy")) if os.path.basename(f) != "silence.npy"]
+    rng = _random.Random(0)
+    sample = rng.sample(items, min(n, len(items)))
+    rejected, prompts = 0, []
+    for f in sample:
+        try:
+            with open(f[:-4] + ".json") as fh:
+                info = json.load(fh)
+        except Exception:
+            rejected += 1
+            continue
+        info["latent_filename"] = f
+        out = fn(info, None)
+        if out.get("__reject__"):
+            rejected += 1
+        else:
+            prompts.append(out.get("prompt", info.get("prompt")))
+    distinct = len(set(prompts))
+    print(f"[captions] source {i} ({os.path.basename(d)}): {len(items)} items, "
+          f"sidecar={os.path.basename(sidecar) if sidecar else 'none (stored prompts)'}, "
+          f"tiers t1/t2/t3={probs}; audit of {len(sample)}: {rejected} rejected, "
+          f"{distinct} distinct prompts", flush=True)
+    for ex in prompts[:2]:
+        print(f"[captions]     e.g. {str(ex)[:110]!r}", flush=True)
+    if sample and rejected > 0.2 * len(sample):
+        print(f"[captions] WARNING: source {i} rejects {rejected}/{len(sample)} items -- its captions "
+              f"are missing; the dataset will resample around them.", flush=True)
+    if prompts and distinct <= 5:
+        print(f"[captions] WARNING: source {i} has only {distinct} distinct prompts in {len(prompts)} "
+              f"-- probably a constant label, not per-track captions. Pass a --caption_sidecar.",
+              flush=True)
+
+
 def _now_iso() -> str:
     import datetime
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
@@ -368,16 +406,22 @@ def train(args):
     sidecars = [s.strip() for s in args.caption_sidecar.split(",")] if args.caption_sidecar else []
     if sidecars and len(sidecars) != len(dirs):
         raise ValueError(f"got {len(dirs)} encoded_dirs but {len(sidecars)} caption_sidecars")
-    weights = [1.0] * len(dirs)
+    weights = ([float(w) for w in args.source_weights.split(",")] if args.source_weights
+               else [1.0] * len(dirs))
+    if len(weights) != len(dirs):
+        raise ValueError(f"got {len(dirs)} encoded_dirs but {len(weights)} source_weights")
 
+    # Captions, per source (C 2026-09-23): the established train_lora.py routine -- per-source
+    # tier probabilities, optional TrackType prefix -- plus a suffix-key lookup, so sidecars keyed by
+    # source path (goa bigset) resolve, and a REJECT on empty/'None' prompts. CFG caption dropout
+    # (10%) is applied later by the training wrapper, as in train_lora.py.
+    from caption_tools import make_source_caption_fn, parse_caption_probs
+    probs_list = parse_caption_probs(args.caption_probs, len(dirs))
     configs = []
     for i, d in enumerate(dirs):
         sc = sidecars[i] if i < len(sidecars) and sidecars[i] else None
-        fn = None
-        if sc:
-            from caption_tools import make_caption_sampler
-            fn = make_caption_sampler(sc, probs=(0, 0.9, 0.1))
-            print(f"[captions] source {i} ({os.path.basename(d)}): sidecar={os.path.basename(sc)}")
+        fn = make_source_caption_fn(sc, probs_list[i], args.track_type_prob)
+        _audit_source_captions(i, d, sc, probs_list[i], fn)
         configs.append(LatentDatasetConfig(id=f"train{i}", path=d, weight=weights[i],
                                            custom_metadata_fn=fn))
 
@@ -388,10 +432,27 @@ def train(args):
     )
     print(f"[dataset] {len(dataset)} samples from {len(dirs)} source(s)")
 
+    # --source_weights must actually change sampling. PreEncodedDataset records per-item weights
+    # but nothing consumed them (train_lora.py's --source_weights is inert for the same reason).
+    sampler = None
+    if args.source_weights and len(set(weights)) > 1:
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.tensor(dataset.sample_weights, dtype=torch.double),
+            num_samples=len(dataset), replacement=True,
+            generator=torch.Generator().manual_seed(seed))
+        per_src = {}
+        for w in dataset.sample_weights:
+            per_src[w] = per_src.get(w, 0) + 1
+        tot = sum(w * n for w, n in per_src.items())
+        print("[dataset] weighted sampling, expected share per source: "
+              + ", ".join(f"{os.path.basename(d)} {100 * weights[i] * per_src.get(weights[i], 0) / tot:.0f}%"
+                          for i, d in enumerate(dirs)))
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=args.num_workers,
         drop_last=True,
         collate_fn=collation_fn,
@@ -661,6 +722,15 @@ def main():
                    help="Pre-encoded latent directory (or comma-separated list)")
     p.add_argument("--subset300", action="store_true",
                    help=f"Use canonical 300-track subset at {SUBSET_300_PATH}")
+    p.add_argument("--caption_probs", default="0,0.9,0.1",
+                   help="caption tier probabilities t1,t2,t3: ONE tuple for all sources or "
+                        "semicolon-separated per source in --encoded_dir order. goa bigset (v5): "
+                        "T1 70%% genre-correct, T2 48%%, T3 1.2%% (ARCHITECTURE.md) -> weight T1/T2.")
+    p.add_argument("--track_type_prob", type=float, default=0.0,
+                   help="prob of prepending 'TrackType: Music, VocalType: Instrumental, ' (SA3 §5.1)")
+    p.add_argument("--source_weights", default=None,
+                   help="comma-separated per-source sampling weights (parallel to --encoded_dir); "
+                        "unequal weights switch to a WeightedRandomSampler")
     p.add_argument("--caption_sidecar", type=str, default=None,
                    help="Caption JSON sidecar (comma-separated for multi-source)")
     p.add_argument("--duration", type=float, default=380.0,
