@@ -279,6 +279,8 @@ def train(args):
                         "beta_precond": args.modular_beta_precond,
                         "precond_delta": 1e-4,
                         "precond_update_freq": args.modular_precond_freq,
+                        "precond_alpha": args.modular_precond_alpha,
+                        "precond_bottleneck": args.modular_precond_bottleneck,
                         "ns_poly": args.modular_ns_poly,
                         "escape_velocity": args.modular_escape_velocity,
                         "ev_beta": args.modular_ev_beta,
@@ -564,6 +566,14 @@ def main():
 
     # ---- Modular sub-flags ----
     mod = p.add_argument_group("Modular optimizer flags")
+    mod.add_argument("--modular-precond-alpha", type=float, default=0.25,
+                     dest="modular_precond_alpha",
+                     help="Mousse Spectral Tempering: curvature exponent alpha in Lambda^-alpha "
+                          "(Algorithm 1 line 6). 0.25 = classic Shampoo inverse fourth root.")
+    mod.add_argument("--modular-no-precond-bottleneck", action="store_false", default=True,
+                     dest="modular_precond_bottleneck",
+                     help="Precondition BOTH sides. Off by default: on LoRA factors the wide side "
+                          "is up to 12288, and one such eigh measured 7.2 s on this card.")
     mod.add_argument("--modular-whitening", type=str, default="none",
                      choices=["none", "shampoo", "soap"],
                      dest="modular_whitening",
