@@ -425,6 +425,12 @@ def train(args):
     if _tripwire is not None:
         callbacks.append(_tripwire)
 
+    # Wide-side covariance spectrum probe: inert unless SA3_COV_PROBE=1.
+    from scripts.wide_covariance_probe import maybe_build as _maybe_cov
+    _cov = _maybe_cov(out_dir=run_dir)
+    if _cov is not None:
+        callbacks.append(_cov)
+
     # Mechanism audit: report which optimizer mechanisms actually affect the run.
     # ON by default (print-only, reads already-computed telemetry); SA3_MECHANISM_AUDIT=0 silences.
     from scripts.mechanism_audit import maybe_build as _maybe_audit
