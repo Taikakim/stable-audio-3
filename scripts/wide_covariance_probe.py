@@ -59,14 +59,34 @@ class WideCovarianceProbe(pl.Callback):
         """Widest 2-D LoRA factors first -- they are the ones we cannot afford exactly."""
         cands = [(n, tuple(p.shape)) for n, p in pl_module.named_parameters()
                  if p.requires_grad and p.ndim == 2 and ("lora_B" in n or "lora_A" in n)]
-        cands.sort(key=lambda kv: -max(kv[1]))
-        self.targets = [n for n, _ in cands[:self.max_tensors]]
+        if not cands:
+            return
+        # Widest first -- those are the ones we cannot afford exactly.
+        widest = max(max(s) for _, s in cands)
+        wide = [(n, s) for n, s in cands if max(s) == widest]
+        # SPREAD ACROSS DEPTH. Sorting by width alone ties across every layer, so the list
+        # stays in named_parameters order and we silently sample the SHALLOWEST layers. The
+        # first real run did exactly that and measured layers 0/1/2 of 24 -- whose effective
+        # ranks were 90/166/228, i.e. rising with depth, so the shallow sample was also the
+        # most optimistic one. Sample evenly instead.
+        import re as _re
+        def _depth(name):
+            m = _re.search(r"layers\.(\d+)\.", name)
+            return int(m.group(1)) if m else -1
+        wide.sort(key=lambda kv: _depth(kv[0]))
+        k = min(self.max_tensors, len(wide))
+        if k and len(wide) > k:
+            idx = [round(i * (len(wide) - 1) / (k - 1)) for i in range(k)] if k > 1 else [0]
+            picked = [wide[i] for i in dict.fromkeys(idx)]
+        else:
+            picked = wide[:k]
+        self.targets = [n for n, _ in picked]
         for n in self.targets:
             self.snaps[n] = []
         print(f"[COV PROBE] watching {len(self.targets)} tensors, "
               f"{self.n_snapshots} snapshots every {self.every} steps:", flush=True)
-        for n, s in cands[:self.max_tensors]:
-            print(f"[COV PROBE]   {s}  {n}", flush=True)
+        for n in self.targets:
+            print(f"[COV PROBE]   depth-spread pick: {n}", flush=True)
 
     def on_after_backward(self, trainer, pl_module):
         if self.done:
@@ -163,16 +183,22 @@ class WideCovarianceProbe(pl.Callback):
 
     @staticmethod
     def _verdict(mass, eff_rank):
+        """Name the rank that reaches 95% mass, rather than pass/fail a fixed k."""
+        target = 0.95
+        need = next((k for k in sorted(mass) if mass[k] >= target), None)
         m256 = mass.get(256, mass.get(128, 0.0))
-        if m256 >= 0.90:
-            return (f"SKETCH IS JUSTIFIED: top-256 holds {m256*100:.1f}% of the variance, so a "
-                    f"rank-128/256 EW-FD sketch can carry the wide side at ~12 MiB.")
-        if m256 >= 0.70:
-            return (f"MARGINAL: top-256 holds {m256*100:.1f}%. A sketch keeps most but not all; "
-                    f"consider block-diagonal plus a low-rank correction.")
-        return (f"SPECTRUM IS FLAT: top-256 holds only {m256*100:.1f}% (effective rank "
-                f"{eff_rank:.0f}). Low-rank CANNOT represent this -- use blocks, or stay "
-                f"one-sided and spend the effort elsewhere.")
+        if need is None:
+            biggest = max(mass)
+            return (f"SPECTRUM TOO FLAT FOR A SKETCH: even top-{biggest} holds only "
+                    f"{mass[biggest]*100:.1f}% (effective rank {eff_rank:.0f}). Low-rank cannot "
+                    f"represent this -- blocks, or stay one-sided.")
+        mib = 12288 * need * 4 / 2**20
+        if need <= 256:
+            return (f"SKETCH IS JUSTIFIED at rank {need}: it reaches {mass[need]*100:.1f}% "
+                    f"(~{mib:.0f} MiB per 12288-wide tensor). Effective rank {eff_rank:.0f}.")
+        return (f"SKETCH VIABLE BUT WANTS RANK {need} ({mass[need]*100:.1f}% mass, ~{mib:.0f} MiB "
+                f"per 12288-wide tensor); rank 256 would keep only {m256*100:.1f}%. "
+                f"Effective rank {eff_rank:.0f} -- weigh against block-diagonal.")
 
 
 def maybe_build(out_dir: str = ".", args=None):
