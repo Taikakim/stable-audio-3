@@ -175,11 +175,20 @@ class WideCovarianceProbe(pl.Callback):
                 f"one-sided and spend the effort elsewhere.")
 
 
-def maybe_build(out_dir: str = "."):
-    if os.environ.get("SA3_COV_PROBE", "") not in ("1", "true", "yes"):
+def maybe_build(out_dir: str = ".", args=None):
+    """Armed by --cov-probe, or by SA3_COV_PROBE=1 for env-driven callers.
+
+    The flag exists because the env route is quietly fragile: writing
+    `SA3_COV_PROBE=1 && python ...` without `export` sets a SHELL variable, which the
+    child process never sees, so the probe stays inert and the run produces no data with
+    no error. That cost a real run on 2026-09-22.
+    """
+    flag = bool(getattr(args, "cov_probe", False)) if args is not None else False
+    env = os.environ.get("SA3_COV_PROBE", "") in ("1", "true", "yes")
+    if not (flag or env):
         return None
-    n = int(os.environ.get("SA3_COV_PROBE_SNAPS", "64"))
-    every = int(os.environ.get("SA3_COV_PROBE_EVERY", "4"))
+    n = int(getattr(args, "cov_probe_snaps", 0) or os.environ.get("SA3_COV_PROBE_SNAPS", "64"))
+    every = int(getattr(args, "cov_probe_every", 0) or os.environ.get("SA3_COV_PROBE_EVERY", "4"))
     print(f"[COV PROBE] armed: {n} snapshots every {every} steps (CPU-resident, no VRAM cost).",
           flush=True)
     return WideCovarianceProbe(n_snapshots=n, every=every, out_dir=out_dir)

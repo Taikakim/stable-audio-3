@@ -427,7 +427,7 @@ def train(args):
 
     # Wide-side covariance spectrum probe: inert unless SA3_COV_PROBE=1.
     from scripts.wide_covariance_probe import maybe_build as _maybe_cov
-    _cov = _maybe_cov(out_dir=run_dir)
+    _cov = _maybe_cov(out_dir=run_dir, args=args)
     if _cov is not None:
         callbacks.append(_cov)
 
@@ -581,6 +581,15 @@ def main():
                      dest="modular_precond_bottleneck",
                      help="Precondition BOTH sides. Off by default: on LoRA factors the wide side "
                           "is up to 12288, and one such eigh measured 7.2 s on this card.")
+    mod.add_argument("--cov-probe", action="store_true", default=False, dest="cov_probe",
+                     help="Measure the wide-side gradient covariance spectrum and write "
+                          "wide_covariance_spectrum.json. Decides whether a low-rank sketch "
+                          "of the wide Kronecker factor is viable at all.")
+    mod.add_argument("--cov-probe-snaps", type=int, default=0, dest="cov_probe_snaps",
+                     help="Gradient snapshots to capture (default 64).")
+    mod.add_argument("--cov-probe-every", type=int, default=0, dest="cov_probe_every",
+                     help="Capture one snapshot every N optimizer steps (default 4). Use 1 "
+                          "on short runs so the horizon fits inside the run.")
     mod.add_argument("--modular-whitening", type=str, default="none",
                      choices=["none", "shampoo", "soap"],
                      dest="modular_whitening",

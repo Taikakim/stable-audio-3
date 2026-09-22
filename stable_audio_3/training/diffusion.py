@@ -875,6 +875,15 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                     var_barrier_loss = excess.pow(2).mean()
                     loss = loss + self.latent_var_weight * var_barrier_loss
                     log_dict["train/var_barrier_loss"] = var_barrier_loss.detach()
+                    # Exposed for the mechanism audit. It must read the ACTUAL hinge, not
+                    # infer it from running_latent_std: std_hat is PER-CHANNEL, so single
+                    # channels routinely exceed the barrier while the mean EMA sits below
+                    # it. Inferring from the EMA reported tier 1 INERT on runs where the
+                    # logged barrier loss was demonstrably non-zero.
+                    self._last_var_barrier_loss = float(var_barrier_loss.detach())
+                    self._max_channel_latent_std = max(
+                        getattr(self, "_max_channel_latent_std", 0.0), float(std_hat.max())
+                    )
 
         # x0-reconstruction ADD-a-term (see __init__): reconstruct the clean latent
         # z0_hat = noised - t*v_pred (rf_z0_hat, SAME as the output-std/stereo blocks)

@@ -128,6 +128,9 @@ class MechanismAuditCallback(pl.Callback):
         self.max_latent_std = 0.0
         self.barrier_weight = 0.0
         self.barrier_thresh = 0.0
+        self.barrier_seen = False
+        self.max_barrier_loss = 0.0
+        self.max_channel_std = 0.0
         self.reported = False
 
     def _sample(self, pl_module, trainer):
@@ -153,9 +156,19 @@ class MechanismAuditCallback(pl.Callback):
             self.max_latent_std = max(self.max_latent_std, float(std))
         self.barrier_weight = float(getattr(pl_module, "latent_var_weight", 0.0) or 0.0)
         self.barrier_thresh = float(getattr(pl_module, "latent_var_barrier", 0.0) or 0.0)
-        if (self.barrier_weight > 0 and self.barrier_thresh > 0
-                and self.max_latent_std > self.barrier_thresh):
-            self.barrier_nonzero = True
+        # Read the ACTUAL hinge. Deriving it from running_latent_std was wrong and produced
+        # a false INERT: std_hat is per-CHANNEL, so channels exceed the barrier while the
+        # mean EMA stays under it. A 2026-09-22 run logged var_barrier_loss 0.002 while this
+        # reported "the hinge stayed 0.0".
+        vb = getattr(pl_module, "_last_var_barrier_loss", None)
+        if vb is not None:
+            self.barrier_seen = True
+            self.max_barrier_loss = max(self.max_barrier_loss, float(vb))
+            if float(vb) > 0:
+                self.barrier_nonzero = True
+        self.max_channel_std = max(
+            self.max_channel_std,
+            float(getattr(pl_module, "_max_channel_latent_std", 0.0) or 0.0))
 
     def on_train_start(self, trainer, pl_module):
         """Catch a Schedule-Free burn-in longer than the run itself.
@@ -220,11 +233,14 @@ class MechanismAuditCallback(pl.Callback):
         elif self.barrier_weight <= 0 or self.barrier_thresh <= 0:
             detail = "disabled (weight or barrier is 0)"
         elif self.barrier_nonzero:
-            detail = (f"latent std reached {self.max_latent_std:.3f} > barrier "
-                      f"{self.barrier_thresh:.3f}")
+            detail = (f"hinge reached {self.max_barrier_loss:.4g}; max CHANNEL std "
+                      f"{self.max_channel_std:.3f} > barrier {self.barrier_thresh:.3f} "
+                      f"(mean-EMA std only {self.max_latent_std:.3f})")
+        elif self.barrier_seen:
+            detail = (f"hinge stayed 0.0; max CHANNEL std {self.max_channel_std:.3f} never "
+                      f"exceeded barrier {self.barrier_thresh:.3f}")
         else:
-            detail = (f"max latent std {self.max_latent_std:.3f} never exceeded barrier "
-                      f"{self.barrier_thresh:.3f}, so the hinge stayed 0.0")
+            detail = "no hinge value observed (module exposed none)"
         if detail is not None:
             lines.append(f"    {'ACTIVE ' if self.barrier_nonzero else 'INERT  '} "
                          f"{'VADD tier 1 (barrier loss)':<32} {detail}")
