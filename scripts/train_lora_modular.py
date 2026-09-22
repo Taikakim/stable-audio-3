@@ -566,10 +566,11 @@ def main():
 
     # ---- Modular sub-flags ----
     mod = p.add_argument_group("Modular optimizer flags")
-    mod.add_argument("--modular-precond-alpha", type=float, default=0.25,
+    mod.add_argument("--modular-precond-alpha", type=float, default=0.125,
                      dest="modular_precond_alpha",
                      help="Mousse Spectral Tempering: curvature exponent alpha in Lambda^-alpha "
-                          "(Algorithm 1 line 6). 0.25 = classic Shampoo inverse fourth root.")
+                          "(Algorithm 1 line 6). Default 0.125 per the paper's Figure 7a ablation, "
+                          "which beats the classic Shampoo 0.25.")
     mod.add_argument("--modular-no-precond-bottleneck", action="store_false", default=True,
                      dest="modular_precond_bottleneck",
                      help="Precondition BOTH sides. Off by default: on LoRA factors the wide side "
@@ -631,9 +632,11 @@ def main():
     mod.add_argument("--modular-beta-precond", type=float, default=0.95,
                      dest="modular_beta_precond",
                      help="Preconditioner covariance EMA beta (default: 0.95)")
-    mod.add_argument("--modular-precond-freq", type=int, default=1,
+    mod.add_argument("--modular-precond-freq", type=int, default=10,
                      dest="modular_precond_freq",
-                     help="Preconditioner update frequency (default: 1)")
+                     help="Preconditioner eigendecomposition refresh interval. Default 10, "
+                          "matching the Mousse reference (dion/dion/mousse.py:80). At 1 this "
+                          "is an eigh per tensor per step.")
     mod.add_argument("--wd-overtraining", "--wd_overtraining", "--modular-wd-overtraining", action="store_true", default=False,
                      dest="wd_overtraining",
                      help="Scale weight decay by sqrt(epochs) according to overtraining factor (Everett & Qiu 2026)")
