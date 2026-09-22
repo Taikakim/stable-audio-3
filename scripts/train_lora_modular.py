@@ -198,6 +198,87 @@ def _remember_project(name: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# run_meta.json -- written AT LAUNCH into the run's own directory (CLAUDE.md "Training runs --
+# write the notes AT LAUNCH"). Pattern: lumi/sbatch/fullft_fleet.sbatch:91. Until 2026-09-22 this
+# script wrote a thin version into the PARENT output dir, so every run overwrote the previous
+# run's file and no run dir carried one.
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    import datetime
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _ask(label: str, current):
+    """Explicit flag wins; otherwise ask on a real terminal; never block an unattended run."""
+    if current:
+        return current
+    if not sys.stdin.isatty():
+        print(f"[run_meta] WARNING: no --{label} given and no tty -- recorded as null. "
+              f"Fill it in run_meta.json before you forget why this run exists.", flush=True)
+        return None
+    try:
+        return input(f"[run_meta] {label} (one line, why this run exists): ").strip() or None
+    except EOFError:
+        return None
+
+
+def _write_run_meta(args, run_dir, lora_config=None, weight_decay=None) -> str:
+    import shlex
+    os.makedirs(run_dir, exist_ok=True)
+    meta_path = os.path.join(run_dir, "run_meta.json")
+    if os.path.exists(meta_path) and args.resume_ckpt:
+        # A resume keeps the launch record; only note the resume.
+        _update_run_meta(meta_path, status="running", resumed=_now_iso(), resume_ckpt=args.resume_ckpt)
+        return meta_path
+    purpose = _ask("purpose", getattr(args, "purpose", None))
+    hypothesis = _ask("hypothesis", getattr(args, "hypothesis", None))
+    meta = {
+        "run": args.name,
+        "created": _now_iso(),
+        "purpose": purpose,
+        "hypothesis": hypothesis,
+        "status": "running",
+        "command": " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv),
+        "script": "stable-audio-3/scripts/train_lora_modular.py",
+        "recipe": {
+            "model": args.model,
+            "adapter": f"{args.adapter_type} rank{args.rank} alpha{args.lora_alpha or args.rank}",
+            "optimizer": args.optimizer,
+            "lr": args.lr,
+            "weight_decay": weight_decay,
+            "batch_size": args.batch_size,
+            "grad_accum": args.accumulate_grad_batches,
+            "epochs": args.epochs,
+            "steps": args.steps,
+            "frames": args.frames,
+            "seed": args.seed,
+            "notes": getattr(args, "run_notes", None),
+        },
+        "dataset": {"subset300": bool(getattr(args, "subset300", False))},
+        "args": {k: (v if isinstance(v, (int, float, str, bool, type(None), list)) else str(v))
+                 for k, v in sorted(vars(args).items())},
+        "result": None,
+        "kim_feedback": None,
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=1)
+    print(f"[run_meta] wrote {meta_path}", flush=True)
+    return meta_path
+
+
+def _update_run_meta(meta_path, **fields) -> None:
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta.update(fields)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=1)
+    except Exception as e:  # never lose a run to bookkeeping
+        print(f"[run_meta] could not update {meta_path}: {e}", flush=True)
+
+
 def _resolve_wandb_project(args) -> str:
     """Explicit flag, then env, then ASK -- offering the last project as the default.
 
@@ -374,6 +455,7 @@ def train(args):
                         "default_whitening": args.modular_whitening,
                         "split_qkv": args.modular_split_qkv,
                         "split_adaln": args.modular_split_adaln,
+                        "lora_a_lr_mult": args.modular_lora_a_lr_mult,
                         **({"spectral_wd": args.weight_decay}
                            if args.weight_decay is not None else {}),
                     },
@@ -547,39 +629,19 @@ def train(args):
         num_sanity_val_steps=0,
     )
 
-    if args.save_dir:
-        os.makedirs(args.save_dir, exist_ok=True)
-        meta_path = os.path.join(args.save_dir, "run_meta.json")
-        meta = {
-            "what_this_is": "LoRA training with Modular Stage-Based Optimizer (ModularOptimizer) on canonical 300 subset.",
-            "optimizer": args.optimizer,
-            "lr": args.lr,
-            "weight_decay": _wd,
-            "batch_size": args.batch_size,
-            "num_workers": args.num_workers,
-            "steps": args.steps,
-            "frames": args.frames,
-            "seed": args.seed,
-            "eval_demos": args.eval_demos,
-            "loss_guard_threshold": args.loss_guard_threshold,
-            "recipe": {
-                "model": args.model,
-                "adapter": f"{args.adapter_type} rank{args.rank} alpha{args.lora_alpha or args.rank}",
-                "whitening": getattr(args, "modular_whitening", None),
-                "split_qkv": getattr(args, "modular_split_qkv", None),
-                "split_adaln": getattr(args, "modular_split_adaln", None),
-            }
-        }
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
-        print(f"[run_meta] Wrote run metadata to {meta_path}")
+    meta_path = _write_run_meta(args, run_dir, lora_config=lora_config, weight_decay=_wd)
 
     if args.resume_ckpt:
         training_wrapper.strict_loading = False
         print(f"[resume] strict_loading=False for {args.resume_ckpt} "
               f"(stripped-base DoRA fat; missing frozen-base keys are expected)")
 
-    trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt)
+    try:
+        trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt)
+    except BaseException as e:
+        _update_run_meta(meta_path, status="crashed", status_why=f"{type(e).__name__}: {e}"[:500])
+        raise
+    _update_run_meta(meta_path, status="done", finished=_now_iso(), global_step=int(trainer.global_step))
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +741,9 @@ def main():
     mod.add_argument("--modular-snr-gate", action="store_true", default=False,
                      dest="modular_snr_gate",
                      help="Enable SNR gate on raw gradient")
+    mod.add_argument("--modular-lora-a-lr-mult", type=float, default=1.0,
+                     help="Multiply the final step size of every lora_A tensor (applied after NorMuon, "
+                          "weight decay unchanged). A's input subspace barely rotates at 1.0.")
     mod.add_argument("--modular-normuon", action="store_true", default=True,
                      dest="modular_normuon",
                      help="Enable NorMuon per-neuron row scaling (default: True)")
@@ -767,6 +832,12 @@ def main():
     p.add_argument("--wandb-project", "--wandb_project", type=str, default=None,
                    dest="wandb_project", help="W&B project name (overrides WANDB_PROJECT env var)")
     p.add_argument("--name", type=str, default="modular_test")
+    p.add_argument("--purpose", type=str, default=None,
+                   help="One line: what question this run answers (and EXPERIMENTS.md id). Asked for on a tty if omitted.")
+    p.add_argument("--hypothesis", type=str, default=None,
+                   help="Expected result / kill-criterion. Asked for on a tty if omitted.")
+    p.add_argument("--run-notes", dest="run_notes", type=str, default=None,
+                   help="Operational traps a future renderer needs (recipe.notes).")
     p.add_argument("--save_dir", "--output-dir", "--output_dir", type=str, default=None,
                    dest="save_dir")
     p.add_argument("--checkpoint_every", type=int, default=500)
