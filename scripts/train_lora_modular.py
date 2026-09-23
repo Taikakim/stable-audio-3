@@ -759,9 +759,9 @@ def main():
                    choices=["lora", "dora", "dora-rows", "dora-cols", "bora"])
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--include", type=str, nargs="*", default=None,
-                   help="Regex patterns for layers to include in LoRA")
+                   help="Name substrings: only layers containing one get LoRA")
     p.add_argument("--exclude", type=str, nargs="*", default=None,
-                   help="Regex patterns for layers to exclude from LoRA")
+                   help="Name substrings: layers containing one are skipped")
     p.add_argument("--lora_checkpoint", type=str, default=None,
                    help="Resume adapter weights from this checkpoint")
 
