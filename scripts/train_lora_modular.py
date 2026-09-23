@@ -511,6 +511,7 @@ def train(args):
                         "var_dampening_power": getattr(args, "var_damp_power", 1.0),
                         "var_wd_boost": getattr(args, "var_wd_boost", 0.0),
                         "radial_brake": getattr(args, "modular_radial_brake", 1.0),
+                        "magnitude_update": args.modular_magnitude_update,
                     },
                     "param_groups": {
                         "default_whitening": args.modular_whitening,
@@ -823,6 +824,10 @@ def main():
     mod.add_argument("--modular-snr-gate", action="store_true", default=False,
                      dest="modular_snr_gate",
                      help="Enable SNR gate on raw gradient")
+    mod.add_argument("--modular-magnitude-update", choices=["additive", "multiplicative"],
+                     default="additive",
+                     help="DoRA magnitude step: additive (m -= lr*sign, can cross zero) or "
+                          "multiplicative (m *= exp(-lr*sign): scale-relative, stays positive).")
     mod.add_argument("--modular-lora-a-lr-mult", type=float, default=1.0,
                      help="Multiply the final step size of every lora_A tensor (applied after NorMuon, "
                           "weight decay unchanged). A's input subspace barely rotates at 1.0.")
