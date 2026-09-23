@@ -702,7 +702,19 @@ def train(args):
     except BaseException as e:
         _update_run_meta(meta_path, status="crashed", status_why=f"{type(e).__name__}: {e}"[:500])
         raise
-    _update_run_meta(meta_path, status="done", finished=_now_iso(), global_step=int(trainer.global_step))
+    # fit() also RETURNS when the loss guard stops a run early -- only a run that reached its
+    # target is "done" (2026-09-23: goa3_avp_r256 hit NaN at step ~6900 and was recorded "done").
+    _target = trainer.max_steps if trainer.max_steps and trainer.max_steps > 0 else None
+    _reached = (int(trainer.global_step) >= _target) if _target else (trainer.current_epoch + 1 >= (args.epochs or 0))
+    _aborts = sorted(f for f in os.listdir(run_dir) if f.startswith("abort_"))
+    if _reached and not _aborts:
+        _update_run_meta(meta_path, status="done", finished=_now_iso(), global_step=int(trainer.global_step))
+    else:
+        _update_run_meta(meta_path, status="stopped_early", finished=_now_iso(),
+                         global_step=int(trainer.global_step),
+                         status_why=(f"stopped at step {int(trainer.global_step)}"
+                                     + (f"; target {_target}" if _target else "")
+                                     + (f"; emergency checkpoint(s): {', '.join(_aborts)}" if _aborts else "")))
 
 
 # ---------------------------------------------------------------------------
