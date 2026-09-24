@@ -24,6 +24,7 @@ dependencies = [
     "ninja",
     "pip",
     "pyyaml",
+    "flash-attn==2.8.4",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +48,12 @@ torchvision = { path = "./torchvision-0.25.0+rocm7.2.3.git82df5f59-cp313-cp313-l
 triton      = { path = "./triton-3.6.0+rocm7.2.3.git4ed88892-cp313-cp313-linux_x86_64.whl" }
 # Local torchcodec source (sibling repo, built against the ROCm torch above).
 torchcodec  = { path = "../torchcodec" }
+# CK (Composable Kernel) flash-attn build for RDNA4/gfx1201 -- ABI-tied to the exact
+# torch build above (2.10.0+rocm7.2.3.git1a270074). MUST be rebuilt (docs/flash-attn-ck-rdna4.md)
+# if torch moves -- a stale wheel here will import-crash (undefined symbol), not silently
+# degrade. Without this pin, `uv sync` will fetch the plain PyPI flash-attn (no CK .so,
+# Triton/aiter fallback only) and silently drop 30-100% of DiT attention throughput.
+flash-attn  = { path = "../my_wheels/flash_attn-2.8.4-cp313-cp313-linux_x86_64.whl" }
 
 [project.scripts]
 stable-audio = "stable_audio_3.cli:main"
