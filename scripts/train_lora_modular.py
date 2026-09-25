@@ -735,6 +735,7 @@ def train(args):
             num_prompts=getattr(args, "eval_num_prompts", 3),
             cfg_rescale=getattr(args, "demo_cfg_rescale", 0.0),
             max_latent_std=getattr(args, "demo_latent_clamp", None),
+            render_inline=getattr(args, "inline_demos", True),
         )
         callbacks.append(eval_cb)
         args.no_demos = True
@@ -1076,6 +1077,12 @@ def main():
                    help="Also render long continuations (ext512, ext303) during eval demos (default: False)")
     p.add_argument("--eval_num_prompts", type=int, default=3,
                    help="Number of canonical prompts to render during eval (default: 3)")
+    p.add_argument("--no-inline-demos", dest="inline_demos", action="store_false", default=True,
+                   help="With --eval_demos: keep the milestone checkpoints and the loss guard, but do NOT render "
+                        "demos inside the training process. Rendering a LIVE DoRA adapter between training steps "
+                        "returns history-dependent NaN/1e11 latents on our ROCm stack (docs/training-findings.md "
+                        "13e). Render afterwards from the checkpoints with scripts/demo_cfg_sweep.py --cfgs 7, "
+                        "which merges the adapter and is exact.")
     p.add_argument("--loss_guard_threshold", type=float, default=1.0,
                    help="Mean epoch loss threshold to trigger abort and emergency save (default: 1.0)")
 

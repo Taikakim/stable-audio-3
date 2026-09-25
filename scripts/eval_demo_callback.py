@@ -160,6 +160,7 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         num_prompts: int = 3,
         cfg_rescale: float = 0.0,
         max_latent_std: float | None = None,
+        render_inline: bool = True,
     ):
         super().__init__()
         self.save_dir = Path(save_dir)
@@ -181,6 +182,8 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
         self.num_prompts = num_prompts
         self.cfg_rescale = cfg_rescale
         self.max_latent_std = max_latent_std
+        # False = milestones save checkpoints only (see --no-inline-demos, training-findings 13e).
+        self.render_inline = render_inline
         self.epoch_losses: list[float] = []
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -204,6 +207,9 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
                 trainer.save_checkpoint(str(ckpt_path))
                 print(f"\n[MILESTONE] Saved checkpoint to {ckpt_path.name}")
             # If demos already exist on disk, skip re-rendering
+            if not self.render_inline:
+                print(f"[DEMO] inline rendering off: render step {step} later with demo_cfg_sweep.py --steps-ckpt {step} --cfgs 7", flush=True)
+                return
             out_dir = self.demos_dir / f"step{step}"
             expected_clips = self.num_prompts * (4 if self.render_continuations else 2)
             if out_dir.exists() and len(list(out_dir.glob("*.wav"))) >= expected_clips:
@@ -259,7 +265,8 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
             trainer.save_checkpoint(str(ckpt_path))
             print(f"[LOSS GUARD] Emergency checkpoint saved: {ckpt_path.name}")
 
-            self._render_demos(trainer, pl_module, tag=f"abort_loss{mean_loss:.3f}_ep{epoch}")
+            if self.render_inline:
+                self._render_demos(trainer, pl_module, tag=f"abort_loss{mean_loss:.3f}_ep{epoch}")
             trainer.should_stop = True
         elif self.render_between_epochs and trainer.global_step >= 100:
             print(f"[DEMO TRIGGER] Epoch {epoch} complete (loss healthy). Rendering between-epoch demos...")
