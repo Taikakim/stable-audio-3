@@ -956,6 +956,18 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         if opt is not None:
             opt.set_loss(loss)
 
+        # Flight recorder (flight_recorder.py): keep references to THIS micro-batch so a
+        # gradient spike found in on_before_optimizer_step can be dumped with its inputs.
+        # References only (no copies, no sync); they are replaced on the next batch.
+        if getattr(self, "flight_recorder_cfg", None):
+            self._flight_stash = {
+                "loss": loss.detach(), "t": t.detach(),
+                "latents": diffusion_input.detach(), "noise": noise.detach(),
+                "per_item_loss": mse_loss_full.detach().mean(dim=tuple(range(1, mse_loss_full.ndim))),
+                "prompts": [md.get("prompt") for md in metadata],
+                "files": [md.get("latent_filename", md.get("path")) for md in metadata],
+            }
+
         #p.tick("log_dict")
         #print(f"Profiler: {p}")
         return loss
@@ -1099,6 +1111,23 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         # Arm per-stage component telemetry
         if hasattr(optimizer, "_telem_on"):
             optimizer._telem_on = True
+
+        # Raw-gradient telemetry + flight recorder. This hook runs after backward and BEFORE
+        # Lightning's gradient clipping, so these are the raw gradients. Diagnostic only.
+        cfg = getattr(self, "flight_recorder_cfg", None)
+        if cfg:
+            fr = getattr(self, "_flight_recorder", None)
+            if fr is None:
+                from stable_audio_3.training.flight_recorder import FlightRecorder
+                fr = FlightRecorder(named_params=self.diffusion.named_parameters(), **cfg)
+                self._flight_recorder = fr
+                print(f"[flight-recorder] armed: {len(fr.tele.names)} trainable tensors, "
+                      f"z>{fr.z_thresh}, window {fr.window}, <= {fr.max_dumps} dumps -> {fr.dir}", flush=True)
+            fr.stash = getattr(self, "_flight_stash", None)
+            m = fr.observe(self.global_step)
+            if m and (m.get("grad/flight_trigger") or self.global_step % self._staggered_logger.every_n_steps == 0):
+                for k, v in m.items():
+                    log_metric(self.logger, k, float(v), step=self.global_step)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         # EMA update AFTER the optimizer step (Lightning fires this post-step). No-op unless

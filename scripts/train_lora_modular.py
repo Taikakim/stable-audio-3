@@ -676,6 +676,13 @@ def train(args):
     os.makedirs(run_dir, exist_ok=True)
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
 
+    # Raw-gradient telemetry + outlier flight recorder (diagnostic only; see
+    # stable_audio_3/training/flight_recorder.py and docs/train_lora_modular.md §7).
+    if args.flight_recorder:
+        training_wrapper.flight_recorder_cfg = dict(
+            run_dir=run_dir, z_thresh=args.flight_z, window=args.flight_window,
+            warmup=args.flight_warmup, max_dumps=args.flight_max_dumps, min_gap=args.flight_min_gap)
+
     logger = _build_logger(args, run_dir, training_wrapper)
 
     ckpt_callback = pl.callbacks.ModelCheckpoint(
@@ -898,6 +905,23 @@ def main():
                      dest="modular_precond_bottleneck",
                      help="Precondition BOTH sides. Off by default: on LoRA factors the wide side "
                           "is up to 12288, and one such eigh measured 7.2 s on this card.")
+    fr = p.add_argument_group("Raw-gradient telemetry + flight recorder (diagnostic, any optimizer)")
+    fr.add_argument("--flight-recorder", action=argparse.BooleanOptionalAction, default=True,
+                    dest="flight_recorder",
+                    help="Log raw (pre-clip) grad norms per kind as grad/raw_norm_* every step, "
+                         "and dump an incident (batch prompts/files/t/latents/noise, previous "
+                         "steps, top layers) to <run>/incidents/ when the norm spikes or goes "
+                         "non-finite. Never changes training. Default on.")
+    fr.add_argument("--flight-z", type=float, default=6.0, dest="flight_z",
+                    help="Spike threshold: robust z-score of log grad-norm (median/MAD). Default 6.")
+    fr.add_argument("--flight-window", type=int, default=200, dest="flight_window",
+                    help="Steps of history for the yardstick. Default 200.")
+    fr.add_argument("--flight-warmup", type=int, default=50, dest="flight_warmup",
+                    help="Steps before a spike may fire (non-finite grads always fire). Default 50.")
+    fr.add_argument("--flight-max-dumps", type=int, default=5, dest="flight_max_dumps",
+                    help="Max incidents saved per run. Default 5.")
+    fr.add_argument("--flight-min-gap", type=int, default=25, dest="flight_min_gap",
+                    help="Min steps between saved incidents. Default 25.")
     mod.add_argument("--cov-probe", action="store_true", default=False, dest="cov_probe",
                      help="Measure the wide-side gradient covariance spectrum and write "
                           "wide_covariance_spectrum.json. Decides whether a low-rank sketch "
