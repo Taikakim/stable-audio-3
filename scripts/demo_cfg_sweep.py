@@ -113,6 +113,9 @@ def main():
     ap.add_argument("--frames", nargs="+", type=int, default=[216, 256],
                     help="clip lengths in frames; the trainer's are 216 ('20s') and --frames ('48s', 256 on this run)")
     ap.add_argument("--only-prompts", nargs="*", default=None)
+    ap.add_argument("--write-demos", action="store_true",
+                    help="also copy the cfg-7 clips into <run-dir>/demos/step<N>/ under the demo callback's names "
+                         "(<tag>_<prompt>_20s / _48s), so runs trained with --no-inline-demos get the usual folders")
     ap.add_argument("--base", default="medium-base")
     ap.add_argument("--no-merge", dest="merge", action="store_false",
                     help="keep the adapter as a live parametrization (reproduces the ROCm nondeterminism; diagnostic only)")
@@ -168,6 +171,16 @@ def main():
                         sf.write(str(out / tag / f"{stem}.wav"), a, model.sample_rate, subtype="PCM_16")
                     with open(results, "a") as f:
                         f.write(json.dumps(rec) + "\n")
+                    if args.write_demos and c == 7.0 and args.weights == "x":
+                        import shutil
+                        dd = args.run_dir / "demos" / f"step{step}"
+                        dd.mkdir(parents=True, exist_ok=True)
+                        # the callback names the 216-frame clip "20s" and the --frames clip "48s"
+                        suffix = "20s" if frames == 216 else "48s"
+                        for ext in (".wav", ".z0.npy"):
+                            src = out / tag / f"{stem}{ext}"
+                            if src.exists():
+                                shutil.copy2(src, dd / f"step{step}_{p['id']}_{suffix}{ext}")
                     print(f"[sweep] {stem}: finite {rec['finite_frac']:.4f}  pre-clamp std {rec['pre_clamp_std']}  "
                           f"max|z| {rec['max_abs']}", flush=True)
         del model

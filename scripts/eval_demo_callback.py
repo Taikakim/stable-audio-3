@@ -208,7 +208,7 @@ class ModularDemoAndLossGuardCallback(pl.Callback):
                 print(f"\n[MILESTONE] Saved checkpoint to {ckpt_path.name}")
             # If demos already exist on disk, skip re-rendering
             if not self.render_inline:
-                print(f"[DEMO] inline rendering off: render step {step} later with demo_cfg_sweep.py --steps-ckpt {step} --cfgs 7", flush=True)
+                print(f"[DEMO] inline rendering off: render step {step} later with demo_cfg_sweep.py --run-dir <run> --steps-ckpt {step} --cfgs 7 --write-demos", flush=True)
                 return
             out_dir = self.demos_dir / f"step{step}"
             expected_clips = self.num_prompts * (4 if self.render_continuations else 2)
