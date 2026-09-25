@@ -683,6 +683,8 @@ def train(args):
         grad_clip_mode="norm",
         latent_var_barrier=(args.var_dampening if args.var_dampening is not None else 0.0),
         latent_var_weight=(args.var_barrier_weight if args.var_dampening is not None else 0.0),
+        subspace_loss_basis=args.subspace_loss_basis,
+        subspace_loss_weight=args.subspace_loss_weight,
     )
 
     # ---- Callbacks ----
@@ -1026,6 +1028,18 @@ def main():
     mod.add_argument("--modular-radial-brake", type=float, default=1.0,
                      dest="modular_radial_brake",
                      help="Radial brake soft-limiting scale for parameter norm expansion (NVIDIA RadialBrakeHook, e.g. 0.8; 1.0=disabled)")
+
+    # ---- Melody-subspace loss (ported from train_lora.py, W 2026-09-26) ----
+    # The loss lives in DiffusionCondTrainingWrapper (which ModularTrainingWrapper inherits), so
+    # this only passes the flags through. It computes on the RAW error and was designed for
+    # loss_normalization="none" -- this trainer never sets it, so the default "none" holds.
+    sub = p.add_argument_group("Melody-subspace loss (subloss arms)")
+    sub.add_argument("--subspace-loss-basis", "--subspace_loss_basis", dest="subspace_loss_basis", default=None,
+                     help="npz with orthonormal latent-subspace rows (`basis15`, or first 15 of `melody_basis`), "
+                          "e.g. lumi/melody_subspace15_selective_v3.npz (the subloss_k24 basis)")
+    sub.add_argument("--subspace-loss-weight", "--subspace_loss_weight", dest="subspace_loss_weight",
+                     type=float, default=1.0,
+                     help="K: the RF error's share inside the subspace is weighted K x; 1.0 = off (byte-identical)")
 
     # ---- Variance-Aware Dynamic Dampening (VADD) ----
     vadd = p.add_argument_group("Variance-Aware Dynamic Dampening (VADD)")
