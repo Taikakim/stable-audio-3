@@ -139,6 +139,21 @@ class ModularTrainingWrapper(DiffusionCondTrainingWrapper):
     For all other optimizer types, delegates to the parent's configure_optimizers().
     """
 
+    def on_train_start(self):
+        """Resume guard for checkpoints written before ModularOptimizer saved its step count.
+        Lightning has restored global_step and the optimizer state by now; a counter still
+        behind global_step means the checkpoint predates the fix, and left alone it would restart
+        LR warmup, the Schedule-Free burn-in (averaging OFF, x overwritten by z) and the
+        momentum bias corrections from 0 (training-findings 20a)."""
+        opts = self.optimizers()
+        for o in (opts if isinstance(opts, (list, tuple)) else [opts]):
+            inner = getattr(o, "optimizer", o)
+            if hasattr(inner, "get_step_count") and hasattr(inner, "set_step_count"):
+                if inner.get_step_count() < self.global_step:
+                    print(f"[resume] ModularOptimizer step count {inner.get_step_count()} -> "
+                          f"{self.global_step} (checkpoint predates the saved counter)", flush=True)
+                    inner.set_step_count(self.global_step)
+
     def configure_optimizers(self):
         diffusion_opt_config = self.optimizer_configs['diffusion']
         opt_type = diffusion_opt_config['optimizer'].get('type')
