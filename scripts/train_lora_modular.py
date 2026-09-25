@@ -784,7 +784,11 @@ def train(args):
               f"(stripped-base DoRA fat; missing frozen-base keys are expected)")
 
     try:
-        trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt)
+        # weights_only=False: torch's safe loader refuses the optimizer state's own classes
+        # (e.g. modular_opt.preconditioners.ShampooPreconditioner), so a Shampoo run could not
+        # resume at all. Resume checkpoints are always our own files.
+        trainer.fit(training_wrapper, dataloader, ckpt_path=args.resume_ckpt,
+                    weights_only=False if args.resume_ckpt else None)
     except BaseException as e:
         _update_run_meta(meta_path, status="crashed", status_why=f"{type(e).__name__}: {e}"[:500])
         raise
