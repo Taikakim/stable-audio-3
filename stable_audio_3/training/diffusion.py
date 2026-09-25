@@ -46,6 +46,48 @@ def get_alphas_sigmas(t):
     return torch.cos(t * torch.pi / 2), torch.sin(t * torch.pi / 2)
 
 
+def _optimizer_current_lr(opt) -> float:
+    """Read an optimizer's CURRENTLY-EFFECTIVE lr, for the `train/lr` log line.
+
+    Fix round 2026-09-24 (Opus critic item 4): `train/lr` used to read
+    `param_groups[0]['lr']` unconditionally. That is already stale during warmup for
+    ModularOptimizer/FusionOpt too (both compute a local `warm_factor`/`warmup` multiplier
+    inside step() and apply it to the update directly -- neither writes the ramped value
+    back into param_groups; see modular_opt/optimizer.py's `warm_factor` at step()). This
+    helper does not attempt to fix that pre-existing gap (out of scope here, and those two
+    optimizers key their warmup off `param_groups[0]['warmup_steps'] + self._step_count`,
+    a different location than LoRA-TSD's).
+
+    BatchedLoRATSD (`--optimizer lora_tsd`) is the same story: CONTRACT.md does not require
+    it to touch param_groups, and as shipped (checked against batched.py 2026-09-24) it
+    doesn't -- `param_groups[0]['lr']` stays pinned at the constructor value for the whole
+    run, so warmup is invisible in the log and a resume shows the checkpoint's stale
+    original value forever, not the current warmed-up one.
+
+    Rather than take a live dependency on worker B writing `g['lr'] = lr_t` into
+    param_groups each step (a coordination race this file shouldn't have to win), read
+    LoRA-TSD's OWN attributes -- `.lr`, `.warmup_steps`, `._step` -- and reproduce its
+    linear-warmup formula verbatim (matches `BatchedLoRATSD._warmup_scale`:
+    `min(1.0, step / warmup_steps)`). This duplicates one line of B's logic outside
+    lora_tsd/; if `_warmup_scale`'s formula ever changes, this drifts out of sync with it
+    (a real coupling cost, accepted to avoid depending on a change to a file this repo
+    doesn't own). Falls back to `param_groups[0]['lr']`, unchanged, for every other
+    optimizer.
+    """
+    base_lr = getattr(opt, "lr", None)
+    warmup_steps = getattr(opt, "warmup_steps", None)
+    step_count = getattr(opt, "_step", None)
+    if base_lr is not None and warmup_steps is not None and step_count is not None:
+        # training_step logs BEFORE this step's optimizer.step() increments _step, so the lr
+        # this step will actually use is the (_step + 1) one (final critic, 2026-09-25).
+        scale = min(1.0, (step_count + 1) / warmup_steps) if warmup_steps and warmup_steps > 0 else 1.0
+        return float(base_lr) * scale
+    try:
+        return opt.param_groups[0]['lr']
+    except Exception:
+        return float('nan')
+
+
 class SimpleEMA(torch.nn.Module):
     """Minimal self-contained weight-EMA (ema_pytorch was stripped from this SA3 fork; the
     wrapper's .ema_model reads survived but the build+update did not). Shadows `model`'s params
@@ -724,7 +766,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         log_dict = {
             'train/std_data': std_data,
             'train/std_targets': std_targets,
-            'train/lr': self.trainer.optimizers[0].param_groups[0]['lr']
+            'train/lr': _optimizer_current_lr(self.trainer.optimizers[0])
         }
 
         p.tick("std_compute")
@@ -1076,6 +1118,21 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 opt_inst._comp_telem = {}
                 if hasattr(opt_inst, "_telem_on"):
                     opt_inst._telem_on = False
+
+            # LoRA-TSD (BatchedLoRATSD): duck-typed on `last_stats` (CONTRACT.md's telemetry
+            # dict, refreshed every step() -- dW_norm_mean, clip_frac, qr_fallbacks). No
+            # isinstance/import of lora_tsd needed. Not cleared after logging (unlike
+            # _comp_telem above): last_stats is a snapshot the optimizer OVERWRITES on its
+            # own next step(), not an accumulate-then-drain buffer, so clearing it here would
+            # just make it read 0/0/0 between steps for no reason.
+            # Logged once per optimizer step: with accumulate_grad_batches > 1 this hook fires on
+            # every micro-batch while last_stats only changes on a real step (final critic).
+            _tsd_step = getattr(opt_inst, "_step", None)
+            if (hasattr(opt_inst, "last_stats") and opt_inst.last_stats
+                    and _tsd_step != getattr(self, "_tsd_logged_step", None)):
+                self._tsd_logged_step = _tsd_step
+                for k, v in opt_inst.last_stats.items():
+                    log_metric(self.logger, f"train/tsd_{k}", float(v), step=self.global_step)
 
     def on_save_checkpoint(self, checkpoint):
         if self.lora_config is not None:

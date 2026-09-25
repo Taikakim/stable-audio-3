@@ -102,6 +102,29 @@ class ExceptionCallback(pl.Callback):
         print(f"{type(err).__name__}: {err}")
 
 
+def build_lora_tsd_optimizer(route_root, opt_cfg: dict):
+    """Construct BatchedLoRATSD over route_root's trainable named params.
+
+    Factored out of configure_optimizers() so it can be exercised in a CPU-only unit/smoke
+    test without a Lightning trainer or a GPU: pass any nn.Module whose parameter names look
+    like `....lora_A` / `....lora_B` / `....magnitude` (see CONTRACT.md pairing rule) and a
+    config dict matching BatchedLoRATSD's constructor kwargs (lr, momentum, ball_iters,
+    max_delta_norm, balance, lr_magnitude, warmup_steps, ...).
+
+    Imports stable_audio_tools.training.lora_tsd LAZILY -- that package's __init__.py pulls
+    in both reference.py and batched.py, and batched.py is worker B's parallel deliverable
+    (may not exist yet). Importing at module load time would break this script for every
+    OTHER --optimizer choice too.
+    """
+    from stable_audio_tools.training.lora_tsd import BatchedLoRATSD
+
+    named_params = [(n, p) for n, p in route_root.named_parameters() if p.requires_grad]
+    if not named_params:
+        raise ValueError("build_lora_tsd_optimizer: route_root has no requires_grad params "
+                          "-- nothing for LoRA-TSD to pair/train.")
+    return BatchedLoRATSD(named_params, **opt_cfg)
+
+
 # ---------------------------------------------------------------------------
 # ModularTrainingWrapper — subclass that adds ModularOptimizer dispatch
 # ---------------------------------------------------------------------------
@@ -119,6 +142,30 @@ class ModularTrainingWrapper(DiffusionCondTrainingWrapper):
     def configure_optimizers(self):
         diffusion_opt_config = self.optimizer_configs['diffusion']
         opt_type = diffusion_opt_config['optimizer'].get('type')
+
+        if opt_type == 'LoRATSD':
+            # Handled here, NOT delegated to the parent's configure_optimizers(): that path
+            # (stable_audio_3/training/diffusion.py) only ever builds a bare list of
+            # Parameters (or falls through to create_optimizer_from_config, which doesn't
+            # know the "LoRATSD" type). BatchedLoRATSD needs NAMED params to pair lora_A
+            # with lora_B by prefix (CONTRACT.md), so it must be constructed here.
+            opt_cfg = diffusion_opt_config['optimizer'].get('config', {})
+            # Same route root as the ModularOptimizer branch below, so conditioner LoRA
+            # params are included when training a LoRA/DoRA adapter.
+            route_root = self.diffusion if self.lora_config is not None else self.diffusion.model
+            optimizer = build_lora_tsd_optimizer(route_root, opt_cfg)
+
+            try:
+                from torch.distributed import get_rank
+                rank = get_rank()
+            except Exception:
+                rank = 0
+            if rank == 0:
+                n_trainable = sum(1 for _, p in route_root.named_parameters() if p.requires_grad)
+                print(f"BatchedLoRATSD: {n_trainable} trainable named params routed, "
+                      f"optimizer built with config {opt_cfg}")
+
+            return [optimizer]
 
         if opt_type != 'ModularOptimizer':
             # Delegate to parent for FusionOpt, AdamW, Lion, etc.
@@ -556,6 +603,33 @@ def train(args):
                 }
             }
         }
+    elif args.optimizer == "lora_tsd":
+        # LoRA-TSD (stable_audio_tools.training.lora_tsd.BatchedLoRATSD): a Muon-style
+        # spectral step on the tangent space of B.A, not on A and B separately. No weight
+        # decay, no Schedule-Free, no ModularOptimizer mechanisms -- see CONTRACT.md and
+        # docs/handovers/2026-09-24-lora-tsd-batched-port.md. `_wd` is deliberately NOT
+        # threaded through: this optimizer has no weight-decay concept, and putting the
+        # (unused) default in its config would make run_meta.json's recipe.weight_decay
+        # lie about what the run did.
+        optimizer_config = {
+            "diffusion": {
+                "optimizer": {
+                    "type": "LoRATSD",
+                    "config": {
+                        "lr": args.lr,
+                        "momentum": args.tsd_momentum,
+                        "ball_iters": args.tsd_ball_iters,
+                        "max_delta_norm": args.tsd_max_delta_norm,
+                        "balance": args.tsd_balance,
+                        # NOT args.lr as a fallback: lr and lr_magnitude live on different
+                        # scales (see --tsd-lr-magnitude's help). Default is 5e-4, fixed,
+                        # not derived from --lr.
+                        "lr_magnitude": args.tsd_lr_magnitude,
+                        "warmup_steps": args.warmup_steps,
+                    },
+                }
+            }
+        }
     else:  # adamw
         optimizer_config = {
             "diffusion": {
@@ -691,7 +765,10 @@ def train(args):
         num_sanity_val_steps=0,
     )
 
-    meta_path = _write_run_meta(args, run_dir, lora_config=lora_config, weight_decay=_wd)
+    # LoRA-TSD has no weight-decay concept -- recording _wd here would put a value in
+    # run_meta.json's recipe.weight_decay that was never applied to a single step.
+    _recorded_wd = None if args.optimizer == "lora_tsd" else _wd
+    meta_path = _write_run_meta(args, run_dir, lora_config=lora_config, weight_decay=_recorded_wd)
 
     if args.resume_ckpt:
         training_wrapper.strict_loading = False
@@ -767,12 +844,48 @@ def main():
 
     # ---- Optimizer ----
     p.add_argument("--optimizer", type=str, default="modular",
-                   choices=["modular", "fusion", "adamw", "lion"],
-                   help="Optimizer type (default: modular)")
+                   choices=["modular", "fusion", "adamw", "lion", "lora_tsd"],
+                   help="Optimizer type (default: modular). lora_tsd = LoRA-TSD "
+                        "(experimental, draft, unit-tested only): a spectral step sized on "
+                        "the adapter's actual weight change B.A instead of A and B "
+                        "separately -- see docs/train_lora_modular.md §5e.")
     p.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
     p.add_argument("--weight_decay", "--modular-wd", "--modular_wd", type=float, default=0.01,
-                   dest="weight_decay", help="Weight decay (default: 0.01)")
+                   dest="weight_decay", help="Weight decay (default: 0.01). Ignored by "
+                        "--optimizer lora_tsd, which has no weight-decay concept.")
     p.add_argument("--warmup-steps", "--warmup_steps", type=int, default=0, dest="warmup_steps")
+
+    # ---- LoRA-TSD flags (--optimizer lora_tsd only) ----
+    tsd = p.add_argument_group("LoRA-TSD flags (--optimizer lora_tsd only)")
+    tsd.add_argument("--tsd-ball-iters", type=int, default=1, dest="tsd_ball_iters",
+                     help="Number of tangent-space orthogonalisation sweeps per step "
+                          "(the paper's 'ball' iteration). More = closer to an exact "
+                          "spectral step but slower; default 1, paper default 5.")
+    tsd.add_argument("--tsd-max-delta-norm", type=float, default=0.1, dest="tsd_max_delta_norm",
+                     help="Per-adapter clip on the size of the step actually applied to B.A "
+                          "(Frobenius norm), so no single layer's weight can jump too far in "
+                          "one step regardless of lr. Bounds the change in B.A itself, not "
+                          "the model weight -- the weight moves by (lora_alpha/rank) x this "
+                          "per step. Default 0.1.")
+    tsd.add_argument("--tsd-momentum", type=float, default=0.95, dest="tsd_momentum",
+                     help="Momentum on the raw A/B gradients before the spectral step "
+                          "(0 disables momentum). Default 0.95.")
+    tsd.add_argument("--tsd-balance", type=str, default="norm", choices=["off", "norm"],
+                     dest="tsd_balance",
+                     help="Whether to rebalance ||A|| against ||B|| after each step so "
+                          "neither factor grows lopsided while B.A stays the same. "
+                          "Default norm (rebalance every step).")
+    tsd.add_argument("--tsd-lr-magnitude", type=float, default=5e-4, dest="tsd_lr_magnitude",
+                     help="Learning rate for the DoRA magnitude scalars (the multiplicative "
+                          "sign step, m *= exp(-lr_mag*sign(momentum_buf))). Default 5e-4 -- "
+                          "NOT --lr. LoRA-TSD's --lr lives on a different scale (paper 5e-3, "
+                          "a unit-spectral-norm step later clipped by --tsd-max-delta-norm); "
+                          "at that scale the magnitude sign step would be ~10x the validated "
+                          "modular multiplicative-magnitude step (5e-4), which is the exact "
+                          "size that walked small global-conditioning magnitudes (~0.13) "
+                          "through zero and NaN'd goa3_avp_r256_2026-09-23 (training-findings "
+                          "A1, --modular-magnitude-update additive). 5e-4 matches the "
+                          "validated modular step instead of inheriting --lr's scale.")
 
     # ---- Modular sub-flags ----
     mod = p.add_argument_group("Modular optimizer flags")

@@ -52,6 +52,39 @@ _MECHANISMS = {
 _TOL = 1e-9
 
 
+def _audit_lora_tsd_args(args, g) -> list[str]:
+    """Static check for --optimizer lora_tsd: modular/fusion-only flags (and --weight_decay,
+    which lora_tsd has no concept of) that were left non-default are silently inert under
+    LoRA-TSD -- warn so a run isn't credited to a mechanism that never ran (the same
+    accept-but-ignore failure this module exists to catch, just in the other direction: this
+    time the flag that's inert belongs to the OTHER optimizer family).
+    """
+    warn: list[str] = []
+    # attr -> (identity/default value, human flag name(s))
+    _checks = {
+        "weight_decay": (0.01, "--weight_decay/--modular-wd"),
+        "modular_whitening": ("none", "--modular-whitening"),
+        "modular_escape_velocity": (False, "--modular-escape-velocity/--modular-ev"),
+        "modular_snr_gate": (False, "--modular-snr-gate"),
+        "modular_schedule_free": (True, "--modular-schedule-free/--modular-no-schedule-free"),
+        "modular_normuon": (True, "--modular-normuon/--modular-no-normuon"),
+        "modular_radial_brake": (1.0, "--modular-radial-brake"),
+        "wd_overtraining": (False, "--wd-overtraining"),
+        "modular_lora_a_lr_mult": (1.0, "--modular-lora-a-lr-mult"),
+        "modular_magnitude_update": ("additive", "--modular-magnitude-update"),
+        "var_dampening": (None, "--var-dampening"),
+        "cov_probe": (False, "--cov-probe"),
+    }
+    for attr, (default, flag) in _checks.items():
+        val = g(attr)
+        if val != default:
+            warn.append(f"{flag} is set (={val!r}) but --optimizer lora_tsd ignores it: "
+                        f"LoRA-TSD has no ModularOptimizer/FusionOpt mechanisms (no weight "
+                        f"decay, no Schedule-Free, no whitening, no escape velocity, no VADD "
+                        f"step-dampening). It has no effect on this run.")
+    return warn
+
+
 def audit_args(args) -> list[str]:
     """Static reachability check: flags that cannot reach code given the other flags.
 
@@ -60,6 +93,25 @@ def audit_args(args) -> list[str]:
     """
     warn: list[str] = []
     g = lambda n, d=None: getattr(args, n, d)
+
+    if g("optimizer") == "lora_tsd":
+        return _audit_lora_tsd_args(args, g)
+
+    # Symmetric check, for EVERY non-lora_tsd optimizer (modular, fusion, adamw, lion):
+    # --tsd-* flags set while not training with lora_tsd are just as silently inert as the
+    # reverse, and are easy to leave behind after switching --optimizer back.
+    _tsd_checks = {
+        "tsd_ball_iters": (1, "--tsd-ball-iters"),
+        "tsd_max_delta_norm": (0.1, "--tsd-max-delta-norm"),
+        "tsd_momentum": (0.95, "--tsd-momentum"),
+        "tsd_balance": ("norm", "--tsd-balance"),
+        "tsd_lr_magnitude": (5e-4, "--tsd-lr-magnitude"),
+    }
+    for attr, (default, flag) in _tsd_checks.items():
+        val = g(attr)
+        if val != default:
+            warn.append(f"{flag} is set (={val!r}) but --optimizer is "
+                        f"{g('optimizer')!r}, not lora_tsd: this flag has no effect.")
 
     if g("optimizer") != "modular":
         return warn
@@ -208,8 +260,18 @@ class MechanismAuditCallback(pl.Callback):
 
     def report(self, trainer, final: bool):
         if not self.seen:
-            print("\n[MECHANISM AUDIT] No component telemetry seen -- cannot judge activity. "
-                  "This means the optimizer never populated _comp_telem.", flush=True)
+            opt_name = getattr(self.args, "optimizer", None) if self.args is not None else None
+            if opt_name is not None and opt_name != "modular":
+                # Not an error: this audit only understands ModularOptimizer's per-component
+                # telemetry (_comp_telem). fusion/adamw/lion/lora_tsd optimizers never
+                # populate it, by design -- say so once and stop, rather than printing
+                # something that reads like every mechanism failed.
+                print(f"\n[MECHANISM AUDIT] --optimizer {opt_name!r} is not 'modular' -- this "
+                      f"runtime audit only understands ModularOptimizer's telemetry, "
+                      f"skipping.\n", flush=True)
+            else:
+                print("\n[MECHANISM AUDIT] No component telemetry seen -- cannot judge activity. "
+                      "This means the optimizer never populated _comp_telem.", flush=True)
             return
         head = "FINAL" if final else f"step {trainer.global_step}"
         lines = [f"\n[MECHANISM AUDIT] {head} -- is each mechanism actually doing anything?"]
