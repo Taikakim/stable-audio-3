@@ -13,5 +13,58 @@ export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE PYTORCH_CUDA_ALLOC_CONF=expandabl
 FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MIOPEN_FIND_MODE=2 PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0 SA3_COV_PROBE=1 && /home/kim/Projects/SAO/.venv/bin/python /home/kim/Projects/SAO/stable-audio-3/scripts/train_lora_modular.py --subset300 --frames 256 --model medium-base --rank 128 --lora_alpha 128 --adapter_type dora-rows --name modular_2026-09-22 --output-dir /run/media/kim/Mantu/sa3_lora_runs/ --batch-size 32 --num-workers 10 --epochs 10 --lr 1e-3 --warmup-steps 75 --optimizer modular --modular-lmo-poly cubic5 --modular-schedule-free --modular-sf-c-warmup 75 --modular-sf-r 1.0 --modular-ev --modular-radial-brake 0.8 --modular-wd 0.02 --modular-wd-overtraining --var-dampening 1.20 --var-barrier-weight 0.1 --var-damp-opt --eval_demos 2>&1 | tee /tmp/modular_sfswap.log
 
 23.9. duplicate with bigger dataset.
+This was quite clean, but I still kind of recall that earlier runs learned style better without degradation
 
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MIOPEN_FIND_MODE=3 PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=0 && cd /home/kim/Projects/SAO && .venv/bin/python stable-audio-3/scripts/train_lora_modular.py --encoded_dir /home/kim/Projects/latents_sa3,/run/media/kim/Kosmos/latents_avp,/run/media/kim/Kosmos/latents_goa_bigset --caption_sidecar ,/home/kim/Projects/SAO/lumi/avp_captions_tiered.json,/run/media/kim/Kosmos/latents_goa_bigset/goa_archive_caption_sidecar.json --caption_probs "0,0.9,0.1;0,0.9,0.1;0.5,0.5,0" --frames 256 --model medium-base --rank 128 --lora_alpha 128 --adapter_type dora-rows --name goa3_avp_r256_2026-09-23 --output-dir /run/media/kim/Mantu/sa3_lora_runs --batch-size 32 --num-workers 10 --lr 6e-4 --warmup-steps 320 --optimizer modular --modular-lmo-poly cubic5 --modular-schedule-free --modular-sf-c-warmup 1000 --modular-sf-r 1.0 --modular-wd 0.02 --modular-wd-overtraining --eval_demos --steps 10144 --eval_milestones 1268 2536 3804 5072 6340 7608 8876 10144 --checkpoint_every 200000 --purpose 'Overnight r256 DoRA on goa (latents_sa3) + avp (tiered captions) + goa bigset (v5 captions, T1/T2); modular recipe, SF averaging delayed to step 1000 (~1.6 epochs undamped)' --hypothesis 'Clean like audition_160ep; more goa + r256 moves toward the 90s goa sound' 2>&1 | tee /tmp/goa3_avp_r256.log
+
+24.9.
+What's built: --modular-magnitude-update multiplicative. With it, each DoRA magnitude scalar moves by a fraction of its own value per step, rather than a fixed amount: m ← m·exp(−lr·sign). So a 0.13 scalar moves as carefully as a 2.4 one, and none can go negative. The default stays additive, so existing recipes behave exactly as before. Commits: 3197c28 (optimizer + tests), a7de168 (trainer flag), plus manual updates.
+-> NaN
+
+export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MIOPEN_FIND_MODE=2 PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=1 && cd /home/kim/Projects/SAO && .venv/bin/python stable-audio-3/scripts/train_lora_modular.py --encoded_dir /home/kim/Projects/latents_sa3,/run/media/kim/Kosmos/latents_avp,/run/media/kim/Kosmos/latents_goa_bigset --caption_sidecar ,/home/kim/Projects/SAO/lumi/avp_captions_tiered.json,/run/media/kim/Kosmos/latents_goa_bigset/goa_archive_caption_sidecar.json --caption_probs "0,0.9,0.1;0,0.9,0.1;0.5,0.5,0" --frames 256 --model medium-base --rank 128 --lora_alpha 128 --adapter_type dora-rows --name goa3_avp_r128_magmult_2026-09-24 --output-dir /run/media/kim/Mantu/sa3_lora_runs --batch-size 32 --num-workers 10 --steps 10144 --lr 6e-4 --warmup-steps 1000 --optimizer modular --modular-lmo-poly cubic5 --modular-schedule-free --modular-sf-c-warmup 1000 --modular-sf-r 1.0 --modular-wd 0.02 --modular-wd-overtraining --modular-magnitude-update multiplicative --eval_demos --eval_milestones 1268 2536 3804 5072 6340 7608 8876 10144 --checkpoint_every 100000 --purpose 'Retry of goa3_avp_r256_2026-09-23 (NaN at ~6900 from DoRA magnitudes crossing zero) with ONLY --modular-magnitude-update multiplicative added' --hypothesis 'Passes step 6900 with no NaN; global-conditioning magnitudes stay positive; clips at 5072 match or beat the original' 2>&1 | tee /tmp/goa3_magmult.log
+
+Trying with Shampoo and b16, lr 2e-4
+export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE \
+       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+       MIOPEN_FIND_MODE=2 \
+       PYTORCH_TUNABLEOP_ENABLED=0 \
+       PYTORCH_TUNABLEOP_TUNING=0 && \
+cd /home/kim/Projects/SAO && \
+.venv/bin/python stable-audio-3/scripts/train_lora_modular.py \
+  --encoded_dir /home/kim/Projects/latents_sa3,/run/media/kim/Kosmos/latents_avp,/run/media/kim/Kosmos/latents_goa_bigset \
+  --caption_sidecar ,/home/kim/Projects/SAO/lumi/avp_captions_tiered.json,/run/media/kim/Kosmos/latents_goa_bigset/goa_archive_caption_sidecar.json \
+  --caption_probs "0,0.9,0.1;0,0.9,0.1;0.5,0.5,0" \
+  --frames 256 \
+  --model medium-base \
+  --rank 128 \
+  --lora_alpha 128 \
+  --adapter_type dora-rows \
+  --modular-magnitude-update multiplicative \
+  --var-dampening 1.15 \
+  --var-barrier-weight 0.08 \
+  --var-damp-opt \
+  --modular-radial-brake 0.8 \
+  --modular-beta1 0.9 \
+  --modular-snr-gate \
+  --name goa3_avp_r128_shampoo_b16_3e4_2026-09-25 \
+  --output-dir /run/media/kim/Mantu/sa3_lora_runs \
+  --batch-size 16 \
+  --num-workers 10 \
+  --lr 3e-4 \
+  --warmup-steps 1000 \
+  --optimizer modular \
+  --modular-lmo-poly cubic5 \
+  --modular-whitening shampoo \
+  --modular-schedule-free \
+  --modular-sf-c-warmup 1000 \
+  --modular-sf-r 1.0 \
+  --modular-wd 0.02 \
+  --modular-wd-overtraining \
+  --demo-latent-clamp 1.25 \
+  --eval_demos \
+  --steps 10144 \
+  --eval_milestones 1268 2536 3804 5072 6340 7608 8876 10144 \
+  --checkpoint_every 200000 \
+  --purpose 'Overnight r128 DoRA on 3 corpora (20k tracks); Modular Shampoo + multiplicative magnitude update + VADD + Radial Brake; SF averaging delayed to step 1000 (~1.6 epochs undamped)' \
+  --hypothesis 'Multiplicative magnitudes prevent step 6900 NaN; Shampoo preconditioning accelerates convergence at lr 3e-4' \
+  2>&1 | tee /tmp/goa3_avp_r128_shampoo.log
