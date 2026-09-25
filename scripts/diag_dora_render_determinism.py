@@ -38,6 +38,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--mode", choices=("live", "merged", "base"), default="live")
     ap.add_argument("--ckpt", default=f"{RUN}/step=3804.ckpt")
+    ap.add_argument("--slim-adapter", action="store_true",
+                    help="--ckpt is already a plain {state_dict, lora_config} file (e.g. from "
+                         "demo_cfg_sweep.adapter_state(), saved standalone) -- load it directly "
+                         "instead of extracting from a full Lightning checkpoint. Use this off-box "
+                         "(LUMI) where the multi-GB training ckpt with optimizer_states never left "
+                         "the source machine.")
     ap.add_argument("--sdpa", action="store_true", help="route the DiT through SDPA like the demo callback (default: CK)")
     ap.add_argument("--no-flex", action="store_true",
                     help="disable FlexAttention (compiled Triton): windowed attention falls back to masked SDPA")
@@ -53,6 +59,9 @@ def main():
         T.flash_attn_varlen_func = None
     if a.mode == "base":
         sd, cfg = None, {}
+    elif a.slim_adapter:
+        ck = torch.load(str(a.ckpt), map_location="cpu", weights_only=False)
+        sd, cfg = ck["state_dict"], ck.get("lora_config", {})
     else:
         sd, cfg, _ = adapter_state(Path(a.ckpt), "x")
     tmp = Path(os.environ.get("TMPDIR", "/tmp"))
