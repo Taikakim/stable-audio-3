@@ -221,6 +221,7 @@ class ModularTrainingWrapper(DiffusionCondTrainingWrapper):
         During trainer.fit(ckpt_path=...), Lightning expects keys relative to the wrapper root
         ('diffusion.model.model...' and 'diffusion.conditioner.conditioners...').
         """
+        super().on_load_checkpoint(checkpoint)  # AdaGC state (diffusion.py)
         if "state_dict" in checkpoint:
             remapped_sd = {}
             for k, v in checkpoint["state_dict"].items():
@@ -680,7 +681,10 @@ def train(args):
         log_every_n_steps=args.log_every,
         ot_coupling=True,
         base_precision=_base_cast,
-        grad_clip_mode="norm",
+        grad_clip_mode=args.grad_clip_mode,
+        adagc_lambda=args.adagc_lambda,
+        adagc_beta=args.adagc_beta,
+        adagc_warmup=args.adagc_warmup,
         latent_var_barrier=(args.var_dampening if args.var_dampening is not None else 0.0),
         latent_var_weight=(args.var_barrier_weight if args.var_dampening is not None else 0.0),
         subspace_loss_basis=args.subspace_loss_basis,
@@ -1076,6 +1080,18 @@ def main():
     p.add_argument("--accumulate_grad_batches", "--accumulate-grad-batches",
                    type=int, default=1, dest="accumulate_grad_batches")
     p.add_argument("--gradient_clip_val", type=float, default=1.0)
+    p.add_argument("--grad-clip-mode", dest="grad_clip_mode", choices=("norm", "agc", "adagc"), default="norm",
+                   help="norm (default): Lightning's global-norm clip at --gradient_clip_val. adagc: per-tensor "
+                        "clip against an EMA of each tensor's own CLIPPED norms (arXiv 2502.11034), applied before "
+                        "the gradient reaches momentum and the Shampoo accumulators; REPLACES the global clip. "
+                        "agc: NFNets weight-relative clip (unsafe with zero-initialised LoRA B).")
+    p.add_argument("--adagc-lambda", dest="adagc_lambda", type=float, default=1.04,
+                   help="AdaGC threshold as a multiple of the tensor's running norm. 1.04 = paper default "
+                        "(continuous trimming); ~3 = rare-event clip that leaves ordinary steps alone.")
+    p.add_argument("--adagc-beta", dest="adagc_beta", type=float, default=0.99,
+                   help="AdaGC EMA decay of each tensor's clipped norm (paper: 0.99).")
+    p.add_argument("--adagc-warmup", dest="adagc_warmup", type=int, default=100,
+                   help="AdaGC warm-up steps: build the averages, clip nothing.")
     p.add_argument("--base_precision", type=str, default="bf16",
                    choices=list(PRECISION_MODES))
     p.add_argument("--seed", type=int, default=42)

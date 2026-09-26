@@ -200,6 +200,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             x0_loss_weight: float = 0.0,
             grad_clip_mode: str = "norm",
             agc_lambda: float = 0.01,
+            adagc_lambda: float = 1.04,
+            adagc_beta: float = 0.99,
+            adagc_warmup: int = 100,
             output_std_penalty: float = 0.0,
             output_std_t_gate: float = 0.5,
             latent_var_barrier: float = 0.0,
@@ -218,6 +221,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         #     per-channel std drifting off the real data's, gated to t < output_std_t_gate.
         self.grad_clip_mode = grad_clip_mode
         self.agc_lambda = agc_lambda
+        # grad_clip_mode "adagc" (2026-09-26): per-tensor clip against an EMA of each tensor's own
+        # clipped norms (training/adagc.py). Built lazily from self.diffusion's named params.
+        self.adagc_cfg = dict(lam=adagc_lambda, beta=adagc_beta, warmup=adagc_warmup)
         self.output_std_penalty = output_std_penalty
         self.output_std_t_gate = output_std_t_gate
 
@@ -518,6 +524,24 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         if self.grad_clip_mode == "agc":
             for group in optimizer.param_groups:
                 agc_clip_grads_(group["params"], self.agc_lambda)
+            return
+        if self.grad_clip_mode == "adagc":
+            ag = getattr(self, "_adagc", None)
+            if ag is None:
+                from stable_audio_3.training.adagc import AdaGC
+                ag = AdaGC(self.diffusion.named_parameters(), **self.adagc_cfg)
+                pending = getattr(self, "_adagc_pending", None)
+                if pending:
+                    ag.load_state_dict(pending)
+                    print(f"[adagc] restored averages from checkpoint (n_seen={ag.n_seen})", flush=True)
+                self._adagc = ag
+                print(f"[adagc] armed: {len(ag.names)} tensors, lambda={ag.lam}, beta={ag.beta}, "
+                      f"warmup={ag.warmup}", flush=True)
+            ag.clip_()
+            if getattr(self, "logger", None) is not None and \
+                    self.global_step % self._staggered_logger.every_n_steps == 0:
+                for k, v in ag.stats().items():
+                    log_metric(self.logger, k, v, step=self.global_step)
             return
         super().configure_gradient_clipping(
             optimizer, gradient_clip_val=gradient_clip_val,
@@ -1197,6 +1221,15 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             }
             checkpoint['lora_config'] = self.lora_config
             checkpoint.update(resume_state)
+        # AdaGC's per-tensor averages ride along, AFTER the LoRA branch rebuilds the checkpoint
+        # from its fixed key list (a key added earlier would be cleared there).
+        ag = getattr(self, "_adagc", None)
+        if ag is not None:
+            checkpoint['adagc_state'] = ag.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        # Consumed when AdaGC is built lazily at the first clipping call of the resumed run.
+        self._adagc_pending = checkpoint.get('adagc_state')
 
     # ------------------------------------------------------------------
     # FusionOpt Schedule-Free lifecycle hooks
