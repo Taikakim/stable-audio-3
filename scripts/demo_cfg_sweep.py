@@ -86,11 +86,37 @@ def merge_adapters(wrapper) -> int:
     return n
 
 
-def load_model(sd, cfg, tmp_dir: Path, base: str, merge: bool = True):
+def warm_start_base(run_dir: Path):
+    """The run's --init_state_ckpt, if it was warm-started from one; None for a stock-base run.
+
+    An adapter trained on a warm-started base (e.g. goa5k_fullft_avp_dora_3e-3_*, trained over
+    fullft_avp_t4096 ep7) is only valid on THAT base. Rendering it over stock medium-base is silently
+    wrong, so a named-but-missing base (e.g. an unmounted drive) is fatal here, never skipped."""
+    meta = run_dir / "run_meta.json"
+    if not meta.exists():
+        return None
+    init = json.loads(meta.read_text()).get("args", {}).get("init_state_ckpt")
+    if not init:
+        return None
+    if not Path(init).exists():
+        raise SystemExit(f"{run_dir.name} was trained over --init_state_ckpt {init}, which is not on disk "
+                         f"(drive unmounted?). Refusing to render it over stock medium-base.")
+    return Path(init)
+
+
+def load_model(sd, cfg, tmp_dir: Path, base: str, merge: bool = True, run_dir: Path | None = None):
     from stable_audio_3 import StableAudioModel
     slim = tmp_dir / "_sweep_adapter.ckpt"
     torch.save({"state_dict": sd or {}, "lora_config": cfg}, str(slim))
     m = StableAudioModel.from_pretrained(base, device="cuda", model_half=False)
+    init = warm_start_base(run_dir) if run_dir is not None else None
+    if init is not None:
+        # Reuse model_matrix_gen's loader (W 2026-09-28): EMA-shadow preference and the >99%
+        # coverage assert, so both renderers apply a warm-start base identically.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "eval"))
+        from model_matrix_gen import load_adapter_base_weights
+        assert load_adapter_base_weights(m, str(run_dir / "run_meta.json")), f"warm-start base {init} not applied"
+        print(f"[sweep] warm-start base applied: {init}", flush=True)
     m.model.to(dtype=torch.bfloat16)  # the trainer's base precision (--base_precision bf16)
     if sd is not None:
         m.load_lora([str(slim)])
@@ -140,7 +166,8 @@ def main():
         else:
             sd, cfg, note = adapter_state(ckpt, args.weights)
         print(f"[sweep] {ckpt.name}: weights {note}", flush=True)
-        model = load_model(sd, cfg, out, args.base, merge=args.merge)
+        model = load_model(sd, cfg, out, args.base, merge=args.merge,
+                           run_dir=None if args.weights == "base" else args.run_dir)
         del sd
         tag = f"step{step}_{args.weights}" + ("" if args.merge or args.weights == "base" else "_live")
         (out / tag).mkdir(exist_ok=True)

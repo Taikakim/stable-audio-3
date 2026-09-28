@@ -25,7 +25,7 @@ def test_write_demos_copies_cfg7_with_callback_names(tmp_path, monkeypatch):
 
     fake = SimpleNamespace(pretransform=_PT(), sample_rate=44100)
     monkeypatch.setattr(S, "adapter_state", lambda ckpt, w: ({}, {}, "x (test)"))
-    monkeypatch.setattr(S, "load_model", lambda sd, cfg, tmp, base, merge=True: fake)
+    monkeypatch.setattr(S, "load_model", lambda sd, cfg, tmp, base, merge=True, run_dir=None: fake)
     monkeypatch.setattr(S, "generate_clip_latents",
                         lambda m, text, seed, total_frames, steps, cfg_scale, max_latent_std: torch.randn(1, 4, total_frames))
     monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self, raising=False)
