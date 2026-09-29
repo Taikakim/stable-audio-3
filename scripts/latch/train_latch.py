@@ -206,6 +206,25 @@ def make_optimizer(args, model):
               f"uses_sf_averaging={opt.uses_sf_averaging}  "
               f"hot_dtype={args.hot_dtype}")
         return opt, True
+    if args.optimizer == "modular":
+        # The ModularOptimizer the DoRA trainer uses (stable-audio-3/scripts/train_lora_modular.py),
+        # on a LatCH head (C, 2026-09-30, Kim: bracket the small heads under our new trainer).
+        # Only the parts that exist for a plain network: whitening (Shampoo/SOAP), NorMuon,
+        # Schedule-Free, warmup, decoupled wd. The DoRA-only parts (SNR gate = an lr knob per the
+        # goa5k ablation, radial brake, variance damping, magnitude mode) are left at their no-op
+        # defaults. Same train()/eval() SF-swap contract as FusionOpt, hence is_fusion=True.
+        from stable_audio_tools.training.modular_opt import (
+            ModularOptimizer, build_modular_param_groups, summarise_modular_groups,
+        )
+        groups = build_modular_param_groups(model, default_whitening=args.mod_whitening,
+                                            spectral_wd=args.mod_wd)
+        print("ModularOptimizer groups:")
+        print(summarise_modular_groups(groups))
+        opt = ModularOptimizer(groups, lr=args.lr, normuon=args.mod_normuon,
+                               schedule_free=args.mod_sf, warmup_steps=args.mod_warmup,
+                               precond_update_freq=args.mod_precond_freq)
+        print(opt.summary())
+        return opt, True
     raise ValueError(f"Unknown --optimizer {args.optimizer!r}")
 
 
@@ -381,8 +400,8 @@ def train(args):
             micro_in_group += 1
             is_last = (bi == n_micro - 1)
             if micro_in_group == accum or is_last:   # optimizer step every `accum` micro-batches (+ final partial group)
-                if is_fusion:
-                    # Polyak γ_t = γ_base·clamp(loss_ema / gnorm_ema) needs the loss tensor
+                if is_fusion and hasattr(opt, "set_loss"):
+                    # Polyak γ_t = γ_base·clamp(loss_ema / gnorm_ema) needs the loss tensor (FusionOpt only)
                     opt.set_loss(loss)
                 if telem is not None:
                     gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))  # measure only, no real clip
@@ -588,7 +607,15 @@ if __name__ == "__main__":
                         "6 stops paying off. Use 8 for fast-prototyping niche only.")
     p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
-    p.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "fusion", "modular"], default="adamw")
+    p.add_argument("--mod-whitening", choices=["none", "shampoo", "soap"], default="shampoo",
+                   help="--optimizer modular: preconditioner on the spectral (hidden 2D) group")
+    p.add_argument("--mod-normuon", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mod-sf", action=argparse.BooleanOptionalAction, default=True,
+                   help="--optimizer modular: Schedule-Free averaging")
+    p.add_argument("--mod-warmup", type=int, default=0, help="--optimizer modular: lr warmup steps")
+    p.add_argument("--mod-wd", type=float, default=0.01, help="--optimizer modular: spectral-group wd")
+    p.add_argument("--mod-precond-freq", type=int, default=10)
     p.add_argument("--fusion-decay", dest="fusion_decay", default="none",
                    choices=("none", "cosine", "linear", "wsd"),
                    help="FusionOpt in-optimizer LR decay over the run (see train_lora --fusion-decay)")
