@@ -387,6 +387,9 @@ class StableAudioModel:
                 # generate()-level sampler_type reaches the guided path too, so a
                 # caller does not need a second dialect to say the same thing.
                 sampler_type=sampler_type,
+                # CFG rescale rides **sampler_kwargs on the sample_diffusion path; the latch
+                # path passes explicit kwargs only (Latent Forge, 2026-09-15).
+                scale_phi=sampler_kwargs.pop("scale_phi", 0.0),
             )
         else:
             result = sample_diffusion(
@@ -462,6 +465,7 @@ class StableAudioModel:
         latents_sink=None,
         callback=None,
         sampler_type=None,
+        scale_phi=0.0,
     ):
         """Run flow-matching Euler sampling with one or more LatCH guides.
 
@@ -615,6 +619,9 @@ class StableAudioModel:
                 # (cfg_interval[0] <= sigma <= cfg_interval[1]) — native sigma semantics
                 cfg_interval=tuple(cfg_interval),
                 callback=callback, **hp, **cond_inputs,
+                # Latent Forge CFG RESCALE: only forwarded when non-zero, so a default request
+                # reaches the sampler byte-identical to before.
+                **({"scale_phi": float(scale_phi)} if scale_phi else {}),
             )
 
             # Non-invasive capture: same audio out, z0 also handed to the caller.
