@@ -34,3 +34,28 @@ def test_latch_path_forwards_scale_phi(monkeypatch):
 
 def test_latch_path_omits_zero_scale_phi(monkeypatch):
     assert "scale_phi" not in _run(monkeypatch)
+
+
+import pytest
+
+
+def test_fit_latents_pads_crops_and_casts():
+    z = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+    out = m._fit_latents(z, 8, "cpu", torch.float16)
+    assert out.shape == (1, 2, 8) and out.dtype == torch.float16
+    assert float(out[0, 1, 5]) == 11.0 and float(out[0, 0, 7]) == 0.0
+    assert m._fit_latents(z.unsqueeze(0), 4, "cpu", torch.float32).shape == (1, 2, 4)
+    with pytest.raises(ValueError):
+        m._fit_latents(torch.zeros(2, 2, 2, 2), 4, "cpu", torch.float32)
+
+
+def test_generate_rejects_both_init_forms():
+    with pytest.raises(ValueError, match="init_audio or init_latents"):
+        m.StableAudioModel.generate(_stub(), prompt="x", init_audio=(44100, torch.zeros(2, 10)),
+                                    init_latents=torch.zeros(1, 4, 2))
+
+
+def test_generate_rejects_both_inpaint_forms():
+    with pytest.raises(ValueError, match="inpaint_audio or inpaint_latents"):
+        m.StableAudioModel.generate(_stub(), prompt="x", inpaint_audio=(44100, torch.zeros(2, 10)),
+                                    inpaint_latents=torch.zeros(1, 4, 2))
