@@ -442,6 +442,31 @@ def train(args):
         dtype=_base_load_dtype,
     )
 
+    if getattr(args, "init_state_ckpt", None):
+        _ck = torch.load(args.init_state_ckpt, map_location="cpu", weights_only=False)
+        _sd_raw = _ck.get("state_dict", _ck)
+        _has_ema = any(k.startswith("diffusion_ema.ema_model.") for k in _sd_raw)
+        _prefixes = ("diffusion_ema.ema_model.",) if _has_ema else ("diffusion.model.", "model.")
+        _best = None
+        for _tgt in (model.model, model):
+            _want = set(dict(_tgt.named_parameters())) | set(dict(_tgt.named_buffers()))
+            for _pfx in _prefixes:
+                _sd = {(k[len(_pfx):] if k.startswith(_pfx) else k): v
+                       for k, v in _sd_raw.items()}
+                _n = sum(1 for k in _sd if k in _want)
+                if _best is None or _n > _best[0]:
+                    _best = (_n, _tgt, _sd, _want, _pfx)
+        _, _tgt, _sd, _want, _pfx = _best
+        _missing, _ = _tgt.load_state_dict(
+            {k: v.to(next(_tgt.parameters()).dtype) for k, v in _sd.items() if k in _want},
+            strict=False)
+        _cov = 1 - len(_missing) / max(1, len(list(_tgt.state_dict())))
+        assert _cov > 0.99, (f"--init_state_ckpt covers only {_cov:.1%} of the target "
+                             f"({len(_missing)} missing keys, prefix tried '{_pfx}')")
+        print(f"[init] full-FT warm-start from {args.init_state_ckpt} "
+              f"(prefix '{_pfx}', ema={_has_ema}, cov {_cov:.2%})")
+        del _ck, _sd_raw, _sd
+
     sample_rate = model.sample_rate
     ds_ratio = model.pretransform.downsampling_ratio
 
@@ -874,6 +899,8 @@ def main():
                    help="Name substrings: layers containing one are skipped")
     p.add_argument("--lora_checkpoint", type=str, default=None,
                    help="Resume adapter weights from this checkpoint")
+    p.add_argument("--init_state_ckpt", "--init-state-ckpt", dest="init_state_ckpt", default=None,
+                   help="warm-start model weights from a full-FT checkpoint (EMA-preferred, fresh optimizer)")
 
     # ---- Optimizer ----
     p.add_argument("--optimizer", type=str, default="modular",
