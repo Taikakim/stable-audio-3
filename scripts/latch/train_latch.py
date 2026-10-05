@@ -222,7 +222,10 @@ def make_optimizer(args, model):
         print(summarise_modular_groups(groups))
         opt = ModularOptimizer(groups, lr=args.lr, normuon=args.mod_normuon,
                                schedule_free=args.mod_sf, warmup_steps=args.mod_warmup,
-                               precond_update_freq=args.mod_precond_freq)
+                               precond_update_freq=args.mod_precond_freq,
+                               radial_brake=args.mod_radial_brake,
+                               escape_velocity=args.mod_escape_velocity,
+                               sf_c_warmup=args.mod_sf_c_warmup, sf_r=args.mod_sf_r)
         print(opt.summary())
         return opt, True
     raise ValueError(f"Unknown --optimizer {args.optimizer!r}")
@@ -616,6 +619,14 @@ if __name__ == "__main__":
     p.add_argument("--mod-warmup", type=int, default=0, help="--optimizer modular: lr warmup steps")
     p.add_argument("--mod-wd", type=float, default=0.01, help="--optimizer modular: spectral-group wd")
     p.add_argument("--mod-precond-freq", type=int, default=10)
+    p.add_argument("--mod-radial-brake", type=float, default=1.0,
+                   help="--optimizer modular: radial brake on the SF fast iterate's norm growth (1.0 = off; DoRA recipe 0.8)")
+    p.add_argument("--mod-escape-velocity", action=argparse.BooleanOptionalAction, default=False,
+                   help="--optimizer modular: Prodigy-style escape-velocity step multiplier")
+    p.add_argument("--mod-sf-c-warmup", type=int, default=None,
+                   help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
+    p.add_argument("--mod-sf-r", type=float, default=1.0,
+                   help="--optimizer modular: ScheduleFree+ power weighting r (0 = uniform average)")
     p.add_argument("--fusion-decay", dest="fusion_decay", default="none",
                    choices=("none", "cosine", "linear", "wsd"),
                    help="FusionOpt in-optimizer LR decay over the run (see train_lora --fusion-decay)")
