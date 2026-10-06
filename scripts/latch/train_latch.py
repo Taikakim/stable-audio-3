@@ -169,12 +169,49 @@ def make_criterion(args):
 # Optimizer factories
 # ---------------------------------------------------------------------------
 
+class Lion(torch.optim.Optimizer):
+    """Lion (Chen et al. 2023, arXiv 2302.06675): update = sign(b1*m + (1-b1)*g), momentum m <- b2*m + (1-b2)*g,
+    decoupled weight decay. One momentum buffer, no second moment. Typical lr is 3-10x BELOW AdamW's."""
+
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            b1, b2 = g["betas"]
+            for p in g["params"]:
+                if p.grad is None:
+                    continue
+                m = self.state[p].setdefault("m", torch.zeros_like(p))
+                if g["weight_decay"]:
+                    p.mul_(1.0 - g["lr"] * g["weight_decay"])
+                p.add_(torch.sign(m.mul(b1).add(p.grad, alpha=1.0 - b1)), alpha=-g["lr"])
+                m.mul_(b2).add_(p.grad, alpha=1.0 - b2)
+
+
+def _arm_late_modular(opt):
+    """Switch the radial brake / escape velocity on mid-run (--mod-late-from). Escape velocity's state is
+    created at a parameter's first step, so give it its own here, anchored at the CURRENT weights."""
+    brake, ev = opt._late.pop()
+    for g in opt.param_groups:
+        g["radial_brake"], g["escape_velocity"] = brake, ev
+        if ev:
+            for p in g["params"]:
+                st = opt.state[p]
+                st.update(w0=p.data.clone(), ev_numerator=0.0, ev_denominator=0.0, ev_d=1.0)
+    print(f"[late] radial_brake={brake} escape_velocity={ev} armed", flush=True)
+
+
 def make_optimizer(args, model):
     """Return (optimizer, is_fusion_opt). FusionOpt routes 2D matrices with
     min(shape) >= 128 to the spectral Muon+MONA+KL-Shampoo path; everything
     else (1D, biases, LayerNorm, small/odd projections) to ScheduleFree-AdamW."""
     if args.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=args.lr), False
+    if args.optimizer == "lion":
+        return Lion(model.parameters(), lr=args.lr, betas=(args.lion_b1, args.lion_b2),
+                    weight_decay=args.lion_wd), False
     if args.optimizer == "fusion":
         from stable_audio_tools.training.fusion_opt import FusionOpt
         from stable_audio_tools.training.fusion_groups import (
@@ -227,6 +264,10 @@ def make_optimizer(args, model):
                                escape_velocity=args.mod_escape_velocity,
                                sf_c_warmup=args.mod_sf_c_warmup, sf_r=args.mod_sf_r)
         print(opt.summary())
+        if args.mod_late_from > 0:
+            opt._late = [(args.mod_radial_brake, args.mod_escape_velocity)]
+            for g in opt.param_groups:
+                g["radial_brake"], g["escape_velocity"] = 1.0, False
         return opt, True
     raise ValueError(f"Unknown --optimizer {args.optimizer!r}")
 
@@ -410,6 +451,8 @@ def train(args):
                     gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))  # measure only, no real clip
                     if hasattr(opt, "_telem_on"):       # FusionOpt: instrument the step we're about to log
                         opt._telem_on = (step % args.log_every == 0)
+                if getattr(opt, "_late", None) and step == args.mod_late_from:
+                    _arm_late_modular(opt)
                 opt.step()
                 opt.zero_grad()
                 if ema_params is not None:   # EMA on the optimizer step (every `accum` micro-batches), not per micro-batch
@@ -610,7 +653,10 @@ if __name__ == "__main__":
                         "6 stops paying off. Use 8 for fast-prototyping niche only.")
     p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
-    p.add_argument("--optimizer", choices=["adamw", "fusion", "modular"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "fusion", "modular", "lion"], default="adamw")
+    p.add_argument("--lion-b1", type=float, default=0.9)
+    p.add_argument("--lion-b2", type=float, default=0.99)
+    p.add_argument("--lion-wd", type=float, default=0.0, help="--optimizer lion: decoupled wd (Lion papers use 3-10x AdamW's)")
     p.add_argument("--mod-whitening", choices=["none", "shampoo", "soap"], default="shampoo",
                    help="--optimizer modular: preconditioner on the spectral (hidden 2D) group")
     p.add_argument("--mod-normuon", action=argparse.BooleanOptionalAction, default=True)
@@ -623,6 +669,9 @@ if __name__ == "__main__":
                    help="--optimizer modular: radial brake on the SF fast iterate's norm growth (1.0 = off; DoRA recipe 0.8)")
     p.add_argument("--mod-escape-velocity", action=argparse.BooleanOptionalAction, default=False,
                    help="--optimizer modular: Prodigy-style escape-velocity step multiplier")
+    p.add_argument("--mod-late-from", type=int, default=0,
+                   help="--optimizer modular: keep --mod-radial-brake / --mod-escape-velocity OFF until this optimizer "
+                        "step, then switch them on (escape velocity's W0 = the weights at that step). 0 = from the start")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
                    help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
     p.add_argument("--mod-sf-r", type=float, default=1.0,
