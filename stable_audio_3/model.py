@@ -26,6 +26,20 @@ from stable_audio_3.models.lora import (
 )
 
 
+
+def _fit_latents(latents, frames, device, dtype):
+    """(C,T') or (1,C,T') -> (1,C,frames), zero-padded or cropped at the end (Latent Forge, 2026-09-15)."""
+    z = torch.as_tensor(latents)
+    if z.dim() == 2:
+        z = z.unsqueeze(0)
+    if z.dim() != 3 or z.shape[0] != 1:
+        raise ValueError(f"latents must be (C,T) or (1,C,T), got {tuple(z.shape)}")
+    z = z.to(device=device, dtype=dtype)
+    if z.shape[-1] < frames:
+        z = torch.nn.functional.pad(z, (0, frames - z.shape[-1]))
+    return z[..., :frames].contiguous()
+
+
 class StableAudioModel:
     def __init__(self, model, model_config, device, model_half):
         self.model = model
@@ -111,6 +125,8 @@ class StableAudioModel:
         inpaint_mask=None,
         inpaint_mask_start_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
         inpaint_mask_end_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
+        init_latents: tp.Optional[torch.Tensor] = None,
+        inpaint_latents: tp.Optional[torch.Tensor] = None,
         # Schedule options
         duration_padding_sec: float = 6.0,
         apg_scale: float = 1.0,
@@ -172,6 +188,11 @@ class StableAudioModel:
                 chunked decoding on, False forces it off, None (default) uses the value set in the model config.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
         """
+
+        if init_latents is not None and init_audio is not None:
+            raise ValueError("pass init_audio or init_latents, not both")
+        if inpaint_latents is not None and inpaint_audio is not None:
+            raise ValueError("pass inpaint_audio or inpaint_latents, not both")
 
         device = str(self.device)
 
@@ -294,6 +315,10 @@ class StableAudioModel:
                 init_audio, audio_sample_size, inpaint_mask
             )
             init_audio = init_audio.repeat(batch_size, 1, 1)
+        elif init_latents is not None:
+            # Latent Forge: successive passes over one latent never round-trip the decoder.
+            init_audio = _fit_latents(init_latents, latent_sample_size, device,
+                                      next(self.model.pretransform.parameters()).dtype).repeat(batch_size, 1, 1)
 
         # Process inpaint audio
         if inpaint_audio is not None:
@@ -301,6 +326,13 @@ class StableAudioModel:
                 inpaint_audio, audio_sample_size, inpaint_mask
             )
             inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
+        elif inpaint_latents is not None:
+            inpaint_audio = _fit_latents(inpaint_latents, latent_sample_size, device,
+                                         next(self.model.pretransform.parameters()).dtype).repeat(batch_size, 1, 1)
+            if inpaint_mask is not None:
+                inpaint_mask = interpolate(
+                    inpaint_mask.unsqueeze(1), size=latent_sample_size, mode="nearest"
+                ).squeeze(1)
         else:
             if inpaint_mask is not None:
                 inpaint_mask = interpolate(
@@ -387,6 +419,9 @@ class StableAudioModel:
                 # generate()-level sampler_type reaches the guided path too, so a
                 # caller does not need a second dialect to say the same thing.
                 sampler_type=sampler_type,
+                # CFG rescale rides **sampler_kwargs on the sample_diffusion path; the latch
+                # path passes explicit kwargs only (Latent Forge, 2026-09-15).
+                scale_phi=sampler_kwargs.pop("scale_phi", 0.0),
             )
         else:
             result = sample_diffusion(
@@ -462,6 +497,7 @@ class StableAudioModel:
         latents_sink=None,
         callback=None,
         sampler_type=None,
+        scale_phi=0.0,
     ):
         """Run flow-matching Euler sampling with one or more LatCH guides.
 
@@ -615,6 +651,9 @@ class StableAudioModel:
                 # (cfg_interval[0] <= sigma <= cfg_interval[1]) — native sigma semantics
                 cfg_interval=tuple(cfg_interval),
                 callback=callback, **hp, **cond_inputs,
+                # Latent Forge CFG RESCALE: only forwarded when non-zero, so a default request
+                # reaches the sampler byte-identical to before.
+                **({"scale_phi": float(scale_phi)} if scale_phi else {}),
             )
 
             # Non-invasive capture: same audio out, z0 also handed to the caller.
