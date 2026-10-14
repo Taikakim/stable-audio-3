@@ -391,11 +391,16 @@ def train(args):
         ema_params = [p.detach().clone() for p in model.parameters()]
         print(f"EMA: on, decay={args.ema} (saved checkpoint will be the EMA weights)")
 
-    def ema_state_dict():
+    ema_extra = [(hl, 0.5 ** (1.0 / (hl * args._spe)), [p.detach().clone() for p in model.parameters()]) for hl in args.ema_extra_halflife_epochs]
+    for hl, dec, _ in ema_extra:
+        print(f"EMA extra: half-life {hl} epochs, decay={dec:.5f}")
+
+    def ema_state_dict(params=None):
         """state_dict with the EMA params swapped in (restores live params after)."""
+        params = ema_params if params is None else params
         backup = [p.detach().clone() for p in model.parameters()]
         with torch.no_grad():
-            for p, e in zip(model.parameters(), ema_params):
+            for p, e in zip(model.parameters(), params):
                 p.copy_(e)
         sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
         with torch.no_grad():
@@ -483,6 +488,9 @@ def train(args):
                     with torch.no_grad():
                         for e, p in zip(ema_params, model.parameters()):
                             e.lerp_(p.detach(), 1.0 - args.ema)
+                        for _hl, _dec, _ep in ema_extra:
+                            for e, p in zip(_ep, model.parameters()):
+                                e.lerp_(p.detach(), 1.0 - _dec)
                 if telem is not None:
                     _now = _time.perf_counter()
                     _rate = 1.0 / max(_now - _t_prev, 1e-6); _t_prev = _now
@@ -594,6 +602,10 @@ def train(args):
             for _cp in ckpt_paths:
                 torch.save(_ck, _cp)
                 print(f"  -> saved {_cp}{' (new best)' if is_best and _cp.endswith('_best.pt') else ''}")
+            if ema_extra and args.save_every_epoch:
+                for _hl, _dec, _ep in ema_extra:
+                    _p = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}_ema{_hl:g}.pt")
+                    torch.save({**_ck, "state_dict": ema_state_dict(_ep), "ema": _dec}, _p)
 
     if wb is not None:
         wb.finish()
@@ -720,6 +732,7 @@ if __name__ == "__main__":
                    help="cosine-decay the LR (every param group) from START to END epochs to --cosine-min-frac x lr; constant before, held at the floor after")
     p.add_argument("--cosine-min-frac", type=float, default=0.0)
     p.add_argument("--ema-halflife-epochs", type=float, default=None, help="EMA half-life in EPOCHS (overrides --ema; decay = 0.5**(1/(halflife*steps_per_epoch)))")
+    p.add_argument("--ema-extra-halflife-epochs", type=float, nargs="*", default=[], help="additional EMA trackers (half-lives in EPOCHS) updated alongside the main one in the SAME run; each epoch checkpoint also gets a latch_sa3_<feat>_ep<N>_ema<hl>.pt sibling (requires --save-every-epoch)")
     p.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps (0 = run all epochs); epochs is raised to cover it")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
                    help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
