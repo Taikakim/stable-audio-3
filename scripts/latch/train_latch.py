@@ -265,7 +265,7 @@ def make_optimizer(args, model):
                                radial_brake=args.mod_radial_brake,
                                escape_velocity=args.mod_escape_velocity,
                                sf_c_warmup=args.mod_sf_c_warmup, sf_r=args.mod_sf_r,
-                               wd_overtraining=args.mod_wd_overtraining, steps_per_epoch=getattr(args, '_spe', None))
+                               wd_overtraining=args.mod_wd_overtraining, snr_gate=args.mod_snr_gate, snr_floor=args.mod_snr_floor, steps_per_epoch=getattr(args, '_spe', None))
         print(opt.summary())
         if args.mod_late_from > 0:
             opt._late = [(args.mod_radial_brake, args.mod_escape_velocity)]
@@ -465,6 +465,8 @@ def train(args):
                     gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1e9))  # measure only, no real clip
                     if hasattr(opt, "_telem_on"):       # FusionOpt: instrument the step we're about to log
                         opt._telem_on = (step % args.log_every == 0)
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 if getattr(opt, "_late", None) and step == args.mod_late_from:
                     _arm_late_modular(opt)
                 if args.cosine_epochs is not None:
@@ -709,6 +711,9 @@ if __name__ == "__main__":
     p.add_argument("--mod-muon-all", action="store_true",
                    help="--optimizer modular: route EVERY 2-D parameter (small output head, AdaLN emitters, embeddings) to the spectral/Muon group, not only min(shape)>=64 ones. 1-D params stay sign-descent.")
     p.add_argument("--mod-wd-overtraining", action="store_true", help="--optimizer modular: overtraining-aware weight decay, wd_t = wd*sqrt(max(1, epoch)) (Everett & Qiu 2026)")
+    p.add_argument("--mod-snr-gate", action="store_true", help="--optimizer modular: per-row SNR gate on the step (an lr damper)")
+    p.add_argument("--mod-snr-floor", type=float, default=0.0)
+    p.add_argument("--grad-clip", type=float, default=0.0, help="clip the global gradient norm to this value before every optimizer step (0 = off)")
     p.add_argument("--mod-warmup-epochs", type=float, default=None, help="--optimizer modular: warmup in EPOCHS (overrides --mod-warmup)")
     p.add_argument("--mod-late-from-epochs", type=float, default=None, help="--optimizer modular: switch brake/escape velocity on after this many EPOCHS (overrides --mod-late-from)")
     p.add_argument("--cosine-epochs", type=float, nargs=2, default=None, metavar=("START", "END"),
