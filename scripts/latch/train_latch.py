@@ -1,4 +1,5 @@
 # scripts/latch/train_latch.py
+# Last edited: GHOST-NOTE 2026-10-14 -- --save-every-epoch (per-epoch snapshots alongside best.pt; default off)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -528,8 +529,11 @@ def train(args):
                 ckpt_path = None
         else:
             ckpt_path = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}.pt")
-        if ckpt_path is not None:
-            torch.save({
+        ckpt_paths = [ckpt_path] if ckpt_path is not None else []
+        if args.save_every_epoch and (ckpt_path is None or not ckpt_path.endswith(f"_ep{epoch+1}.pt")):
+            ckpt_paths.append(os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}.pt"))
+        if ckpt_paths:
+            _ck = ({
                 "state_dict": ema_state_dict() if ema_params is not None else model.state_dict(),
                 "ema": args.ema,
                 "grad_accum": args.grad_accum,
@@ -561,8 +565,10 @@ def train(args):
                 "val_loss": val_loss,
                 "val_split": val_meta,
                 "selected_on": "val_loss" if val_loader is not None else "train_loss",
-            }, ckpt_path)
-            print(f"  -> saved {ckpt_path}{' (new best)' if is_best else ''}")
+            })
+            for _cp in ckpt_paths:
+                torch.save(_ck, _cp)
+                print(f"  -> saved {_cp}{' (new best)' if is_best and _cp.endswith('_best.pt') else ''}")
 
     if wb is not None:
         wb.finish()
@@ -630,6 +636,11 @@ if __name__ == "__main__":
     p.add_argument("--save-dir", default="latch_weights_sa3")
     p.add_argument("--save-best-only", action="store_true",
                    help="Save only when train-loss improves (Schedule-Free averaged iterate)")
+    p.add_argument("--save-every-epoch", action="store_true",
+                   help="Also write latch_sa3_<feature>_ep<N>.pt every epoch, alongside the _best.pt that "
+                        "--save-best-only keeps. Val loss goes flat long before a diffusion-style head stops "
+                        "changing, and best.pt alone cannot answer 'does the LAST epoch steer better'. "
+                        "~78 MB per epoch at dim 512 (so ~1.5 GB per 20-epoch arm).")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the LatCH head. Per docs/FUSION_SHAREABLE.md this "
                         "is CRITICAL for FusionOpt — without it the spectral-path overhead "
