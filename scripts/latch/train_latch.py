@@ -27,6 +27,7 @@ via _apply_rocm_training_profile().
 """
 
 import argparse
+import math
 import os
 
 
@@ -255,7 +256,7 @@ def make_optimizer(args, model):
             ModularOptimizer, build_modular_param_groups, summarise_modular_groups,
         )
         groups = build_modular_param_groups(model, default_whitening=args.mod_whitening,
-                                            spectral_wd=args.mod_wd)
+                                            spectral_wd=args.mod_wd, spectral_all=args.mod_muon_all)
         print("ModularOptimizer groups:")
         print(summarise_modular_groups(groups))
         opt = ModularOptimizer(groups, lr=args.lr, normuon=args.mod_normuon,
@@ -263,7 +264,8 @@ def make_optimizer(args, model):
                                precond_update_freq=args.mod_precond_freq,
                                radial_brake=args.mod_radial_brake,
                                escape_velocity=args.mod_escape_velocity,
-                               sf_c_warmup=args.mod_sf_c_warmup, sf_r=args.mod_sf_r)
+                               sf_c_warmup=args.mod_sf_c_warmup, sf_r=args.mod_sf_r,
+                               wd_overtraining=args.mod_wd_overtraining, steps_per_epoch=getattr(args, '_spe', None))
         print(opt.summary())
         if args.mod_late_from > 0:
             opt._late = [(args.mod_radial_brake, args.mod_escape_velocity)]
@@ -335,7 +337,18 @@ def train(args):
                         num_workers=args.num_workers, collate_fn=collate_varlen,
                         persistent_workers=args.num_workers > 0)
 
-    args._total_opt_steps = (len(loader) // max(1, args.grad_accum)) * args.epochs   # for --fusion-decay
+    _spe = max(1, len(loader) // max(1, args.grad_accum))                               # optimizer steps per epoch
+    if args.max_steps:
+        args.epochs = max(1, -(-args.max_steps // _spe))
+    args._total_opt_steps = _spe * args.epochs   # for --fusion-decay
+    if args.mod_warmup_epochs is not None:
+        args.mod_warmup = int(round(args.mod_warmup_epochs * _spe))
+    if args.mod_late_from_epochs is not None:
+        args.mod_late_from = int(round(args.mod_late_from_epochs * _spe))
+    if args.ema_halflife_epochs is not None:
+        args.ema = 0.5 ** (1.0 / (args.ema_halflife_epochs * _spe))
+    args._spe = _spe
+    print(f"steps/epoch={_spe}  epochs={args.epochs}  warmup={args.mod_warmup}  late_from={args.mod_late_from}  ema={args.ema:.5f}  cosine={args.cosine_epochs}  max_steps={args.max_steps}")
     model = LatCH(in_channels=256, out_channels=out_channels,
                   dim=args.dim, depth=args.depth, num_heads=args.num_heads,
                   t_injection=args.t_injection).to(device)
@@ -454,6 +467,14 @@ def train(args):
                         opt._telem_on = (step % args.log_every == 0)
                 if getattr(opt, "_late", None) and step == args.mod_late_from:
                     _arm_late_modular(opt)
+                if args.cosine_epochs is not None:
+                    if not hasattr(opt, "_base_lrs"):
+                        opt._base_lrs = [g["lr"] for g in opt.param_groups]
+                    a, b = (x * args._spe for x in args.cosine_epochs)
+                    u = min(1.0, max(0.0, (step - a) / max(b - a, 1.0)))
+                    fac = args.cosine_min_frac + (1 - args.cosine_min_frac) * 0.5 * (1 + math.cos(math.pi * u))
+                    for g, b0 in zip(opt.param_groups, opt._base_lrs):
+                        g["lr"] = b0 * fac
                 opt.step()
                 opt.zero_grad()
                 if ema_params is not None:   # EMA on the optimizer step (every `accum` micro-batches), not per micro-batch
@@ -467,6 +488,8 @@ def train(args):
                               lr=opt.param_groups[0]["lr"], epoch=epoch)
                 step += 1
                 micro_in_group = 0
+                if args.max_steps and step >= args.max_steps:
+                    break
         avg_loss = total / max(nbatches, 1)
         print(f"epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}")
 
@@ -683,6 +706,16 @@ if __name__ == "__main__":
     p.add_argument("--mod-late-from", type=int, default=0,
                    help="--optimizer modular: keep --mod-radial-brake / --mod-escape-velocity OFF until this optimizer "
                         "step, then switch them on (escape velocity's W0 = the weights at that step). 0 = from the start")
+    p.add_argument("--mod-muon-all", action="store_true",
+                   help="--optimizer modular: route EVERY 2-D parameter (small output head, AdaLN emitters, embeddings) to the spectral/Muon group, not only min(shape)>=64 ones. 1-D params stay sign-descent.")
+    p.add_argument("--mod-wd-overtraining", action="store_true", help="--optimizer modular: overtraining-aware weight decay, wd_t = wd*sqrt(max(1, epoch)) (Everett & Qiu 2026)")
+    p.add_argument("--mod-warmup-epochs", type=float, default=None, help="--optimizer modular: warmup in EPOCHS (overrides --mod-warmup)")
+    p.add_argument("--mod-late-from-epochs", type=float, default=None, help="--optimizer modular: switch brake/escape velocity on after this many EPOCHS (overrides --mod-late-from)")
+    p.add_argument("--cosine-epochs", type=float, nargs=2, default=None, metavar=("START", "END"),
+                   help="cosine-decay the LR (every param group) from START to END epochs to --cosine-min-frac x lr; constant before, held at the floor after")
+    p.add_argument("--cosine-min-frac", type=float, default=0.0)
+    p.add_argument("--ema-halflife-epochs", type=float, default=None, help="EMA half-life in EPOCHS (overrides --ema; decay = 0.5**(1/(halflife*steps_per_epoch)))")
+    p.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps (0 = run all epochs); epochs is raised to cover it")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
                    help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
     p.add_argument("--mod-sf-r", type=float, default=1.0,
