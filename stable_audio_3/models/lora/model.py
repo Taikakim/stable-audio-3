@@ -238,6 +238,10 @@ class LoRAParametrization(nn.Module):
         delta = self.scaling * self.lora_strength * delta
         return (W + delta.to(W.dtype))
     
+    # lora_interp (GHOST-NOTE 2026-10-15, default False = unchanged): when True the DoRA is computed at FULL strength and the strength then blends the WEIGHTS,
+    # W_out = W + s*(W_dora - W). The default scales only the low-rank direction update and keeps the trained magnitude vector at full size, so s<1 is NOT a blend with the base model.
+    lora_interp = False
+
     def dora_forward(self, W):
         if self.lora_strength == 0:
             return W
@@ -247,10 +251,13 @@ class LoRAParametrization(nn.Module):
         W_2d = W.view(W.shape[0], -1).to(self.lora_A.dtype)
         # low-rank update on the *direction*
         delta = torch.matmul(*self.swap((self.lora_B, self.dropout_fn(self.lora_A))))
-        V = W_2d + self.scaling * self.lora_strength * delta
+        V = W_2d + self.scaling * (1.0 if self.lora_interp else self.lora_strength) * delta
         # normalize along _norm_dim, then scale by per-element magnitude
         V_hat = V / (V.norm(dim=self._norm_dim, keepdim=True) + 1e-12)
-        return (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape).to(W.dtype)
+        out = (V_hat * self.magnitude.unsqueeze(self._norm_dim)).view(orig_shape).to(W.dtype)
+        if self.lora_interp:
+            out = W + self.lora_strength.to(W.dtype) * (out - W)
+        return out
 
     def bora_forward(self, W):
         if self.lora_strength == 0:
