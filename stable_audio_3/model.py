@@ -1,3 +1,4 @@
+# Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_schedule"] ("alpha" | "flat") forwarded to the guided samplers
 import json
 import numpy as np
 import torch
@@ -628,6 +629,7 @@ class StableAudioModel:
                 "mu": float(latch_hparams.get("mu", 1.0)),
                 "gamma": float(latch_hparams.get("gamma", 0.3)),
                 "n_iter": int(latch_hparams.get("n_iter", 4)),
+                "guide_schedule": str(latch_hparams.get("guide_schedule", "alpha")),
                 "log_norms": bool(latch_hparams.get("log_norms", False)),
             }
 

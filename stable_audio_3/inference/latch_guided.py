@@ -1,4 +1,5 @@
 # stable_audio_3/inference/latch_guided.py
+# Last edited: WINTERMUTE 2026-10-15 — guide_schedule="flat" option (constant per-step weight) beside the TFG alpha schedule
 """Gradient-enabled Euler sampler with LatCH Training-Free Guidance for SA3 (Phase 1)."""
 
 import torch
@@ -82,7 +83,7 @@ def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
 @torch.enable_grad()
 def sample_flow_euler_multi_latch_guided(
     model, x, sigmas, guides, *,
-    rho=1.0, mu=1.0, gamma=0.3, n_iter=4,
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha",
     log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Flow-matching Euler sampler with multiple LatCH guides (Selective TFG).
@@ -103,6 +104,9 @@ def sample_flow_euler_multi_latch_guided(
 
     rho/mu: global variance/mean guidance strengths (scaled per-step by s_t).
     gamma:  input-noise augmentation std for the clean head evaluation.
+    guide_schedule: shape of s_t inside each guide's window -- "alpha" (TFG default,
+            s_t ∝ 1 - t, so near zero at the first, noisiest steps) or "flat"
+           (equal weight on every active step). See _window_scale.
     All guidance math runs in fp32 (heads are fp32); x is cast to the diffusion
     model's dtype only for the velocity forward, so this works whether the model
     is fp16 or fp32.
@@ -122,9 +126,7 @@ def sample_flow_euler_multi_latch_guided(
         # Each guide spends all of rho/mu*weight inside its window instead of only the
         # window's share of a whole-schedule budget -- see _st_weights for the numbers
         # and the 10.8x legacy-gain caveat.
-        _m = torch.zeros_like(alpha)
-        _m[g["_start"]:g["_end"]] = 1.0
-        g["_scale"] = (alpha * _m) / (alpha * _m).sum().clamp(min=1e-8)
+        g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule)
         g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
                                                 w_sec=g.get("w_sec"), fps=g.get("fps"))
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
@@ -241,7 +243,7 @@ def resolve_guided_sampler(objective, latch_hparams=None, sampler_type=None):
 @torch.enable_grad()
 def sample_flow_pingpong_multi_latch_guided(
     model, x, sigmas, guides, *,
-    rho=1.0, mu=1.0, gamma=0.3, n_iter=4,
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha",
     log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Ping-pong sampler with multiple LatCH guides — the rf_denoiser twin of
@@ -292,9 +294,7 @@ def sample_flow_pingpong_multi_latch_guided(
     for g in guides:
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"] = int(num_steps * g["end_pct"])
-        _m = torch.zeros_like(alpha)
-        _m[g["_start"]:g["_end"]] = 1.0
-        g["_scale"] = (alpha * _m) / (alpha * _m).sum().clamp(min=1e-8)
+        g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule)
         g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
                                                 w_sec=g.get("w_sec"), fps=g.get("fps"))
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
@@ -366,6 +366,27 @@ def sample_flow_pingpong_multi_latch_guided(
             print(f"  i={r['i']:>3} sigma={r['sigma']:.4f} "
                   f"||grad_var||={r['gv_norm']:.4e} ||x||={r['x_norm']:.4e} rho_t={r['rho_t']:.4e}")
     return x
+
+
+def _window_scale(alpha, start, end, schedule="alpha"):
+    """Per-step weight of one guide over its window [start, end), summing to 1.
+
+    "alpha" is TFG's s(t) = alpha_t / sum(alpha_t) (Ye et al. 2024, used as-is by the
+    LatCH paper, 2603.04366 Eq. 3), with alpha = 1 - t here: tiny at the noisiest
+    steps, so a full window spends most of its budget in the last steps, after the
+    arrangement and rhythm are already fixed. "flat" gives every active step the
+    same weight, so the early steps get a real share. Both are normalised over the
+    window, so rho/mu stay a budget and keep their meaning across schedules.
+    """
+    m = torch.zeros_like(alpha)
+    m[start:end] = 1.0
+    if schedule == "flat":
+        w = m
+    elif schedule == "alpha":
+        w = alpha * m
+    else:
+        raise ValueError(f"latch schedule must be 'alpha' or 'flat', got {schedule!r}")
+    return w / w.sum().clamp(min=1e-8)
 
 
 def _st_weights(sigmas_1d, active_mask=None):

@@ -117,3 +117,39 @@ def test_unknown_loss_type_raises():
     import pytest
     with pytest.raises(ValueError):
         _make_latch_criterion("nonsense")
+
+
+# --- schedule="flat" (WINTERMUTE 2026-10-15) ---------------------------------------------
+from stable_audio_3.inference.latch_guided import _window_scale  # noqa: E402
+
+
+def test_window_scale_alpha_and_flat_sum_to_one_inside_window():
+    alpha = 1.0 - _schedule(10)[:-1]          # 0.0, 0.1, ... 0.9
+    for sched in ("alpha", "flat"):
+        w = _window_scale(alpha, 0, 10, sched)
+        assert torch.isclose(w.sum(), torch.tensor(1.0))
+    a, f = _window_scale(alpha, 0, 10, "alpha"), _window_scale(alpha, 0, 10, "flat")
+    assert a[0] == 0.0 and a[-1] > a[1]       # TFG alpha: nothing at the noisiest step
+    assert torch.allclose(f, torch.full_like(f, 0.1))
+    w = _window_scale(alpha, 2, 5, "flat")
+    assert w[:2].sum() == 0 and w[5:].sum() == 0 and torch.allclose(w[2:5], torch.full((3,), 1 / 3))
+
+
+def test_window_scale_rejects_unknown_schedule():
+    import pytest
+    with pytest.raises(ValueError):
+        _window_scale(torch.ones(4), 0, 4, "cosine")
+
+
+def test_flat_schedule_guides_the_first_step_alpha_does_not():
+    # Window = first step only. alpha_0 = 0 there, so "alpha" is a no-op; "flat" must act.
+    torch.manual_seed(0)
+    x = torch.randn(1, 4, 8)
+    sigmas = _schedule(10)
+    plain = sample_flow_euler_multi_latch_guided(
+        _toy_model, x.clone(), sigmas, [_guide(-5.0, start=0.0, end=0.1)], rho=5.0, mu=5.0, gamma=0.0)
+    flat = sample_flow_euler_multi_latch_guided(
+        _toy_model, x.clone(), sigmas, [_guide(-5.0, start=0.0, end=0.1)], rho=5.0, mu=5.0, gamma=0.0,
+        guide_schedule="flat")
+    probe = _ConstHead()
+    assert probe(flat, torch.zeros(1)).mean() < probe(plain, torch.zeros(1)).mean() - 1e-3
