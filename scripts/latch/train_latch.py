@@ -502,6 +502,10 @@ def train(args):
                     break
         avg_loss = total / max(nbatches, 1)
         print(f"epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}")
+        if not math.isfinite(avg_loss):
+            # diverged: every later epoch is NaN and every later checkpoint garbage (overnight 2026-10-15: four arms burned hours on NaN epochs). Stop without saving this epoch.
+            print(f"non-finite training loss at epoch {epoch+1}: stopping (no checkpoint written for this epoch)")
+            break
 
         # For FusionOpt save the Schedule-Free averaged iterate x_t (deployable),
         # not the fast iterate z_t. opt.eval() swaps x into live params.
