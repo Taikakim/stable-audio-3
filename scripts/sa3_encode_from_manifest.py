@@ -5,7 +5,7 @@ sa3_beat_manifest.py CSV, appending to the latents_sa3 corpus.
 Reconstructed 2026-07-04 (see sa3_beat_manifest.py docstring for context: the
 originals were /tmp-only and got lost).
 
-Per crop, writes (matching the existing /home/kim/Projects/latents_sa3 schema
+Per crop, writes (matching the existing /run/media/kim/Kosmos/latents/latents_sa3 schema
 exactly -- verified against 000000.{npy,json,TIMESERIES.npz}):
   <id>.npy            SAME-L latent, (256, 4096) fp16
   <id>.json           source .INFO features merged with crop-specific fields
@@ -60,13 +60,13 @@ Usage:
   .venv/bin/python scripts/sa3_encode_from_manifest.py \
       --manifest /tmp/sa3_crop_manifest.csv \
       --timeseries-root /run/media/kim/Lehto/timeseries \
-      --out /home/kim/Projects/latents_sa3 \
+      --out /run/media/kim/Kosmos/latents/latents_sa3 \
       --model_half
 
   # avp corpus (trigger caption, co-located timeseries, augmentation variants):
   .venv/bin/python scripts/sa3_encode_from_manifest.py \
       --manifest /tmp/avp_crop_manifest.csv \
-      --out /home/kim/Projects/latents_avp \
+      --out /run/media/kim/Kosmos/latents/latents_avp \
       --trigger-caption --model_half
 """
 import os
@@ -335,7 +335,7 @@ def main():
                      help="prompt = deterministic aavepyora/aavepyörä trigger word per parent "
                           "track (avp personal-style LoRA), instead of the §3.5 artist/title/bpm prompt")
     args = ap.parse_args()
-    is_pristine = args.out.resolve() == Path("/home/kim/Projects/latents_sa3").resolve()
+    is_pristine = args.out.resolve() == Path("/run/media/kim/Kosmos/latents/latents_sa3").resolve()
 
     if args.companion_only:
         # CPU-only companion rebuild -- no model, no manifest. Returns before any GPU work.

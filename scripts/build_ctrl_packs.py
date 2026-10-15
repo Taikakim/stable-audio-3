@@ -17,7 +17,7 @@ bracket arm. Missing fields (f0 on avp) zero-fill — same layout both corpora.
 
 Run (any venv with numpy; ~10 min for 7.8k crops):
   python3 stable-audio-3/scripts/build_ctrl_packs.py \
-      --dirs /home/kim/Projects/latents_sa3,/home/kim/Projects/latents_avp
+      --dirs /run/media/kim/Kosmos/latents/latents_sa3,/run/media/kim/Kosmos/latents/latents_avp
 Stats are estimated ONCE over a sample pooled from ALL --dirs (one normalization for
 the mixed corpus), then applied everywhere.
 """

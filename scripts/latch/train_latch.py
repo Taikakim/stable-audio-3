@@ -622,7 +622,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     # Data / target
     p.add_argument("--feature", default="rms_energy_bass")
-    p.add_argument("--latent-dir", default="/home/kim/Projects/latents_sa3",
+    p.add_argument("--latent-dir", default="/run/media/kim/Kosmos/latents/latents_sa3",
                    help="latent dir; ALSO accepts a comma-separated list (goa,avp) for a combined "
                         "multi-root dataset (full-path item lists concatenated -> stem collision sidestepped).")
     p.add_argument("--latent-dirs", nargs="+", default=None,

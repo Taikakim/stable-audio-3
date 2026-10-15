@@ -4,7 +4,7 @@
 A standalone copy of train_lora.py, stripped of research-specific features (glitch,
 mir_ctrl, traj_sketch, subspace loss, familiarity) and extended with:
   - --optimizer modular: the ModularOptimizer 6-stage pipeline
-  - --subset300: shortcut to /home/kim/Projects/latents_sa3_subset300
+  - --subset300: shortcut to /run/media/kim/Kosmos/latents/latents_sa3_subset300
   - Modular sub-flags: --modular-whitening, --modular-escape-velocity, etc.
 
 Origin: Kim & Antigravity.Neuromancer
@@ -76,7 +76,7 @@ PRECISION_MODES = {
 }
 
 # Canonical subset path (symlinks)
-SUBSET_300_PATH = "/home/kim/Projects/latents_sa3_subset300"
+SUBSET_300_PATH = "/run/media/kim/Kosmos/latents/latents_sa3_subset300"
 
 
 def load_model(model_name: str, device: torch.device,

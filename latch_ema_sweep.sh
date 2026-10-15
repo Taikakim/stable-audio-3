@@ -14,7 +14,7 @@ run() {  # epochs grad_accum tag
   ./.venv/bin/python scripts/latch/train_latch.py \
     --feature spectral_skewness --optimizer adamw --lr 3e-4 --batch-size 32 \
     --ema 0.999 --grad-accum "$ga" --epochs "$ep" \
-    --target-source npz --latent-dir /home/kim/Projects/latents_sa3 \
+    --target-source npz --latent-dir /run/media/kim/Kosmos/latents/latents_sa3 \
     --standardize --precision bf16 --t-injection adaln_zero --dim 256 --depth 4 --num-heads 8 \
     --seed 1 --save-best-only --wandb --wandb-project sa3-latch --run-name "skew_$tag" --save-dir "$out"
   echo "=== DONE $tag end $(date +%H:%M:%S) rc=$? ==="

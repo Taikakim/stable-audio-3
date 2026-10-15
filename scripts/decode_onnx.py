@@ -35,7 +35,7 @@ import numpy as np
 SAMPLE_RATE = 44100
 DOWNSAMPLING_RATIO = 4096   # SAME-L: 256 (patch) * 16 (encoder stride)
 LATENT_DIM = 256
-DEFAULT_LATENT_DIR = Path("/home/kim/Projects/latents_sa3")
+DEFAULT_LATENT_DIR = Path("/run/media/kim/Kosmos/latents/latents_sa3")
 
 _PROVIDER_ALIASES = {
     "migraphx": "MIGraphXExecutionProvider",

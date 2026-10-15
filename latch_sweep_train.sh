@@ -13,7 +13,7 @@ run() {
   echo "=== TRAIN skew lr=$lr bs=$bs tag=$tag  start $(date +%H:%M:%S) ==="
   .venv/bin/python scripts/latch/train_latch.py \
     --feature spectral_skewness --target-source npz \
-    --latent-dir /home/kim/Projects/latents_sa3 \
+    --latent-dir /run/media/kim/Kosmos/latents/latents_sa3 \
     --optimizer adamw --lr "$lr" --batch-size "$bs" \
     --loss smooth_l1 --standardize --precision bf16 \
     --t-injection adaln_zero --dim 256 --depth 4 --num-heads 8 \

@@ -212,7 +212,7 @@ def main():
     ap.add_argument("--decoder-onnx", required=True, type=Path, help="exported SAME decoder .onnx")
     ap.add_argument("--frames", type=int, required=True,
                     help="T — MUST match the DiT export's length rung")
-    ap.add_argument("--cond-dir", default="/home/kim/Projects/latents_sa3",
+    ap.add_argument("--cond-dir", default="/run/media/kim/Kosmos/latents/latents_sa3",
                     help="dir for resolving bare cond/uncond npz filenames")
     ap.add_argument("--decode-chunk", type=int, default=128, help="MUST match the decoder export L")
     ap.add_argument("--decode-overlap", type=int, default=16, help=">= decoder receptive field")

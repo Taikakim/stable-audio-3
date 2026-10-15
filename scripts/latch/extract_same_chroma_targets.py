@@ -26,7 +26,7 @@ READOUT = "/home/kim/Projects/mir-same-chroma/sc_run/chroma_heads_real.npz"
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--latent-dir", default="/home/kim/Projects/latents_sa3")
+    ap.add_argument("--latent-dir", default="/run/media/kim/Kosmos/latents/latents_sa3")
     ap.add_argument("--out-dir", default="/home/kim/Projects/latents_sa3_chroma")
     ap.add_argument("--readout", default=READOUT)
     args = ap.parse_args()
