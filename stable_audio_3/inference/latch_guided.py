@@ -1,5 +1,6 @@
 # stable_audio_3/inference/latch_guided.py
 # Last edited: WINTERMUTE 2026-10-15 — guide_schedule="flat" option (constant per-step weight) beside the TFG alpha schedule
+# Last edited: WINTERMUTE 2026-10-15 — guide_anchor (cap x_t std at its healthy value per sigma, every step)
 # Last edited: WINTERMUTE 2026-10-15 — guide_rescale (per-step std rescale after each guidance edit, LatCH analogue of CFG rescale)
 """Gradient-enabled Euler sampler with LatCH Training-Free Guidance for SA3 (Phase 1)."""
 
@@ -84,7 +85,7 @@ def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
 @torch.enable_grad()
 def sample_flow_euler_multi_latch_guided(
     model, x, sigmas, guides, *,
-    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0,
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0, guide_anchor=0.0,
     log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Flow-matching Euler sampler with multiple LatCH guides (Selective TFG).
@@ -111,6 +112,8 @@ def sample_flow_euler_multi_latch_guided(
     guide_rescale: 0..1, after each guidance edit (x after the variance step, z0 after
            mean guidance) pull the per-sample std back toward its pre-guidance value.
            0 = off (default). See _rescale_like.
+    guide_anchor: s0 > 0 caps the state after every step at the healthy std
+           sqrt(((1-t)*s0)^2 + t^2) for its t (trajectory anchor). 0 = off. See _anchor_std.
     All guidance math runs in fp32 (heads are fp32); x is cast to the diffusion
     model's dtype only for the velocity forward, so this works whether the model
     is fp16 or fp32.
@@ -205,6 +208,7 @@ def sample_flow_euler_multi_latch_guided(
         t_b3 = t_curr.clamp(min=1e-6)
         d = (x - z0) / t_b3
         x = (x + d * (t_prev - t_curr)).detach()
+        x = _anchor_std(x, t_prev, guide_anchor)
 
     x = x.to(model_dtype)
 
@@ -249,7 +253,7 @@ def resolve_guided_sampler(objective, latch_hparams=None, sampler_type=None):
 @torch.enable_grad()
 def sample_flow_pingpong_multi_latch_guided(
     model, x, sigmas, guides, *,
-    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0,
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0, guide_anchor=0.0,
     log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Ping-pong sampler with multiple LatCH guides — the rf_denoiser twin of
@@ -365,6 +369,7 @@ def sample_flow_pingpong_multi_latch_guided(
 
         # --- the ONE line that differs from Euler: renoise with FRESH noise -----
         x = ((1.0 - t_next) * z0 + t_next * torch.randn_like(z0)).detach()
+        x = _anchor_std(x, t_next, guide_anchor)
 
     x = x.to(model_dtype)
 
@@ -394,6 +399,28 @@ def _rescale_like(new, ref, phi):
     s_ref = ref.std(dim=dims, keepdim=True)
     s_new = new.std(dim=dims, keepdim=True).clamp_min(1e-8)
     return phi * (new * (s_ref / s_new)) + (1.0 - phi) * new
+
+
+def _anchor_std(x, t, s0):
+    """Trajectory anchor: cap each sample's std at the value a healthy x_t has at this t.
+
+    With x_t = (1-t)*z0 + t*noise, z0 of std s0 and unit noise independent, the expected
+    std is sqrt(((1-t)*s0)^2 + t^2). Guidance that steers hard (flat weighting, early
+    windows, high gain) leaves states the model then INFLATES over its later steps: the
+    final latent std reaches 2-5 against ~1.1 unguided, heard as louder and distorted.
+    A per-edit rescale (_rescale_like) cannot see that growth because it happens between
+    edits (test 2026-10-15). This caps the state itself, after every step, guided or not.
+    A CEILING only: states at or below the expected level are untouched, so with s0 above
+    the unguided latent std (~1.0-1.2 for SA3 medium-base) a normal render is unchanged.
+    s0 <= 0 disables it.
+    """
+    if s0 <= 0:
+        return x
+    t = float(t)
+    target = (((1.0 - t) * s0) ** 2 + t ** 2) ** 0.5
+    dims = tuple(range(1, x.dim()))
+    s = x.std(dim=dims, keepdim=True).clamp_min(1e-8)
+    return x * (target / s).clamp(max=1.0)
 
 
 def _window_scale(alpha, start, end, schedule="alpha"):

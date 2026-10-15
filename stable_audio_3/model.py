@@ -1,5 +1,6 @@
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_schedule"] ("alpha" | "flat") forwarded to the guided samplers
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_rescale"] (0..1 per-step std rescale) forwarded to the guided samplers
+# Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_anchor"] (trajectory std ceiling s0) forwarded to the guided samplers
 import json
 import numpy as np
 import torch
@@ -632,6 +633,7 @@ class StableAudioModel:
                 "n_iter": int(latch_hparams.get("n_iter", 4)),
                 "guide_schedule": str(latch_hparams.get("guide_schedule", "alpha")),
                 "guide_rescale": float(latch_hparams.get("guide_rescale", 0.0)),
+                "guide_anchor": float(latch_hparams.get("guide_anchor", 0.0)),
                 "log_norms": bool(latch_hparams.get("log_norms", False)),
             }
 

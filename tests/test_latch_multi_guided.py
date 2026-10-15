@@ -199,3 +199,54 @@ def test_pingpong_accepts_guide_rescale():
     out = sample_flow_pingpong_multi_latch_guided(
         _toy_model, torch.randn(1, 4, 8), _schedule(6), [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0, guide_rescale=1.0)
     assert torch.isfinite(out).all()
+
+
+# --- guide_anchor (WINTERMUTE 2026-10-15) ------------------------------------------------
+from stable_audio_3.inference.latch_guided import _anchor_std  # noqa: E402
+
+
+def test_anchor_std_is_a_ceiling_at_the_healthy_level():
+    torch.manual_seed(0)
+    loud, quiet = 5.0 * torch.randn(2, 4, 64), 0.5 * torch.randn(2, 4, 64)
+    assert torch.equal(_anchor_std(loud, 0.3, 0.0), loud)            # off
+    assert torch.equal(_anchor_std(quiet, 0.3, 1.2), quiet)          # below the ceiling: untouched
+    capped = _anchor_std(loud, 0.0, 1.2).std(dim=(1, 2))             # t=0: ceiling = s0
+    assert torch.allclose(capped, torch.full_like(capped, 1.2), atol=1e-5)
+    capped = _anchor_std(loud, 1.0, 1.2).std(dim=(1, 2))             # t=1: ceiling = unit noise
+    assert torch.allclose(capped, torch.ones_like(capped), atol=1e-5)
+
+
+def test_anchor_zero_is_the_default_path():
+    torch.manual_seed(0)
+    x, sigmas = torch.randn(1, 4, 8), _schedule(8)
+    a = sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0)
+    b = sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0,
+                                             guide_anchor=0.0)
+    assert torch.equal(a, b)
+
+
+def test_anchor_caps_the_final_latent_and_still_steers():
+    torch.manual_seed(0)
+    # Target alternates +-5 over time, so steering toward it inflates the variance (a uniform
+    # target would only shift the mean, which std does not see).
+    torch.manual_seed(0)
+    x, sigmas = torch.randn(1, 4, 8), _schedule(8)
+    tgt = torch.tensor([5.0, -5.0] * 4).view(1, 1, 8)
+
+    def run(**kw):
+        g = {**_guide(0.0), "target": tgt.clone()}
+        return sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [g], rho=5.0, mu=5.0, gamma=0.0, **kw)
+
+    raw, anch = run(), run(guide_anchor=1.2)
+    assert raw.std() > 1.2 and anch.std() <= 1.2 + 1e-4
+    probe = lambda z: (_ConstHead()(z, torch.zeros(1)) * tgt).mean()  # noqa: E731  alignment with the target
+    plain = sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [])
+    assert probe(anch) > probe(plain) + 1e-3
+
+
+def test_pingpong_accepts_guide_anchor():
+    torch.manual_seed(0)
+    out = sample_flow_pingpong_multi_latch_guided(
+        _toy_model, torch.randn(1, 4, 8), _schedule(6),
+        [{**_guide(0.0), "target": torch.tensor([5.0, -5.0] * 4).view(1, 1, 8)}], rho=5.0, mu=5.0, gamma=0.0, guide_anchor=1.2)
+    assert torch.isfinite(out).all() and out.std() <= 1.2 + 1e-4
