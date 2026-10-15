@@ -602,6 +602,9 @@ def train(args):
             for _cp in ckpt_paths:
                 torch.save(_ck, _cp)
                 print(f"  -> saved {_cp}{' (new best)' if is_best and _cp.endswith('_best.pt') else ''}")
+            if args.save_online and args.save_every_epoch:
+                # ONLINE weights = the live params right now: for the modular/Fusion optimiser that is the Schedule-Free AVERAGED iterate x (opt.eval() above), no EMA on top.
+                torch.save({**_ck, "state_dict": model.state_dict(), "ema": 0.0, "weights": "online_sf_average"}, os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}_online.pt"))
             if ema_extra and args.save_every_epoch:
                 for _hl, _dec, _ep in ema_extra:
                     _p = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}_ema{_hl:g}.pt")
@@ -732,6 +735,7 @@ if __name__ == "__main__":
                    help="cosine-decay the LR (every param group) from START to END epochs to --cosine-min-frac x lr; constant before, held at the floor after")
     p.add_argument("--cosine-min-frac", type=float, default=0.0)
     p.add_argument("--ema-halflife-epochs", type=float, default=None, help="EMA half-life in EPOCHS (overrides --ema; decay = 0.5**(1/(halflife*steps_per_epoch)))")
+    p.add_argument("--save-online", action="store_true", help="with --save-every-epoch also write ep<N>_online.pt = the live (non-EMA) weights; under the modular optimiser the Schedule-Free averaged iterate")
     p.add_argument("--ema-extra-halflife-epochs", type=float, nargs="*", default=[], help="additional EMA trackers (half-lives in EPOCHS) updated alongside the main one in the SAME run; each epoch checkpoint also gets a latch_sa3_<feat>_ep<N>_ema<hl>.pt sibling (requires --save-every-epoch)")
     p.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps (0 = run all epochs); epochs is raised to cover it")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
