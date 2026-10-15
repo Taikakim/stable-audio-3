@@ -426,6 +426,15 @@ def train(args):
         from avp_sa3.sa3_control.telemetry import TrainTelemetry
         run_name = args.run_name or f"latch_{args.feature}_{args.t_injection}_d{args.depth}_{args.optimizer}"
         wb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        _hist = wb.Histogram   # a weight tensor whose value range collapses to ~0 (low lr) makes numpy raise "Too many bins" and killed B4 (lr 1e-4) in 10 s; log a single bin instead
+        def _safe_hist(x, *a, **k):
+            try:
+                return _hist(x, *a, **k)
+            except ValueError:
+                import numpy as _np
+                x = _np.asarray(x, dtype="float64").ravel()
+                return _hist(np_histogram=(_np.array([x.size]), _np.array([float(x.min()), float(x.min()) + 1e-12])))
+        wb.Histogram = _safe_hist
         telem = TrainTelemetry(model, wb, scalar_every=args.log_every, layer_every=args.layer_every)
         print(f"[wandb] full telemetry -> project={args.wandb_project} run={run_name}", flush=True)
 
