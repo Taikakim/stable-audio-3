@@ -153,3 +153,49 @@ def test_flat_schedule_guides_the_first_step_alpha_does_not():
         guide_schedule="flat")
     probe = _ConstHead()
     assert probe(flat, torch.zeros(1)).mean() < probe(plain, torch.zeros(1)).mean() - 1e-3
+
+
+# --- guide_rescale (WINTERMUTE 2026-10-15) -----------------------------------------------
+from stable_audio_3.inference.latch_guided import (  # noqa: E402
+    _rescale_like, sample_flow_pingpong_multi_latch_guided,
+)
+
+
+def test_rescale_like_phi_endpoints():
+    torch.manual_seed(0)
+    ref, new = torch.randn(2, 4, 16), 3.0 * torch.randn(2, 4, 16) + 1.0
+    assert torch.equal(_rescale_like(new, ref, 0.0), new)
+    out = _rescale_like(new, ref, 1.0)
+    assert torch.allclose(out.std(dim=(1, 2)), ref.std(dim=(1, 2)), atol=1e-5)   # per sample
+    half = _rescale_like(new, ref, 0.5).std(dim=(1, 2))
+    assert ((half < new.std(dim=(1, 2))) & (half > ref.std(dim=(1, 2)))).all()
+
+
+def test_rescale_zero_is_the_default_path():
+    torch.manual_seed(0)
+    x, sigmas = torch.randn(1, 4, 8), _schedule(8)
+    a = sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0)
+    b = sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0,
+                                             guide_rescale=0.0)
+    assert torch.equal(a, b)
+
+
+def test_rescale_holds_energy_but_still_steers():
+    # A strong pull to a far target inflates the latent; rescale must keep its std near the
+    # unguided one while the head readout still moves toward the target.
+    torch.manual_seed(0)
+    x, sigmas = torch.randn(1, 4, 8), _schedule(8)
+    run = lambda **kw: sample_flow_euler_multi_latch_guided(  # noqa: E731
+        _toy_model, x.clone(), sigmas, [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0, **kw)
+    plain = sample_flow_euler_multi_latch_guided(_toy_model, x.clone(), sigmas, [])
+    raw, resc = run(), run(guide_rescale=1.0)
+    assert abs(resc.std() - plain.std()) < abs(raw.std() - plain.std())
+    probe = _ConstHead()
+    assert probe(resc, torch.zeros(1)).mean() < probe(plain, torch.zeros(1)).mean() - 1e-3
+
+
+def test_pingpong_accepts_guide_rescale():
+    torch.manual_seed(0)
+    out = sample_flow_pingpong_multi_latch_guided(
+        _toy_model, torch.randn(1, 4, 8), _schedule(6), [_guide(-5.0)], rho=5.0, mu=5.0, gamma=0.0, guide_rescale=1.0)
+    assert torch.isfinite(out).all()

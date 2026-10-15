@@ -1,5 +1,6 @@
 # stable_audio_3/inference/latch_guided.py
 # Last edited: WINTERMUTE 2026-10-15 — guide_schedule="flat" option (constant per-step weight) beside the TFG alpha schedule
+# Last edited: WINTERMUTE 2026-10-15 — guide_rescale (per-step std rescale after each guidance edit, LatCH analogue of CFG rescale)
 """Gradient-enabled Euler sampler with LatCH Training-Free Guidance for SA3 (Phase 1)."""
 
 import torch
@@ -83,7 +84,7 @@ def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
 @torch.enable_grad()
 def sample_flow_euler_multi_latch_guided(
     model, x, sigmas, guides, *,
-    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha",
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0,
     log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Flow-matching Euler sampler with multiple LatCH guides (Selective TFG).
@@ -107,6 +108,9 @@ def sample_flow_euler_multi_latch_guided(
     guide_schedule: shape of s_t inside each guide's window -- "alpha" (TFG default,
             s_t ∝ 1 - t, so near zero at the first, noisiest steps) or "flat"
            (equal weight on every active step). See _window_scale.
+    guide_rescale: 0..1, after each guidance edit (x after the variance step, z0 after
+           mean guidance) pull the per-sample std back toward its pre-guidance value.
+           0 = off (default). See _rescale_like.
     All guidance math runs in fp32 (heads are fp32); x is cast to the diffusion
     model's dtype only for the velocity forward, so this works whether the model
     is fp16 or fp32.
@@ -174,7 +178,7 @@ def sample_flow_euler_multi_latch_guided(
                     "gv_norm": grad_var.detach().norm().item(),
                     "x_norm": x.detach().norm().item(), "rho_t": rho_t,
                 })
-            x = (x - rho_t * grad_var).detach()
+            x = _rescale_like((x - rho_t * grad_var).detach(), x.detach(), guide_rescale)
 
         with torch.no_grad():
             v = model(x.to(model_dtype), t_b.to(model_dtype), **model_kwargs).float()
@@ -183,6 +187,7 @@ def sample_flow_euler_multi_latch_guided(
         # --- Mean guidance on the clean estimate (head queried at t=0) ---
         if active and mu_t > 0:
             t0 = torch.zeros(b, device=x.device)
+            z0_pre = z0.detach()
             for _ in range(n_iter):
                 z0 = z0.detach().requires_grad_(True)
                 z_in = z0
@@ -195,6 +200,7 @@ def sample_flow_euler_multi_latch_guided(
                 )
                 grad_mean = torch.autograd.grad(loss_mean, z0)[0]
                 z0 = (z0 - mu_t * grad_mean).detach()
+            z0 = _rescale_like(z0, z0_pre, guide_rescale)
 
         t_b3 = t_curr.clamp(min=1e-6)
         d = (x - z0) / t_b3
@@ -243,7 +249,7 @@ def resolve_guided_sampler(objective, latch_hparams=None, sampler_type=None):
 @torch.enable_grad()
 def sample_flow_pingpong_multi_latch_guided(
     model, x, sigmas, guides, *,
-    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha",
+    rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0,
     log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Ping-pong sampler with multiple LatCH guides — the rf_denoiser twin of
@@ -332,7 +338,7 @@ def sample_flow_pingpong_multi_latch_guided(
                     "gv_norm": grad_var.detach().norm().item(),
                     "x_norm": x.detach().norm().item(), "rho_t": rho_t,
                 })
-            x = (x - rho_t * grad_var).detach()
+            x = _rescale_like((x - rho_t * grad_var).detach(), x.detach(), guide_rescale)
 
         with torch.no_grad():
             v = model(x.to(model_dtype), t_b.to(model_dtype), **model_kwargs).float()
@@ -342,6 +348,7 @@ def sample_flow_pingpong_multi_latch_guided(
         # Ping-pong re-noises FROM z0, so this is what the next step inherits.
         if active and mu_t > 0:
             t0 = torch.zeros(b, device=x.device)
+            z0_pre = z0.detach()
             for _ in range(n_iter):
                 z0 = z0.detach().requires_grad_(True)
                 z_in = z0
@@ -354,6 +361,7 @@ def sample_flow_pingpong_multi_latch_guided(
                 )
                 grad_mean = torch.autograd.grad(loss_mean, z0)[0]
                 z0 = (z0 - mu_t * grad_mean).detach()
+            z0 = _rescale_like(z0, z0_pre, guide_rescale)
 
         # --- the ONE line that differs from Euler: renoise with FRESH noise -----
         x = ((1.0 - t_next) * z0 + t_next * torch.randn_like(z0)).detach()
@@ -366,6 +374,26 @@ def sample_flow_pingpong_multi_latch_guided(
             print(f"  i={r['i']:>3} sigma={r['sigma']:.4f} "
                   f"||grad_var||={r['gv_norm']:.4e} ||x||={r['x_norm']:.4e} rho_t={r['rho_t']:.4e}")
     return x
+
+
+def _rescale_like(new, ref, phi):
+    """Guidance rescale: pull each sample's std back toward its pre-guidance std.
+
+    The LatCH analogue of CFG rescale (Lin et al. 2023): a guidance step may move
+    the latent but should not add energy. Strong guidance (flat weighting, high gain)
+    otherwise inflates the latent and the decode comes out louder and distorted
+    (listening, 2026-10-15). phi=0 is a no-op, phi=1 restores the std exactly;
+    in between, the rescaled and raw tensors are blended as in CFG rescale.
+    Std is per sample over (channels, time), so energy may still move between
+    channels and frames -- which onset steering needs -- but the total cannot grow
+    or shrink.
+    """
+    if phi <= 0:
+        return new
+    dims = tuple(range(1, new.dim()))
+    s_ref = ref.std(dim=dims, keepdim=True)
+    s_new = new.std(dim=dims, keepdim=True).clamp_min(1e-8)
+    return phi * (new * (s_ref / s_new)) + (1.0 - phi) * new
 
 
 def _window_scale(alpha, start, end, schedule="alpha"):
