@@ -467,6 +467,17 @@ def train(args):
         telem = TrainTelemetry(model, wb, scalar_every=args.log_every, layer_every=args.layer_every)
         print(f"[wandb] full telemetry -> project={args.wandb_project} run={run_name}", flush=True)
 
+    _feat = {}
+    def _decorr_penalty():
+        z = _feat["h"].float().reshape(-1, _feat["h"].shape[-1])
+        z = (z - z.mean(0, keepdim=True)) / (z.std(0, keepdim=True) + 1e-6)
+        c = (z.T @ z) / z.shape[0]
+        d = c.shape[0]
+        return (c.pow(2).sum() - d) / (d * (d - 1))   # mean squared off-diagonal correlation (diag is 1 after standardising)
+    if args.decorr_lambda > 0:
+        model.out_proj.register_forward_pre_hook(lambda m, inp: _feat.__setitem__("h", inp[0]))
+        print(f"[decorr] lambda={args.decorr_lambda} on the input of out_proj", flush=True)
+    pen_total = 0.0
     best_loss = float("inf")
     for epoch in range(args.epochs):
         model.train()
@@ -495,7 +506,13 @@ def train(args):
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 preds = model(z_t, t)
             loss = criterion(preds.float(), targets, mask)
-            (loss / accum).backward()    # scale so accumulated grads ≈ mean over the effective batch
+            if args.decorr_lambda > 0:
+                with torch.autocast("cuda", enabled=False):
+                    pen = _decorr_penalty()
+                pen_total += float(pen.item())
+                (loss / accum + args.decorr_lambda * pen / accum).backward()
+            else:
+                (loss / accum).backward()    # scale so accumulated grads ≈ mean over the effective batch
             total += loss.item()         # report the unscaled per-micro-batch loss
             nbatches += 1
             micro_in_group += 1
@@ -539,7 +556,8 @@ def train(args):
                 if args.max_steps and step >= args.max_steps:
                     break
         avg_loss = total / max(nbatches, 1)
-        print(f"epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}")
+        print(f"epoch {epoch+1}/{args.epochs}  loss={avg_loss:.4f}" + (f"  decorr={pen_total / max(nbatches, 1):.4f}" if args.decorr_lambda > 0 else ""))
+        pen_total = 0.0
         if not math.isfinite(avg_loss):
             # diverged: every later epoch is NaN and every later checkpoint garbage (overnight 2026-10-15: four arms burned hours on NaN epochs). Stop without saving this epoch.
             print(f"non-finite training loss at epoch {epoch+1}: stopping (no checkpoint written for this epoch)")
@@ -779,6 +797,8 @@ if __name__ == "__main__":
     p.add_argument("--ema-halflife-epochs", type=float, default=None, help="EMA half-life in EPOCHS (overrides --ema; decay = 0.5**(1/(halflife*steps_per_epoch)))")
     p.add_argument("--save-online", action="store_true", help="with --save-every-epoch also write ep<N>_online.pt = the live (non-EMA) weights; under the modular optimiser the Schedule-Free averaged iterate")
     p.add_argument("--ema-extra-halflife-epochs", type=float, nargs="*", default=[], help="additional EMA trackers (half-lives in EPOCHS) updated alongside the main one in the SAME run; each epoch checkpoint also gets a latch_sa3_<feat>_ep<N>_ema<hl>.pt sibling (requires --save-every-epoch)")
+    p.add_argument("--decorr-lambda", type=float, default=0.0, help="DeCov-style decorrelation penalty weight on the head's final hidden features (input of out_proj, after norm_final): lambda * mean squared OFF-DIAGONAL "
+                   "correlation between the hidden channels over all (batch x time) positions. 0 = off. Owner 2026-10-16: force the head to spread the solution over many units instead of a few loud co-active ones.")
     p.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps (0 = run all epochs); epochs is raised to cover it")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
                    help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
