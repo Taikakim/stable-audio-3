@@ -211,6 +211,35 @@ def make_optimizer(args, model):
     else (1D, biases, LayerNorm, small/odd projections) to ScheduleFree-AdamW."""
     if args.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=args.lr), False
+    if args.optimizer == "muon_ref":
+        # BY-THE-BOOK baseline (owner 2026-10-16: "pure Muon at 1e-3 and 1e-4, to see what we are competing against"): NVIDIA Emerging-Optimizers Muon
+        # (momentum 0.95, nesterov, 5-step quintic Newton-Schulz, decoupled wd 0.01, spectral scale max(1, sqrt(m/n))) on the hidden 2-D matrices (our "spectral" routing, min dim >= 64),
+        # AdamW (betas 0.9/0.95, wd 0) on everything else, ONE lr for both. No whitening, no Schedule-Free, no NorMuon, no brake, no warmup: nothing of ours.
+        import sys as _s
+        _s.path.insert(0, "/home/kim/Projects/Emerging-Optimizers")
+        from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+        from stable_audio_tools.training.modular_opt import build_modular_param_groups
+        _g = build_modular_param_groups(model, default_whitening="none", spectral_wd=0.01, spectral_all=False)
+        _spec = [q for g in _g if g.get("group_type") == "spectral" for q in g["params"]]
+        _ids = {id(q) for q in _spec}
+        _rest = [q for q in model.parameters() if id(q) not in _ids]
+        _muon = Muon(_spec, lr=args.lr, momentum=0.95, weight_decay=0.01, nesterov=True, scale_mode="spectral", extra_scale_factor=1.0)
+        _adam = torch.optim.AdamW(_rest, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
+        print(f"muon_ref: Muon on {len(_spec)} tensors ({sum(q.numel() for q in _spec):,} params), AdamW on {len(_rest)} tensors ({sum(q.numel() for q in _rest):,} params), lr {args.lr}", flush=True)
+
+        class _Pair(torch.optim.Optimizer):
+            def __init__(self, a, b):
+                self._a, self._b = a, b
+                self.defaults = {}
+                self.state = {}
+                self.param_groups = a.param_groups + b.param_groups
+            def step(self, closure=None):
+                self._a.step(); self._b.step()
+            def zero_grad(self, set_to_none=True):
+                self._a.zero_grad(set_to_none=set_to_none); self._b.zero_grad(set_to_none=set_to_none)
+            def state_dict(self):
+                return {"muon": self._a.state_dict(), "adamw": self._b.state_dict()}
+        return _Pair(_muon, _adam), False
     if args.optimizer == "lion":
         return Lion(model.parameters(), lr=args.lr, betas=(args.lion_b1, args.lion_b2),
                     weight_decay=args.lion_wd), False
@@ -717,7 +746,7 @@ if __name__ == "__main__":
                         "6 stops paying off. Use 8 for fast-prototyping niche only.")
     p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
-    p.add_argument("--optimizer", choices=["adamw", "fusion", "modular", "lion"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "fusion", "modular", "lion", "muon_ref"], default="adamw")
     p.add_argument("--lion-b1", type=float, default=0.9)
     p.add_argument("--lion-b2", type=float, default=0.99)
     p.add_argument("--lion-wd", type=float, default=0.0, help="--optimizer lion: decoupled wd (Lion papers use 3-10x AdamW's)")
