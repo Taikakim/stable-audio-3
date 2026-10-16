@@ -600,12 +600,20 @@ def train(args):
                         "var_wd_boost": getattr(args, "var_wd_boost", 0.0),
                         "radial_brake": getattr(args, "modular_radial_brake", 1.0),
                         "magnitude_update": args.modular_magnitude_update,
+                        "normuon_mode": args.modular_normuon_mode,
+                        "update_scale": args.modular_update_scale,
+                        "normuon_after_unwhiten": args.modular_normuon_after_unwhiten,
+                        "ns_dtype": args.modular_ns_dtype,
+                        "state_dtype": args.modular_state_dtype,
+                        "ns_batch": args.modular_ns_batch,
                     },
                     "param_groups": {
                         "default_whitening": args.modular_whitening,
                         "split_qkv": args.modular_split_qkv,
                         "split_adaln": args.modular_split_adaln,
                         "lora_a_lr_mult": args.modular_lora_a_lr_mult,
+                        "scalar_opt": args.modular_scalar_opt,
+                        **({"sign_lr": args.modular_sign_lr} if args.modular_sign_lr is not None else {}),
                         **({"spectral_wd": args.weight_decay}
                            if args.weight_decay is not None else {}),
                     },
@@ -1018,6 +1026,24 @@ def main():
                      default="additive",
                      help="DoRA magnitude step: additive (m -= lr*sign, can cross zero) or "
                           "multiplicative (m *= exp(-lr*sign): scale-relative, stays positive).")
+    # C-series (KUANG 2026-10-17; SAO docs/modular-opt-test-plan-2026-10-17.md, docs/TRAINING.md §2e). Defaults = historical.
+    mod.add_argument("--modular-normuon-mode", choices=["row_unit", "dion"], default="row_unit",
+                     help="NorMuon form: row_unit = ours; dion = microsoft/dion. On wide matrices such as lora_A "
+                          "(rank x d_in) ours steps ~sqrt(d_in/rank) larger (~3.5x at 128x1536). Test plan C")
+    mod.add_argument("--modular-update-scale", choices=["native", "rms0.2"], default="native",
+                     help="rms0.2 = every matrix update rescaled to RMS 0.2*lr per element (SF-NorMuon, Adam-matched)")
+    mod.add_argument("--modular-normuon-after-unwhiten", action="store_true",
+                     help="with --modular-whitening shampoo, run NorMuon after the Shampoo pullback")
+    mod.add_argument("--modular-ns-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
+                     help="dtype of the Newton-Schulz iteration only (bf16 = FusionOpt's hot path)")
+    mod.add_argument("--modular-ns-batch", action="store_true",
+                     help="one batched Newton-Schulz call per matrix shape instead of one per matrix (speed)")
+    mod.add_argument("--modular-state-dtype", choices=["param", "fp32"], default="param",
+                     help="fp32 = optimizer state + fp32 master copy for low-precision (bf16) parameters")
+    mod.add_argument("--modular-scalar-opt", choices=["sign", "adam"], default="sign",
+                     help="sign-routed parameters (1-D, DoRA magnitudes, AdaLN emitters) by sign descent or Adam")
+    mod.add_argument("--modular-sign-lr", type=float, default=None,
+                     help="separate lr for the sign (or adam) group; default --lr")
     mod.add_argument("--modular-lora-a-lr-mult", type=float, default=1.0,
                      help="Multiply the final step size of every lora_A tensor (applied after NorMuon, "
                           "weight decay unchanged). A's input subspace barely rotates at 1.0.")
