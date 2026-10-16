@@ -296,7 +296,7 @@ def make_optimizer(args, model):
                                beta1=args.mod_momentum, sf_beta=args.mod_sf_beta,
                                normuon_mode=args.mod_normuon_mode, update_scale=args.mod_update_scale,
                                normuon_after_unwhiten=args.mod_normuon_after_unwhiten,
-                               ns_dtype=args.mod_ns_dtype)
+                               ns_dtype=args.mod_ns_dtype, ns_batch=args.mod_ns_batch)
         print(opt.summary())
         if args.mod_late_from > 0:
             opt._late = [(args.mod_radial_brake, args.mod_escape_velocity)]
@@ -547,6 +547,11 @@ def train(args):
                     _rate = 1.0 / max(_now - _t_prev, 1e-6); _t_prev = _now
                     telem.log(step, loss=loss.item(), gnorm=gnorm, it_s=_rate,
                               lr=opt.param_groups[0]["lr"], epoch=epoch)
+                if args.log_mom_spectra > 0 and step % args.log_mom_spectra == 0 and args.optimizer == "modular":
+                    # pre-polar momentum spectra (reading only), test plan section P
+                    from stable_audio_tools.training.modular_opt import momentum_spectra
+                    with open(os.path.join(args.save_dir, "mom_spectra.jsonl"), "a", encoding="utf-8") as _f:
+                        _f.write(json.dumps({"step": step, "matrices": momentum_spectra(opt, model.named_parameters())}) + "\n")
                 step += 1
                 micro_in_group = 0
                 if args.max_steps and step >= args.max_steps:
@@ -654,6 +659,12 @@ def train(args):
                 "val_split": val_meta,
                 "selected_on": "val_loss" if val_loader is not None else "train_loss",
             })
+            if args.save_opt_state:
+                # optimizer state (momentum, Schedule-Free z/x) so scripts/latch/spectral_probe.py can probe the
+                # gradient point y = (1 - sf_beta) z + sf_beta x with the run's own momentum (z, x are in the state).
+                _ck["optimizer_state"] = opt.state_dict()
+                _ck["optimizer_class"] = type(opt).__name__
+                _ck["arch"] = {"dim": args.dim, "depth": args.depth, "num_heads": args.num_heads}
             for _cp in ckpt_paths:
                 torch.save(_ck, _cp)
                 print(f"  -> saved {_cp}{' (new best)' if is_best and _cp.endswith('_best.pt') else ''}")
@@ -812,6 +823,14 @@ if __name__ == "__main__":
                    help="every N optimizer steps, split the micro-batch in two halves and log gradient cosine / noise "
                         "scale per matrix to <save-dir>/grad_noise.jsonl (2 extra forward+backward passes on those steps; "
                         "training unchanged). 0 = off. Test plan section N")
+    p.add_argument("--mod-ns-batch", action="store_true",
+                   help="--optimizer modular: one batched Newton-Schulz call per matrix shape instead of one per matrix (speed)")
+    p.add_argument("--log-mom-spectra", type=int, default=0,
+                   help="--optimizer modular: every N steps write pre-polar momentum singular values per matrix to "
+                        "<save-dir>/mom_spectra.jsonl (reading only). 0 = off")
+    p.add_argument("--save-opt-state", action="store_true",
+                   help="also store the optimizer state (momentum, Schedule-Free z/x) and the head's dim/depth/heads in "
+                        "every checkpoint, for scripts/latch/spectral_probe.py (bigger files)")
     p.add_argument("--log-opt-groups", action="store_true",
                    help="--optimizer modular: every --log-every steps write per-group update RMS / weight RMS / relative "
                         "update to <save-dir>/opt_groups.jsonl (works without --wandb)")

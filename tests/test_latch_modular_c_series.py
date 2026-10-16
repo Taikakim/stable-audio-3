@@ -22,7 +22,7 @@ def _args(**over):
              mod_sf=True, mod_warmup=0, mod_precond_freq=10, mod_radial_brake=1.0, mod_escape_velocity=False,
              mod_sf_c_warmup=None, mod_sf_r=1.0, mod_wd_overtraining=False, mod_snr_gate=False, mod_snr_floor=0.0,
              _spe=10, mod_momentum=0.9, mod_sf_beta=0.9, mod_normuon_mode="row_unit", mod_update_scale="native",
-             mod_normuon_after_unwhiten=False, mod_ns_dtype="fp32", mod_late_from=0)
+             mod_normuon_after_unwhiten=False, mod_ns_dtype="fp32", mod_late_from=0, mod_ns_batch=False)
     a.update(over)
     return argparse.Namespace(**a)
 

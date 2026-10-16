@@ -605,6 +605,7 @@ def train(args):
                         "normuon_after_unwhiten": args.modular_normuon_after_unwhiten,
                         "ns_dtype": args.modular_ns_dtype,
                         "state_dtype": args.modular_state_dtype,
+                        "ns_batch": args.modular_ns_batch,
                     },
                     "param_groups": {
                         "default_whitening": args.modular_whitening,
@@ -1035,6 +1036,8 @@ def main():
                      help="with --modular-whitening shampoo, run NorMuon after the Shampoo pullback")
     mod.add_argument("--modular-ns-dtype", choices=["fp32", "bf16", "fp16"], default="fp32",
                      help="dtype of the Newton-Schulz iteration only (bf16 = FusionOpt's hot path)")
+    mod.add_argument("--modular-ns-batch", action="store_true",
+                     help="one batched Newton-Schulz call per matrix shape instead of one per matrix (speed)")
     mod.add_argument("--modular-state-dtype", choices=["param", "fp32"], default="param",
                      help="fp32 = optimizer state + fp32 master copy for low-precision (bf16) parameters")
     mod.add_argument("--modular-scalar-opt", choices=["sign", "adam"], default="sign",
