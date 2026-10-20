@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # Owner: KUANG (created 2026-10-17)
+# Last edited: WINTERMUTE 2026-10-21 -- mean_grad backprops per batch (holding all batch graphs OOMed at T=4096 on 16 GB)
 """Held-out spectral probe for a LatCH head (SAO docs/modular-opt-test-plan-2026-10-17.md section P).
 
 Method after SAMuon (arXiv 2608.25990 section 4), adapted to our optimizer, precision and batch:
@@ -84,9 +85,11 @@ def mean_loss(model, params, batches, draws, criterion, std=None):
 def mean_grad(model, params, names, batches, draws, criterion, std=None):
     """Mean gradient over `batches` with respect to params[names], at the point `params`."""
     leaf = {k: (v.detach().clone().requires_grad_(k in names)) for k, v in params.items()}
-    total = sum(batch_loss(model, leaf, b, d, criterion, std) for b, d in zip(batches, draws)) / len(batches)
-    gs = torch.autograd.grad(total, [leaf[n] for n in names])
-    return {n: g.detach() for n, g in zip(names, gs)}
+    acc = None
+    for b, d in zip(batches, draws):   # one graph at a time: summing all batches first kept 8 graphs alive (OOM on 16 GB)
+        gs = torch.autograd.grad(batch_loss(model, leaf, b, d, criterion, std), [leaf[n] for n in names])
+        acc = [g.detach() for g in gs] if acc is None else [a + g.detach() for a, g in zip(acc, gs)]
+    return {n: g / len(batches) for n, g in zip(names, acc)}
 
 
 def spectral_bases(momenta):
