@@ -1,5 +1,6 @@
 # scripts/latch/train_latch.py
 # Last edited: GHOST-NOTE 2026-10-14 -- --save-every-epoch (per-epoch snapshots alongside best.pt; default off)
+# Last edited: WINTERMUTE 2026-10-21 -- --lr-watchdog: per-group lr halving when a group's weight RMS runs away (default off)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -520,6 +521,15 @@ def train(args):
               f"halves of {args.batch_size // 2} -> grad_noise.jsonl", flush=True)
     opt_groups_path = (os.path.join(args.save_dir, "opt_groups.jsonl")
                        if args.optimizer == "modular" and args.log_opt_groups else None)
+    watchdog = None
+    if args.lr_watchdog > 0:
+        from scripts.latch.norm_watchdog import GroupNormWatchdog
+        _wd_start = args.mod_warmup if args.optimizer == "modular" else 0
+        _wd_window = max(1, int(round(args.lr_watchdog_window_epochs * args._spe)))
+        watchdog = GroupNormWatchdog(len(opt.param_groups), ratio=args.lr_watchdog, window=_wd_window,
+                                     start=_wd_start, factor=args.lr_watchdog_factor)
+        print(f"[lr-watchdog] halve a group's lr when its weight RMS grows > x{args.lr_watchdog} within {_wd_window} "
+              f"steps (checked every {watchdog.check_every}, from step {_wd_start}) -> lr_watchdog.jsonl", flush=True)
 
     best_loss = float("inf")
     for epoch in range(args.epochs):
@@ -587,6 +597,15 @@ def train(args):
                         g["lr"] = b0 * fac
                 opt.step()
                 opt.zero_grad()
+                if watchdog is not None:
+                    for _cut in watchdog.step(step, opt.param_groups):
+                        if hasattr(opt, "_base_lrs"):   # keep a cosine schedule's base in step with the cut
+                            opt._base_lrs[_cut["index"]] *= args.lr_watchdog_factor
+                        print(f"[lr-watchdog] step {step} group {_cut['group']}: weight RMS {_cut['rms_then']:.4g} -> "
+                              f"{_cut['rms_now']:.4g} (x{_cut['ratio']:.2f} since step {_cut['since_step']}), "
+                              f"lr {_cut['lr_old']:.3g} -> {_cut['lr_new']:.3g}", flush=True)
+                        with open(os.path.join(args.save_dir, "lr_watchdog.jsonl"), "a", encoding="utf-8") as _f:
+                            _f.write(json.dumps(_cut) + "\n")
                 if opt_groups_path is not None and getattr(opt, "_telem_on", False):
                     with open(opt_groups_path, "a", encoding="utf-8") as _f:
                         _f.write(json.dumps({"step": step, **opt.component_telemetry}) + "\n")
@@ -890,6 +909,12 @@ if __name__ == "__main__":
     p.add_argument("--log-opt-groups", action="store_true",
                    help="--optimizer modular: every --log-every steps write per-group update RMS / weight RMS / relative "
                         "update to <save-dir>/opt_groups.jsonl (works without --wandb)")
+    p.add_argument("--lr-watchdog", type=float, default=0.0,
+                   help="halve a param group's lr whenever its weight RMS grows by more than this factor within "
+                        "--lr-watchdog-window-epochs (checked from the end of warmup; 0 = off). Every cooked LatCH run of "
+                        "2026-10 showed weight size running away before the loss (scripts/latch/norm_watchdog.py)")
+    p.add_argument("--lr-watchdog-window-epochs", type=float, default=1.0)
+    p.add_argument("--lr-watchdog-factor", type=float, default=0.5)
     p.add_argument("--grad-clip", type=float, default=0.0, help="clip the global gradient norm to this value before every optimizer step (0 = off)")
     p.add_argument("--mod-warmup-epochs", type=float, default=None, help="--optimizer modular: warmup in EPOCHS (overrides --mod-warmup)")
     p.add_argument("--mod-late-from-epochs", type=float, default=None, help="--optimizer modular: switch brake/escape velocity on after this many EPOCHS (overrides --mod-late-from)")
