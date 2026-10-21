@@ -5,6 +5,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- stop at the first non-finite batch loss; cooked-run stops --stop-val-ratio (1.5x best, 2 ep) and --stop-rising-epochs (3)
 # Last edited: WINTERMUTE 2026-10-21 -- --flight-recorder / --skip-spike-ratio (spike incidents with per-item gradient norms; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --mod-precond-beta / --mod-normuon-beta / --mod-adam-beta2 (optimizer constants exposed for batch scaling; defaults unchanged)
+# Last edited: WINTERMUTE 2026-10-21 -- --init-from (weights + standardization stats from a saved head, fresh optimizer; default off)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -445,6 +446,20 @@ def train(args):
     print(f"LatCH head: dim={args.dim} depth={args.depth} heads={args.num_heads} "
           f"t_injection={args.t_injection}, "
           f"params={sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    init_ck = None
+    if args.init_from:
+        # Weights only: the optimizer (any --optimizer) starts fresh. Loaded before the optimizer and the EMA copies
+        # are built, so Schedule-Free's z/x and every EMA start at these weights. A saved head is the SF average /
+        # EMA iterate, which is the right starting point (the fast iterate would add a jump).
+        init_ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        sd = {k.removeprefix("_orig_mod."): v for k, v in init_ck["state_dict"].items()}
+        model.load_state_dict(sd, strict=True)
+        print(f"Init from {args.init_from}: epoch {init_ck.get('epoch')}, val {init_ck.get('val_loss')}, "
+              f"optimizer {init_ck.get('optimizer')} (weights only; optimizer state fresh)")
+        if init_ck.get("feature_name") not in (None, args.feature):
+            raise SystemExit(f"--init-from head is for {init_ck.get('feature_name')!r}, not {args.feature!r}")
+        if init_ck.get("val_split") and val_meta and init_ck["val_split"] != val_meta:
+            raise SystemExit("--init-from checkpoint used a different held-out split; val losses would not compare")
     if args.compile:
         # Build the optimiser on the un-compiled module so FusionOpt's
         # build_fusion_param_groups can introspect param names cleanly; the
@@ -471,6 +486,10 @@ def train(args):
         std_mean = float(allv.mean())
         std_std = float(allv.std()) or 1.0
         print(f"Standardize: mean={std_mean:.4f} std={std_std:.4f}")
+    if init_ck is not None and init_ck.get("standardized"):
+        # The loaded head's output scale is tied to ITS stats; keep them so training continues in the same units.
+        std_mean, std_std = float(init_ck["std_mean"]), float(init_ck["std_std"])
+        print(f"Standardize: using the --init-from stats mean={std_mean:.4f} std={std_std:.4f}")
     use_bf16 = args.precision == "bf16"
 
     # --- EMA of the HEAD's params (no DiT here). When --ema>0 we keep a param-wise
@@ -838,6 +857,8 @@ def train(args):
                 "val_loss": val_loss,
                 "val_split": val_meta,
                 "selected_on": "val_loss" if val_loader is not None else "train_loss",
+                "init_from": args.init_from,
+                "init_from_epoch": init_ck.get("epoch") if init_ck is not None else None,
             })
             if args.save_opt_state:
                 # optimizer state (momentum, Schedule-Free z/x) so scripts/latch/spectral_probe.py can probe the
@@ -924,6 +945,9 @@ if __name__ == "__main__":
                         "(loss scaled by 1/N, step+zero_grad every N, final partial group steps too). "
                         "Effective batch = batch_size * N. EMA updates on the optimizer step, not per micro-batch.")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--init-from", default=None,
+                   help="start from a saved head's weights (and its target standardization stats) with a FRESH optimizer of "
+                        "--optimizer; e.g. a Muon head continued with AdamW. Refuses a different feature or held-out split.")
     p.add_argument("--save-dir", default="latch_weights_sa3")
     p.add_argument("--save-best-only", action="store_true",
                    help="Save only when train-loss improves (Schedule-Free averaged iterate)")
