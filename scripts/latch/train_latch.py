@@ -2,6 +2,7 @@
 # Last edited: GHOST-NOTE 2026-10-14 -- --save-every-epoch (per-epoch snapshots alongside best.pt; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --lr-watchdog: per-group lr halving when a group's weight RMS runs away (default off)
 # Last edited: WINTERMUTE 2026-10-21 -- grad-noise meter reads the real accumulation halves when --grad-accum is even
+# Last edited: WINTERMUTE 2026-10-21 -- stop at the first non-finite batch loss; cooked-run stops --stop-val-ratio (1.5x best, 2 ep) and --stop-rising-epochs (3)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -548,6 +549,7 @@ def train(args):
               f"steps (checked every {watchdog.check_every}, from step {_wd_start}) -> lr_watchdog.jsonl", flush=True)
 
     best_loss = float("inf")
+    cooked, stop_cooked, val_hist = 0, False, []
     for epoch in range(args.epochs):
         model.train()
         if is_fusion:
@@ -585,6 +587,11 @@ def train(args):
                 (loss / accum).backward()    # scale so accumulated grads ≈ mean over the effective batch
             total += loss.item()         # report the unscaled per-micro-batch loss
             nbatches += 1
+            if not math.isfinite(total):
+                # stop at the first non-finite batch loss, not at the end of the epoch: its gradient would turn every
+                # weight NaN at the next optimizer step (the epoch-end check below then ends the run)
+                print(f"non-finite loss at step {step} (epoch {epoch+1}, micro-batch {bi}): stopping", flush=True)
+                break
             micro_in_group += 1
             # with an even accumulation count the noise meter reads the real gradient halves (first vs second
             # accum/2 micro-batches) instead of re-running half of one micro-batch
@@ -721,6 +728,23 @@ def train(args):
         is_best = sel < best_loss
         if is_best:
             best_loss = sel
+        # cooked-run stops (the best checkpoint is already on disk):
+        #  (a) held-out loss above stop_val_ratio x its best for stop_val_epochs epochs in a row;
+        #  (b) held-out loss rose in each of the last stop_rising_epochs epochs AND sits > 5% above its best.
+        # Rule (b) is for a run that never learns: test plan B3 (2026-10-21) went 0.573 -> 0.618 -> 0.649 -> 0.658 and
+        # NaN'd only in epoch 13; (a) alone would have stopped it at epoch 12, (b) stops it at epoch 4. Healthy plateaus
+        # (B2: 0.1944-0.1984 for 8 epochs) neither rise three times running nor leave the 5% band.
+        if val_loss is not None:
+            val_hist.append(val_loss)
+            if args.stop_val_ratio > 0:
+                cooked = cooked + 1 if val_loss > args.stop_val_ratio * best_loss else 0
+                if cooked >= args.stop_val_epochs:
+                    stop_cooked = True
+            k = args.stop_rising_epochs
+            if k > 0 and len(val_hist) > k and all(val_hist[-i] > val_hist[-i - 1] for i in range(1, k + 1)) \
+                    and val_loss > 1.05 * best_loss:
+                stop_cooked = True
+                cooked = k
 
         if args.save_best_only:
             if is_best:
@@ -782,6 +806,11 @@ def train(args):
                 for _hl, _dec, _ep in ema_extra:
                     _p = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}_ema{_hl:g}.pt")
                     torch.save({**_ck, "state_dict": ema_state_dict(_ep), "ema": _dec}, _p)
+        if stop_cooked:
+            print(f"cooked run: held-out loss {val_loss:.4f} vs best {best_loss:.4f} (above {args.stop_val_ratio}x for "
+                  f"{cooked} epochs, or rising {args.stop_rising_epochs} epochs running and > 5% above best): stopping "
+                  f"after epoch {epoch+1} (--stop-val-ratio 0 --stop-rising-epochs 0 disable)", flush=True)
+            break
 
     if wb is not None:
         wb.finish()
@@ -946,6 +975,12 @@ if __name__ == "__main__":
                         "--lr-watchdog-window-epochs (checked from the end of warmup; 0 = off). Every cooked LatCH run of "
                         "2026-10 showed weight size running away before the loss (scripts/latch/norm_watchdog.py)")
     p.add_argument("--lr-watchdog-window-epochs", type=float, default=1.0)
+    p.add_argument("--stop-val-ratio", type=float, default=1.5,
+                   help="stop when held-out loss stays above this x its best for --stop-val-epochs epochs in a row "
+                        "(a cooked run; the best checkpoint is kept). 0 = off")
+    p.add_argument("--stop-val-epochs", type=int, default=2)
+    p.add_argument("--stop-rising-epochs", type=int, default=3,
+                   help="stop when held-out loss rose in each of the last N epochs and is > 5%% above its best. 0 = off")
     p.add_argument("--lr-watchdog-factor", type=float, default=0.5)
     p.add_argument("--grad-clip", type=float, default=0.0, help="clip the global gradient norm to this value before every optimizer step (0 = off)")
     p.add_argument("--mod-warmup-epochs", type=float, default=None, help="--optimizer modular: warmup in EPOCHS (overrides --mod-warmup)")
