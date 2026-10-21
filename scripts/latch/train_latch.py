@@ -3,6 +3,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- --lr-watchdog: per-group lr halving when a group's weight RMS runs away (default off)
 # Last edited: WINTERMUTE 2026-10-21 -- grad-noise meter reads the real accumulation halves when --grad-accum is even
 # Last edited: WINTERMUTE 2026-10-21 -- stop at the first non-finite batch loss; cooked-run stops --stop-val-ratio (1.5x best, 2 ep) and --stop-rising-epochs (3)
+# Last edited: WINTERMUTE 2026-10-21 -- --flight-recorder / --skip-spike-ratio (spike incidents with per-item gradient norms; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --mod-precond-beta / --mod-normuon-beta / --mod-adam-beta2 (optimizer constants exposed for batch scaling; defaults unchanged)
 """Train a LatCH head on SA3 SAME latents.
 
@@ -414,9 +415,17 @@ def train(args):
     else:
         train_ds, tr_idx = ds, list(range(len(ds)))
 
-    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
-                        num_workers=args.num_workers, collate_fn=collate_varlen,
-                        persistent_workers=args.num_workers > 0)
+    rec_sampler = None
+    if args.flight_recorder or args.skip_spike_ratio > 0:
+        # same RNG draws as shuffle=True; remembers each batch's indices so a spike can name its files
+        from scripts.latch.spike_recorder import RecordingBatchSampler
+        rec_sampler = RecordingBatchSampler(torch.utils.data.RandomSampler(train_ds), args.batch_size, drop_last=True)
+        loader = DataLoader(train_ds, batch_sampler=rec_sampler, num_workers=args.num_workers,
+                            collate_fn=collate_varlen, persistent_workers=args.num_workers > 0)
+    else:
+        loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+                            num_workers=args.num_workers, collate_fn=collate_varlen,
+                            persistent_workers=args.num_workers > 0)
 
     _spe = max(1, len(loader) // max(1, args.grad_accum))                               # optimizer steps per epoch
     if args.max_steps:
@@ -551,6 +560,16 @@ def train(args):
         print(f"[lr-watchdog] halve a group's lr when its weight RMS grows > x{args.lr_watchdog} within {_wd_window} "
               f"steps (checked every {watchdog.check_every}, from step {_wd_start}) -> lr_watchdog.jsonl", flush=True)
 
+    spike_rec = None
+    if rec_sampler is not None:
+        from scripts.latch.spike_recorder import SpikeRecorder, total_grad_norm, top_params, attribute_items
+        spike_rec = SpikeRecorder(os.path.join(args.save_dir, "incidents.jsonl"), ratio=args.flight_ratio,
+                                  skip_ratio=args.skip_spike_ratio, window=args.flight_window, warmup=args.flight_warmup)
+        print(f"[flight-recorder] incident at >= x{args.flight_ratio} the median raw grad norm (last {args.flight_window} "
+              f"steps, from step {args.flight_warmup})"
+              + (f"; SKIP the step at >= x{args.skip_spike_ratio} or non-finite" if args.skip_spike_ratio > 0 else "")
+              + " -> incidents.jsonl", flush=True)
+
     best_loss = float("inf")
     cooked, stop_cooked, val_hist = 0, False, []
     for epoch in range(args.epochs):
@@ -564,7 +583,10 @@ def train(args):
         opt.zero_grad()
         micro_in_group = 0
         gn_snap = None
+        grp_idx, grp_t = [], []      # flight recorder: dataset indices and t of the current optimizer step's items
         for bi, batch in enumerate(loader):
+            if rec_sampler is not None:
+                grp_idx += [int(tr_idx[j]) for j in rec_sampler.queue.popleft()]
             latents = batch["latents"].to(device)
             targets = batch["targets"].to(device)
             # mask = length (padding) mask; weight = per-frame loss weight (all-ones unless
@@ -576,6 +598,8 @@ def train(args):
             if args.standardize:
                 targets = (targets - std_mean) / std_std
             t = torch.rand(latents.shape[0], device=device)
+            if rec_sampler is not None:
+                grp_t += t.tolist()
             noise = torch.randn_like(latents)
             z_t = forward_noise(latents, noise, t)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -625,6 +649,12 @@ def train(args):
                     gn_snap = None
                 elif gn_meter is not None and gn_meter.due(step) and z_t.shape[0] >= 2:
                     _gn_measure(gn_meter, model, criterion, z_t, t, targets, mask, step, device, use_bf16)
+                spike_inc, spike_skip, spike_med, spike_r, spike_raw, spike_top = False, False, None, None, None, None
+                if spike_rec is not None:   # raw (pre-clip) norm of the whole step's gradient
+                    spike_raw = total_grad_norm(model.parameters())
+                    spike_inc, spike_skip, spike_med, spike_r = spike_rec.judge(spike_raw)
+                    if spike_inc:
+                        spike_top = top_params(model)
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 if getattr(opt, "_late", None) and step == args.mod_late_from:
@@ -637,8 +667,24 @@ def train(args):
                     fac = args.cosine_min_frac + (1 - args.cosine_min_frac) * 0.5 * (1 + math.cos(math.pi * u))
                     for g, b0 in zip(opt.param_groups, opt._base_lrs):
                         g["lr"] = b0 * fac
-                opt.step()
+                if not spike_skip:
+                    opt.step()
                 opt.zero_grad()
+                if spike_rec is not None:
+                    if spike_inc:
+                        _items = attribute_items(model, criterion, ds, grp_idx, grp_t, collate_varlen, device, use_bf16,
+                                                 forward_noise, std_mean if args.standardize else None,
+                                                 std_std if args.standardize else None, seed=step)
+                        spike_rec.write({"step": step, "epoch": epoch + 1, "raw_norm": spike_raw, "median": spike_med,
+                                         "ratio": spike_r, "skipped": bool(spike_skip), "loss": float(loss.item()),
+                                         "top_params": spike_top, "items": _items})
+                        _worst = max(_items, key=lambda r: r["grad_norm"]) if _items else None
+                        print(f"[flight-recorder] step {step}: raw grad norm {spike_raw:.4g} = x{spike_r:.1f} median"
+                              + (" SKIPPED" if spike_skip else "")
+                              + (f"; largest item grad {_worst['grad_norm']:.3g} t={_worst['t']:.2f} "
+                                 f"{os.path.basename(_worst['file'])}" if _worst else ""), flush=True)
+                    spike_rec.note(step, spike_raw, float(loss.item()))
+                    grp_idx, grp_t = [], []
                 if watchdog is not None:
                     for _cut in watchdog.step(step, opt.param_groups):
                         if hasattr(opt, "_base_lrs"):   # keep a cosine schedule's base in step with the cut
@@ -651,7 +697,7 @@ def train(args):
                 if opt_groups_path is not None and getattr(opt, "_telem_on", False):
                     with open(opt_groups_path, "a", encoding="utf-8") as _f:
                         _f.write(json.dumps({"step": step, **opt.component_telemetry}) + "\n")
-                if ema_params is not None:   # EMA on the optimizer step (every `accum` micro-batches), not per micro-batch
+                if ema_params is not None and not spike_skip:   # EMA on the optimizer step (every `accum` micro-batches), not per micro-batch
                     with torch.no_grad():
                         for e, p in zip(ema_params, model.parameters()):
                             e.lerp_(p.detach(), 1.0 - args.ema)
@@ -992,6 +1038,17 @@ if __name__ == "__main__":
     p.add_argument("--stop-rising-epochs", type=int, default=3,
                    help="stop when held-out loss rose in each of the last N epochs and is > 5%% above its best. 0 = off")
     p.add_argument("--lr-watchdog-factor", type=float, default=0.5)
+    p.add_argument("--flight-recorder", action="store_true",
+                   help="log gradient spikes (raw pre-clip norm >= --flight-ratio x its running median, or non-finite) "
+                        "to <save-dir>/incidents.jsonl with every item's file, t, loss and own gradient norm "
+                        "(scripts/latch/spike_recorder.py). Reading only unless --skip-spike-ratio is set")
+    p.add_argument("--flight-ratio", type=float, default=4.0)
+    p.add_argument("--flight-window", type=int, default=200, help="steps in the running median")
+    p.add_argument("--flight-warmup", type=int, default=50, help="no incidents before this many steps")
+    p.add_argument("--skip-spike-ratio", type=float, default=0.0,
+                   help="skip the optimizer step (gradient dropped, recorded) when the raw norm is >= this x the running "
+                        "median or non-finite; implies --flight-recorder. 0 = off. Keep it well above --flight-ratio: "
+                        "most spikes are high-t batches (legitimate, noisy), skipping those under-trains high noise")
     p.add_argument("--grad-clip", type=float, default=0.0, help="clip the global gradient norm to this value before every optimizer step (0 = off)")
     p.add_argument("--mod-warmup-epochs", type=float, default=None, help="--optimizer modular: warmup in EPOCHS (overrides --mod-warmup)")
     p.add_argument("--mod-late-from-epochs", type=float, default=None, help="--optimizer modular: switch brake/escape velocity on after this many EPOCHS (overrides --mod-late-from)")
