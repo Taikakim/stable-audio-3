@@ -1,6 +1,7 @@
 # scripts/latch/train_latch.py
 # Last edited: GHOST-NOTE 2026-10-14 -- --save-every-epoch (per-epoch snapshots alongside best.pt; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --lr-watchdog: per-group lr halving when a group's weight RMS runs away (default off)
+# Last edited: WINTERMUTE 2026-10-21 -- grad-noise meter reads the real accumulation halves when --grad-accum is even
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -192,6 +193,21 @@ class Lion(torch.optim.Optimizer):
                     p.mul_(1.0 - g["lr"] * g["weight_decay"])
                 p.add_(torch.sign(m.mul(b1).add(p.grad, alpha=1.0 - b1)), alpha=-g["lr"])
                 m.mul_(b2).add_(p.grad, alpha=1.0 - b2)
+
+
+def accum_halves(snap, total):
+    """Gradient-noise halves from gradient accumulation (no extra passes). Each micro-batch backprops loss/accum,
+    so after the first accum/2 micro-batches p.grad = mean_1 / 2 and after all of them p.grad = (mean_1 + mean_2) / 2.
+    snap, total: per-param lists (None = no grad). Returns (mean_1, mean_2) per param."""
+    g1, g2 = [], []
+    for s, t in zip(snap, total):
+        if s is None or t is None:
+            g1.append(None)
+            g2.append(None)
+        else:
+            g1.append(2.0 * s)
+            g2.append(2.0 * (t - s))
+    return g1, g2
 
 
 def _gn_measure(meter, model, criterion, z_t, t, targets, mask, step, device, use_bf16):
@@ -542,6 +558,7 @@ def train(args):
         n_micro = len(loader)
         opt.zero_grad()
         micro_in_group = 0
+        gn_snap = None
         for bi, batch in enumerate(loader):
             latents = batch["latents"].to(device)
             targets = batch["targets"].to(device)
@@ -569,6 +586,11 @@ def train(args):
             total += loss.item()         # report the unscaled per-micro-batch loss
             nbatches += 1
             micro_in_group += 1
+            # with an even accumulation count the noise meter reads the real gradient halves (first vs second
+            # accum/2 micro-batches) instead of re-running half of one micro-batch
+            gn_from_accum = gn_meter is not None and accum >= 2 and accum % 2 == 0
+            if gn_from_accum and micro_in_group == accum // 2 and gn_meter.due(step):
+                gn_snap = gn_meter.capture()
             is_last = (bi == n_micro - 1)
             if micro_in_group == accum or is_last:   # optimizer step every `accum` micro-batches (+ final partial group)
                 if is_fusion and hasattr(opt, "set_loss"):
@@ -581,7 +603,17 @@ def train(args):
                 # per-parameter .item() telemetry on EVERY step (KUANG 2026-10-17).
                 if hasattr(opt, "_telem_on"):
                     opt._telem_on = (step % args.log_every == 0) and (telem is not None or opt_groups_path is not None)
-                if gn_meter is not None and gn_meter.due(step) and z_t.shape[0] >= 2:
+                if gn_from_accum:
+                    if gn_snap is not None and micro_in_group == accum:
+                        _g1, _g2 = accum_halves(gn_snap, gn_meter.capture())
+                        _o = gn_meter.measure(step, _g1, _g2, b_half=args.batch_size * accum // 2)
+                        if _o:
+                            print(f"[grad-noise] step {step}: cos {_o['grad_noise/cos_pooled']:.3f} (null {_o['grad_noise/cos_null']:.3f}) "
+                                  f"B_simple {_o['grad_noise/b_simple_ema']:.1f} (raw {_o['grad_noise/b_simple_raw']:.1f}) "
+                                  f"full-batch cos est {_o['grad_noise/cos_fullbatch_est']:.3f}  [accum halves of "
+                                  f"{args.batch_size * accum // 2}]", flush=True)
+                    gn_snap = None
+                elif gn_meter is not None and gn_meter.due(step) and z_t.shape[0] >= 2:
                     _gn_measure(gn_meter, model, criterion, z_t, t, targets, mask, step, device, use_bf16)
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
