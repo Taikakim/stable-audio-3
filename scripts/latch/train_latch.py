@@ -3,6 +3,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- --lr-watchdog: per-group lr halving when a group's weight RMS runs away (default off)
 # Last edited: WINTERMUTE 2026-10-21 -- grad-noise meter reads the real accumulation halves when --grad-accum is even
 # Last edited: WINTERMUTE 2026-10-21 -- stop at the first non-finite batch loss; cooked-run stops --stop-val-ratio (1.5x best, 2 ep) and --stop-rising-epochs (3)
+# Last edited: WINTERMUTE 2026-10-21 -- --mod-precond-beta / --mod-normuon-beta / --mod-adam-beta2 (optimizer constants exposed for batch scaling; defaults unchanged)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -343,7 +344,9 @@ def make_optimizer(args, model):
                                beta1=args.mod_momentum, sf_beta=args.mod_sf_beta,
                                normuon_mode=args.mod_normuon_mode, update_scale=args.mod_update_scale,
                                normuon_after_unwhiten=args.mod_normuon_after_unwhiten,
-                               ns_dtype=args.mod_ns_dtype, ns_batch=args.mod_ns_batch)
+                               ns_dtype=args.mod_ns_dtype, ns_batch=args.mod_ns_batch,
+                               beta_precond=args.mod_precond_beta, normuon_beta=args.mod_normuon_beta,
+                               adam_beta2=args.mod_adam_beta2)
         print(opt.summary())
         if args.mod_late_from > 0:
             opt._late = [(args.mod_radial_brake, args.mod_escape_velocity)]
@@ -933,6 +936,13 @@ if __name__ == "__main__":
     # C-series (KUANG 2026-10-17; SAO docs/modular-opt-test-plan-2026-10-17.md, docs/TRAINING.md §2e). Defaults = historical.
     p.add_argument("--mod-momentum", type=float, default=0.9,
                    help="--optimizer modular: momentum beta1 of the matrix groups (SF-NorMuon paper best: 0.8 LM, 0.9 ViT)")
+    p.add_argument("--mod-precond-beta", type=float, default=0.95,
+                   help="--optimizer modular: per-step EMA of the Shampoo/SOAP gradient statistics (default = historical)")
+    p.add_argument("--mod-normuon-beta", type=float, default=0.95,
+                   help="--optimizer modular: per-step EMA of NorMuon's row second moments (default = historical)")
+    p.add_argument("--mod-adam-beta2", type=float, default=0.99,
+                   help="--optimizer modular: second-moment beta of the --mod-scalar-opt adam group (default = historical). "
+                        "Batch scaling: keep every per-step EMA's horizon fixed in SAMPLES, 1 - beta x kappa")
     p.add_argument("--mod-sf-beta", type=float, default=0.9,
                    help="--optimizer modular: Schedule-Free interpolation y=(1-b)z+b*x for every group (paper: 0.9 matrices)")
     p.add_argument("--mod-sign-lr", type=float, default=None,
