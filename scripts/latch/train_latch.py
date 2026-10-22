@@ -6,6 +6,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- --flight-recorder / --skip-spike-ratio (spike incidents with per-item gradient norms; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --mod-precond-beta / --mod-normuon-beta / --mod-adam-beta2 (optimizer constants exposed for batch scaling; defaults unchanged)
 # Last edited: WINTERMUTE 2026-10-21 -- --init-from (weights + standardization stats from a saved head, fresh optimizer; default off)
+# Last edited: WINTERMUTE 2026-10-22 -- --warmup-steps/--warmup-epochs (any optimizer) and --adagc (per-tensor clip); default off
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -434,6 +435,8 @@ def train(args):
     args._total_opt_steps = _spe * args.epochs   # for --fusion-decay
     if args.mod_warmup_epochs is not None:
         args.mod_warmup = int(round(args.mod_warmup_epochs * _spe))
+    if args.warmup_epochs is not None:
+        args.warmup_steps = int(round(args.warmup_epochs * _spe))
     if args.mod_late_from_epochs is not None:
         args.mod_late_from = int(round(args.mod_late_from_epochs * _spe))
     if args.ema_halflife_epochs is not None:
@@ -470,6 +473,11 @@ def train(args):
     else:
         opt, is_fusion = make_optimizer(args, model)
     criterion, loss_type = make_criterion(args)
+    adagc = None
+    if args.adagc > 0:
+        from stable_audio_3.training.adagc import AdaGC   # the DoRA trainer's AdaGC (arXiv 2502.11034)
+        adagc = AdaGC(model.named_parameters(), lam=args.adagc, beta=args.adagc_beta, warmup=args.adagc_warmup)
+        print(f"[adagc] armed: {len(adagc.names)} tensors, lambda={adagc.lam}, beta={adagc.beta}, warmup={adagc.warmup}")
 
     print(f"Loss: {loss_type}; Optimizer: {args.optimizer}; Precision: {args.precision}")
     os.makedirs(args.save_dir, exist_ok=True)
@@ -674,16 +682,26 @@ def train(args):
                     spike_inc, spike_skip, spike_med, spike_r = spike_rec.judge(spike_raw)
                     if spike_inc:
                         spike_top = top_params(model)
+                if adagc is not None:   # per-tensor clip of the raw gradient, before the global clip and the optimizer
+                    adagc.clip_()
+                    if step % args.log_every == 0 and step >= args.adagc_warmup:
+                        _s = adagc.stats()
+                        print(f"[adagc] step {step}: clipped {_s['adagc/clipped_frac']:.2f} of tensors, "
+                              f"mean factor {_s['adagc/mean_factor']:.3f}, min {_s['adagc/min_factor']:.3f}", flush=True)
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 if getattr(opt, "_late", None) and step == args.mod_late_from:
                     _arm_late_modular(opt)
-                if args.cosine_epochs is not None:
+                if args.cosine_epochs is not None or args.warmup_steps > 0:
                     if not hasattr(opt, "_base_lrs"):
                         opt._base_lrs = [g["lr"] for g in opt.param_groups]
-                    a, b = (x * args._spe for x in args.cosine_epochs)
-                    u = min(1.0, max(0.0, (step - a) / max(b - a, 1.0)))
-                    fac = args.cosine_min_frac + (1 - args.cosine_min_frac) * 0.5 * (1 + math.cos(math.pi * u))
+                    fac = 1.0
+                    if args.cosine_epochs is not None:
+                        a, b = (x * args._spe for x in args.cosine_epochs)
+                        u = min(1.0, max(0.0, (step - a) / max(b - a, 1.0)))
+                        fac = args.cosine_min_frac + (1 - args.cosine_min_frac) * 0.5 * (1 + math.cos(math.pi * u))
+                    if args.warmup_steps > 0:   # linear warmup for any --optimizer (a fresh AdamW's first steps move every weight ~lr)
+                        fac *= min(1.0, (step + 1) / args.warmup_steps)
                     for g, b0 in zip(opt.param_groups, opt._base_lrs):
                         g["lr"] = b0 * fac
                 if not spike_skip:
@@ -1079,6 +1097,15 @@ if __name__ == "__main__":
     p.add_argument("--cosine-epochs", type=float, nargs=2, default=None, metavar=("START", "END"),
                    help="cosine-decay the LR (every param group) from START to END epochs to --cosine-min-frac x lr; constant before, held at the floor after")
     p.add_argument("--cosine-min-frac", type=float, default=0.0)
+    p.add_argument("--warmup-steps", type=int, default=0,
+                   help="linear lr warmup over N optimizer steps for ANY --optimizer (multiplies --cosine-epochs; the modular "
+                        "optimizer also has its own --mod-warmup, do not stack them)")
+    p.add_argument("--warmup-epochs", type=float, default=None, help="--warmup-steps in epochs (overrides it)")
+    p.add_argument("--adagc", type=float, default=0.0,
+                   help="AdaGC per-tensor gradient clip at this lambda x the tensor's EMA of clipped norms (paper 1.04 = "
+                        "continuous trimming, ~3 = rare-event clip); 0 = off. Runs before --grad-clip.")
+    p.add_argument("--adagc-beta", type=float, default=0.99)
+    p.add_argument("--adagc-warmup", type=int, default=100, help="steps that only build the averages (no clipping)")
     p.add_argument("--ema-halflife-epochs", type=float, default=None, help="EMA half-life in EPOCHS (overrides --ema; decay = 0.5**(1/(halflife*steps_per_epoch)))")
     p.add_argument("--save-online", action="store_true", help="with --save-every-epoch also write ep<N>_online.pt = the live (non-EMA) weights; under the modular optimiser the Schedule-Free averaged iterate")
     p.add_argument("--ema-extra-halflife-epochs", type=float, nargs="*", default=[], help="additional EMA trackers (half-lives in EPOCHS) updated alongside the main one in the SAME run; each epoch checkpoint also gets a latch_sa3_<feat>_ep<N>_ema<hl>.pt sibling (requires --save-every-epoch)")
