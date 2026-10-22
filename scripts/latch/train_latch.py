@@ -262,7 +262,7 @@ def make_optimizer(args, model):
         print(f"AdEMAMix: betas (0.9, 0.999, {args.ademamix_beta3}), alpha {args.ademamix_alpha}, alpha/beta3 warmup {w} steps")
         return AdEMAMix(model.parameters(), lr=args.lr, betas=(0.9, 0.999, args.ademamix_beta3),
                         alpha=args.ademamix_alpha, warmup=w, weight_decay=0.01), False
-    if args.optimizer in ("muon_ref", "kl_soap"):
+    if args.optimizer in ("muon_ref", "kl_soap", "rekls_v3"):
         # kl_soap (WINTERMUTE 2026-10-22): same routing, NVIDIA KL-SOAP (Adam in the KL-Shampoo eigenbasis, eigh once then one
         # power-iteration basis update per step) on the hidden 2-D matrices, torch-default AdamW (as --optimizer adamw) on the rest.
         # BY-THE-BOOK baseline (owner 2026-10-16: "pure Muon at 1e-3 and 1e-4, to see what we are competing against"): NVIDIA Emerging-Optimizers Muon
@@ -276,9 +276,9 @@ def make_optimizer(args, model):
         _spec = [q for g in _g if g.get("group_type") == "spectral" for q in g["params"]]
         _ids = {id(q) for q in _spec}
         _rest = [q for q in model.parameters() if id(q) not in _ids]
-        if args.optimizer == "kl_soap":
-            from emerging_optimizers.shampoo.soap_v3 import KlSoapV3
-            _muon = KlSoapV3(_spec, lr=args.lr, betas=(0.9, 0.95), shampoo_beta=args.soap_shampoo_beta, weight_decay=0.01)
+        if args.optimizer in ("kl_soap", "rekls_v3"):
+            from emerging_optimizers.shampoo.soap_v3 import KlSoapV3, ReklsV3   # rekls_v3: full eigh of both factors every step
+            _muon = (ReklsV3 if args.optimizer == "rekls_v3" else KlSoapV3)(_spec, lr=args.lr, betas=(0.9, 0.95), shampoo_beta=args.soap_shampoo_beta, weight_decay=0.01)
             _adam = torch.optim.AdamW(_rest, lr=args.lr)
         else:
             _muon = Muon(_spec, lr=args.lr, momentum=0.95, weight_decay=0.01, nesterov=True, scale_mode="spectral", extra_scale_factor=1.0)
@@ -1011,7 +1011,7 @@ if __name__ == "__main__":
                         "6 stops paying off. Use 8 for fast-prototyping niche only.")
     p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
-    p.add_argument("--optimizer", choices=["adamw", "ademamix", "fusion", "modular", "lion", "muon_ref", "kl_soap"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "ademamix", "fusion", "modular", "lion", "muon_ref", "kl_soap", "rekls_v3"], default="adamw")
     p.add_argument("--soap-shampoo-beta", type=float, default=0.95,
                    help="--optimizer kl_soap: per-step EMA of the Kronecker factors (NVIDIA default 0.95)")
     p.add_argument("--ademamix-beta3", type=float, default=0.999,
