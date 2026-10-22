@@ -8,6 +8,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- --init-from (weights + standardization stats from a saved head, fresh optimizer; default off)
 # Last edited: WINTERMUTE 2026-10-22 -- --warmup-steps/--warmup-epochs (any optimizer) and --adagc (per-tensor clip); default off
 # Last edited: WINTERMUTE 2026-10-22 -- --optimizer ademamix (scripts/latch/ademamix.py); --optimizer kl_soap (NVIDIA KL-SOAP on hidden matrices)
+# Last edited: WINTERMUTE 2026-10-22 -- --val-t-bins (default 10): held-out loss per t-bin each epoch -> val_by_t.jsonl + checkpoint
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -786,7 +787,7 @@ def train(args):
         # Runs AFTER opt.eval() so FusionOpt is measured on its deployable averaged iterate,
         # and with the EMA weights swapped in when EMA is on — i.e. we validate whatever this
         # epoch would actually SAVE, not a different set of weights.
-        val_loss = None
+        val_loss = val_by_t = None
         if val_loader is not None:
             swapped = None
             if ema_params is not None:
@@ -796,6 +797,8 @@ def train(args):
                         p.copy_(e)
             model.eval()
             vtot, vb = 0.0, 0
+            nb = args.val_t_bins
+            bin_se, bin_w = [0.0] * nb, [0.0] * nb
             with torch.no_grad():
                 for vi, batch in enumerate(val_loader):
                     latents = batch["latents"].to(device)
@@ -814,7 +817,17 @@ def train(args):
                         preds = model(z_t, t)
                     vtot += criterion(preds.float(), targets, mask).item()
                     vb += 1
+                    if nb > 0:
+                        # the same fixed t draws, sorted into nb bins: the per-bin loss is the criterion on that bin's
+                        # items, weighted by their valid frames, so the bins are comparable epoch to epoch.
+                        kb = (t * nb).long().clamp(0, nb - 1)
+                        for k in kb.unique().tolist():
+                            sel = kb == k
+                            w = float(mask[sel].sum())
+                            bin_se[k] += criterion(preds[sel].float(), targets[sel], mask[sel]).item() * w
+                            bin_w[k] += w
             val_loss = vtot / max(vb, 1)
+            val_by_t = [bin_se[k] / bin_w[k] if bin_w[k] > 0 else None for k in range(nb)] if nb > 0 else None
             model.train()
             if swapped is not None:
                 with torch.no_grad():
@@ -822,6 +835,12 @@ def train(args):
                         p.copy_(b)
             print(f"           val={val_loss:.4f}  (held-out {val_meta['n_val_groups']} "
                   f"{args.val_group_by}s)")
+            if val_by_t is not None:
+                print("           val by t: " + " ".join(f"{(k + 0.5) / nb:.2f}:{v:.4f}" if v is not None else f"{(k + 0.5) / nb:.2f}:-"
+                                                      for k, v in enumerate(val_by_t)))
+                with open(os.path.join(args.save_dir, "val_by_t.jsonl"), "a", encoding="utf-8") as _f:
+                    _f.write(json.dumps({"epoch": epoch + 1, "val_loss": val_loss, "t_centres": [(k + 0.5) / nb for k in range(nb)],
+                                         "loss": val_by_t, "weight": bin_w}) + "\n")
 
         # Select on VAL when we have it — training loss selects the most-memorised epoch.
         sel = val_loss if val_loss is not None else avg_loss
@@ -887,6 +906,7 @@ def train(args):
                 # None when the run had no held-out set. A consumer can then tell a
                 # val-selected head from a train-selected one instead of assuming.
                 "val_loss": val_loss,
+                "val_loss_by_t": val_by_t,
                 "val_split": val_meta,
                 "selected_on": "val_loss" if val_loader is not None else "train_loss",
                 "init_from": args.init_from,
@@ -1132,6 +1152,8 @@ if __name__ == "__main__":
     p.add_argument("--ema-extra-halflife-epochs", type=float, nargs="*", default=[], help="additional EMA trackers (half-lives in EPOCHS) updated alongside the main one in the SAME run; each epoch checkpoint also gets a latch_sa3_<feat>_ep<N>_ema<hl>.pt sibling (requires --save-every-epoch)")
     p.add_argument("--decorr-lambda", type=float, default=0.0, help="DeCov-style decorrelation penalty weight on the head's final hidden features (input of out_proj, after norm_final): lambda * mean squared OFF-DIAGONAL "
                    "correlation between the hidden channels over all (batch x time) positions. 0 = off. Owner 2026-10-16: force the head to spread the solution over many units instead of a few loud co-active ones.")
+    p.add_argument("--val-t-bins", type=int, default=10, help="also report the held-out loss split into this many bins of t (the val pass's own fixed t draws, so no extra compute and val= unchanged); "
+                   "printed per epoch, appended to <save-dir>/val_by_t.jsonl, saved as val_loss_by_t. 0 = off")
     p.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps (0 = run all epochs); epochs is raised to cover it")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
                    help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
