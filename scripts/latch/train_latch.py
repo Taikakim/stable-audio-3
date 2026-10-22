@@ -7,6 +7,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- --mod-precond-beta / --mod-normuon-beta / --mod-adam-beta2 (optimizer constants exposed for batch scaling; defaults unchanged)
 # Last edited: WINTERMUTE 2026-10-21 -- --init-from (weights + standardization stats from a saved head, fresh optimizer; default off)
 # Last edited: WINTERMUTE 2026-10-22 -- --warmup-steps/--warmup-epochs (any optimizer) and --adagc (per-tensor clip); default off
+# Last edited: WINTERMUTE 2026-10-22 -- --optimizer ademamix (scripts/latch/ademamix.py)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -255,6 +256,12 @@ def make_optimizer(args, model):
     else (1D, biases, LayerNorm, small/odd projections) to ScheduleFree-AdamW."""
     if args.optimizer == "adamw":
         return torch.optim.AdamW(model.parameters(), lr=args.lr), False
+    if args.optimizer == "ademamix":
+        from scripts.latch.ademamix import AdEMAMix
+        w = args.ademamix_warmup if args.ademamix_warmup is not None else args._total_opt_steps   # paper: the whole run
+        print(f"AdEMAMix: betas (0.9, 0.999, {args.ademamix_beta3}), alpha {args.ademamix_alpha}, alpha/beta3 warmup {w} steps")
+        return AdEMAMix(model.parameters(), lr=args.lr, betas=(0.9, 0.999, args.ademamix_beta3),
+                        alpha=args.ademamix_alpha, warmup=w, weight_decay=0.01), False
     if args.optimizer == "muon_ref":
         # BY-THE-BOOK baseline (owner 2026-10-16: "pure Muon at 1e-3 and 1e-4, to see what we are competing against"): NVIDIA Emerging-Optimizers Muon
         # (momentum 0.95, nesterov, 5-step quintic Newton-Schulz, decoupled wd 0.01, spectral scale max(1, sqrt(m/n))) on the hidden 2-D matrices (our "spectral" routing, min dim >= 64),
@@ -997,7 +1004,12 @@ if __name__ == "__main__":
                         "6 stops paying off. Use 8 for fast-prototyping niche only.")
     p.add_argument("--num-heads", type=int, default=8)
     # Optimizer
-    p.add_argument("--optimizer", choices=["adamw", "fusion", "modular", "lion", "muon_ref"], default="adamw")
+    p.add_argument("--optimizer", choices=["adamw", "ademamix", "fusion", "modular", "lion", "muon_ref"], default="adamw")
+    p.add_argument("--ademamix-beta3", type=float, default=0.999,
+                   help="--optimizer ademamix: slow-EMA beta (paper 0.9999 for ~10k+ step LM runs; 0.999 ~ 5 epochs at batch 64 here)")
+    p.add_argument("--ademamix-alpha", type=float, default=5.0, help="--optimizer ademamix: weight of the slow EMA (paper 5-8)")
+    p.add_argument("--ademamix-warmup", type=int, default=None,
+                   help="--optimizer ademamix: steps over which alpha and beta3 ramp up (default: the whole run, as the paper)")
     p.add_argument("--lion-b1", type=float, default=0.9)
     p.add_argument("--lion-b2", type=float, default=0.99)
     p.add_argument("--lion-wd", type=float, default=0.0, help="--optimizer lion: decoupled wd (Lion papers use 3-10x AdamW's)")
