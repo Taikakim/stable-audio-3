@@ -10,6 +10,7 @@
 # Last edited: WINTERMUTE 2026-10-22 -- --optimizer ademamix (scripts/latch/ademamix.py); --optimizer kl_soap (NVIDIA KL-SOAP on hidden matrices)
 # Last edited: WINTERMUTE 2026-10-22 -- --val-t-bins (default 10): held-out loss per t-bin each epoch -> val_by_t.jsonl + checkpoint
 # Last edited: WINTERMUTE 2026-10-23 -- --save-every N: ep<N>.pt every N epochs + the last epoch (incl. an early stop)
+# Last edited: WINTERMUTE 2026-10-23 -- --save-resume / --resume-from (full continuation), --step-log / --layer-log (local per-step telemetry), --device
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -299,6 +300,10 @@ def make_optimizer(args, model):
                 self._a.zero_grad(set_to_none=set_to_none); self._b.zero_grad(set_to_none=set_to_none)
             def state_dict(self):
                 return {"muon": self._a.state_dict(), "adamw": self._b.state_dict()}
+            def load_state_dict(self, sd):
+                self._a.load_state_dict(sd["muon"]); self._b.load_state_dict(sd["adamw"])
+                # torch replaces the inner param_group dicts on load; re-point ours or the lr schedule writes into dead dicts
+                self.param_groups = self._a.param_groups + self._b.param_groups
         return _Pair(_muon, _adam), False
     if args.optimizer == "lion":
         return Lion(model.parameters(), lr=args.lr, betas=(args.lion_b1, args.lion_b2),
@@ -387,7 +392,16 @@ def train(args):
             torch.cuda.manual_seed_all(args.seed)
         print(f"Seed: {args.seed}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    resume = None
+    if args.resume_from:
+        # Full continuation: weights, optimizer state, EMA, AdaGC averages, schedule position, best val, RNG. The run's
+        # other args must match the original (same optimizer, dim, schedule horizons); only --epochs may grow.
+        resume = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        for k in ("optimizer", "dim", "depth", "feature", "lr", "grad_accum", "batch_size"):
+            if resume["args"].get(k) != getattr(args, k):
+                raise SystemExit(f"--resume-from: {k} was {resume['args'].get(k)!r}, now {getattr(args, k)!r}")
+        print(f"Resume from {args.resume_from}: epoch {resume['epoch']} done, step {resume['step']}, best val {resume['best_loss']:.4f}")
     # Resolve the (possibly multi-root) latent dir. --latent-dirs (list) wins; else split --latent-dir
     # on commas. A single dir stays a str (byte-identical single-root path); several -> a list.
     if args.latent_dirs:
@@ -479,6 +493,10 @@ def train(args):
             raise SystemExit(f"--init-from head is for {init_ck.get('feature_name')!r}, not {args.feature!r}")
         if init_ck.get("val_split") and val_meta and init_ck["val_split"] != val_meta:
             raise SystemExit("--init-from checkpoint used a different held-out split; val losses would not compare")
+    if resume is not None:
+        if resume.get("val_split") != val_meta:
+            raise SystemExit("--resume-from: the held-out split differs")
+        model.load_state_dict({k.removeprefix("_orig_mod."): v for k, v in resume["model"].items()}, strict=True)
     if args.compile:
         # Build the optimiser on the un-compiled module so FusionOpt's
         # build_fusion_param_groups can introspect param names cleanly; the
@@ -514,6 +532,8 @@ def train(args):
         # The loaded head's output scale is tied to ITS stats; keep them so training continues in the same units.
         std_mean, std_std = float(init_ck["std_mean"]), float(init_ck["std_std"])
         print(f"Standardize: using the --init-from stats mean={std_mean:.4f} std={std_std:.4f}")
+    if resume is not None:
+        std_mean, std_std = float(resume["std_mean"]), float(resume["std_std"])
     use_bf16 = args.precision == "bf16"
 
     # --- EMA of the HEAD's params (no DiT here). When --ema>0 we keep a param-wise
@@ -527,6 +547,29 @@ def train(args):
     ema_extra = [(hl, 0.5 ** (1.0 / (hl * args._spe)), [p.detach().clone() for p in model.parameters()]) for hl in args.ema_extra_halflife_epochs]
     for hl, dec, _ in ema_extra:
         print(f"EMA extra: half-life {hl} epochs, decay={dec:.5f}")
+
+    start_epoch = 0
+    if resume is not None:
+        opt.load_state_dict(resume["optimizer"])
+        if hasattr(opt, "_mode"):
+            opt._mode = "eval"   # the saved weights are the Schedule-Free average x: let the next opt.train() rebuild y from z/x
+        if resume.get("base_lrs") is not None:
+            opt._base_lrs = resume["base_lrs"]
+        if adagc is not None and resume.get("adagc") is not None:
+            adagc.load_state_dict(resume["adagc"])
+        with torch.no_grad():
+            if ema_params is not None and resume.get("ema_params") is not None:
+                for e, s in zip(ema_params, resume["ema_params"]):
+                    e.copy_(s.to(e.device))
+            for (_hl, _dec, _ep), saved in zip(ema_extra, resume.get("ema_extra") or []):
+                for e, s in zip(_ep, saved):
+                    e.copy_(s.to(e.device))
+        start_epoch = int(resume["epoch"])
+        random.setstate(resume["rng"]["python"])
+        np.random.set_state(resume["rng"]["numpy"])
+        torch.set_rng_state(resume["rng"]["torch"])
+        if resume["rng"].get("cuda") is not None and device.type == "cuda":
+            torch.cuda.set_rng_state_all(resume["rng"]["cuda"])
 
     def ema_state_dict(params=None):
         """state_dict with the EMA params swapped in (restores live params after)."""
@@ -615,7 +658,15 @@ def train(args):
 
     best_loss = float("inf")
     cooked, stop_cooked, val_hist = 0, False, []
-    for epoch in range(args.epochs):
+    if resume is not None:
+        step, best_loss, val_hist = int(resume["step"]), float(resume["best_loss"]), list(resume["val_hist"])
+    steplog = None
+    if args.step_log:
+        from scripts.latch.step_telemetry import StepTelemetry
+        steplog = StepTelemetry(model, args.save_dir, layer_every=args.layer_log,
+                                state=resume.get("steplog") if resume is not None else None)
+        print(f"[step-log] every step -> steps.jsonl; per layer / model part every {args.layer_log} steps -> layers.jsonl", flush=True)
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         if is_fusion:
             opt.train()  # SF eval point y = (1-β)·z + β·x in live params
@@ -698,14 +749,17 @@ def train(args):
                     spike_inc, spike_skip, spike_med, spike_r = spike_rec.judge(spike_raw)
                     if spike_inc:
                         spike_top = top_params(model)
+                if steplog is not None:
+                    steplog.grads(step)
                 if adagc is not None:   # per-tensor clip of the raw gradient, before the global clip and the optimizer
                     adagc.clip_()
                     if step % args.log_every == 0 and step >= args.adagc_warmup:
                         _s = adagc.stats()
                         print(f"[adagc] step {step}: clipped {_s['adagc/clipped_frac']:.2f} of tensors, "
                               f"mean factor {_s['adagc/mean_factor']:.3f}, min {_s['adagc/min_factor']:.3f}", flush=True)
+                _gn_pre_clip = None
                 if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    _gn_pre_clip = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip))
                 if getattr(opt, "_late", None) and step == args.mod_late_from:
                     _arm_late_modular(opt)
                 if args.cosine_epochs is not None or args.warmup_steps > 0:
@@ -757,6 +811,9 @@ def train(args):
                         for _hl, _dec, _ep in ema_extra:
                             for e, p in zip(_ep, model.parameters()):
                                 e.lerp_(p.detach(), 1.0 - _dec)
+                if steplog is not None:
+                    steplog.after_step(step, epoch + 1, float(loss.item()), [g["lr"] for g in opt.param_groups],
+                                       gnorm_after_adagc=_gn_pre_clip, skipped=bool(spike_skip))
                 if telem is not None:
                     _now = _time.perf_counter()
                     _rate = 1.0 / max(_now - _t_prev, 1e-6); _t_prev = _now
@@ -930,12 +987,30 @@ def train(args):
                 for _hl, _dec, _ep in ema_extra:
                     _p = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}_ema{_hl:g}.pt")
                     torch.save({**_ck, "state_dict": ema_state_dict(_ep), "ema": _dec}, _p)
+        if args.save_resume:
+            # Everything a later --resume-from needs to continue this run as if it had not stopped (one file, overwritten
+            # every epoch; written via a temp file so a crash mid-save never leaves a half file behind).
+            _rp = os.path.join(args.save_dir, "resume.pt")
+            torch.save({"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                        "optimizer": opt.state_dict(), "base_lrs": getattr(opt, "_base_lrs", None),
+                        "adagc": adagc.state_dict() if adagc is not None else None,
+                        "ema_params": [e.cpu() for e in ema_params] if ema_params is not None else None,
+                        "ema_extra": [[e.cpu() for e in _ep] for _hl, _dec, _ep in ema_extra],
+                        "steplog": steplog.state_dict() if steplog is not None else None,
+                        "epoch": epoch + 1, "step": step, "best_loss": best_loss, "val_hist": val_hist,
+                        "std_mean": std_mean, "std_std": std_std, "val_split": val_meta, "args": vars(args),
+                        "rng": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+                                "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None}},
+                       _rp + ".tmp")
+            os.replace(_rp + ".tmp", _rp)
         if stop_cooked:
             print(f"cooked run: held-out loss {val_loss:.4f} vs best {best_loss:.4f} (above {args.stop_val_ratio}x for "
                   f"{cooked} epochs, or rising {args.stop_rising_epochs} epochs running and > 5% above best): stopping "
                   f"after epoch {epoch+1} (--stop-val-ratio 0 --stop-rising-epochs 0 disable)", flush=True)
             break
 
+    if steplog is not None:
+        steplog.close()
     if wb is not None:
         wb.finish()
 
@@ -1005,6 +1080,16 @@ if __name__ == "__main__":
     p.add_argument("--save-dir", default="latch_weights_sa3")
     p.add_argument("--save-best-only", action="store_true",
                    help="Save only when train-loss improves (Schedule-Free averaged iterate)")
+    p.add_argument("--save-resume", action="store_true",
+                   help="write <save-dir>/resume.pt every epoch (weights, optimizer state, EMA, AdaGC, schedule position, RNG)")
+    p.add_argument("--resume-from", default=None,
+                   help="continue a --save-resume run from its resume.pt; same args except a larger --epochs (schedule horizons "
+                        "such as --cosine-epochs are in epochs, so set them to the full planned length from the start)")
+    p.add_argument("--step-log", action="store_true",
+                   help="local per-step telemetry (scripts/latch/step_telemetry.py): steps.jsonl every optimizer step, "
+                        "layers.jsonl every --layer-log steps (per tensor + per model part)")
+    p.add_argument("--layer-log", type=int, default=20)
+    p.add_argument("--device", default=None, help="cuda / cpu (default: cuda when available)")
     p.add_argument("--save-every", type=int, default=0,
                    help="Also write latch_sa3_<feature>_ep<N>.pt every N epochs and at the last epoch (incl. an early stop); 0 = off")
     p.add_argument("--save-every-epoch", action="store_true",
