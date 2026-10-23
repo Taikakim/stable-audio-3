@@ -4,6 +4,7 @@
 # Last edited: WINTERMUTE 2026-10-21 -- grad-noise meter reads the real accumulation halves when --grad-accum is even
 # Last edited: WINTERMUTE 2026-10-21 -- stop at the first non-finite batch loss; cooked-run stops --stop-val-ratio (1.5x best, 2 ep) and --stop-rising-epochs (3)
 # Last edited: WINTERMUTE 2026-10-21 -- --flight-recorder / --skip-spike-ratio (spike incidents with per-item gradient norms; default off)
+# Last edited: WINTERMUTE 2026-10-23 -- --grad-ckpt (per-block activation checkpointing; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --mod-precond-beta / --mod-normuon-beta / --mod-adam-beta2 (optimizer constants exposed for batch scaling; defaults unchanged)
 # Last edited: WINTERMUTE 2026-10-21 -- --init-from (weights + standardization stats from a saved head, fresh optimizer; default off)
 # Last edited: WINTERMUTE 2026-10-22 -- --warmup-steps/--warmup-epochs (any optimizer) and --adagc (per-tensor clip); default off
@@ -497,6 +498,15 @@ def train(args):
         if resume.get("val_split") != val_meta:
             raise SystemExit("--resume-from: the held-out split differs")
         model.load_state_dict({k.removeprefix("_orig_mod."): v for k, v in resume["model"].items()}, strict=True)
+    if args.grad_ckpt:
+        # Recompute each block's activations in backward instead of storing them. Patched per instance so the
+        # state_dict keys (and so saved heads) are unchanged; no-op under no_grad (validation, grad-noise probes).
+        from torch.utils.checkpoint import checkpoint
+        for block in model.blocks:
+            def _ckpt_forward(*a, _f=block.forward, **k):
+                return checkpoint(_f, *a, use_reentrant=False, **k) if torch.is_grad_enabled() else _f(*a, **k)
+            block.forward = _ckpt_forward
+        print(f"activation checkpointing: on ({len(model.blocks)} blocks)")
     if args.compile:
         # Build the optimiser on the un-compiled module so FusionOpt's
         # build_fusion_param_groups can introspect param names cleanly; the
@@ -1097,6 +1107,9 @@ if __name__ == "__main__":
                         "--save-best-only keeps. Val loss goes flat long before a diffusion-style head stops "
                         "changing, and best.pt alone cannot answer 'does the LAST epoch steer better'. "
                         "~78 MB per epoch at dim 512 (so ~1.5 GB per 20-epoch arm).")
+    p.add_argument("--grad-ckpt", action="store_true",
+                   help="activation checkpointing per LatCH block: activations are recomputed in backward, so a much larger "
+                        "micro-batch fits (dim 512 at T=4096 needs ~1.1 GB per crop without it) for ~30%% more compute")
     p.add_argument("--compile", action="store_true",
                    help="torch.compile the LatCH head. Per docs/FUSION_SHAREABLE.md this "
                         "is CRITICAL for FusionOpt — without it the spectral-path overhead "
