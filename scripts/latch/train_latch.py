@@ -9,6 +9,7 @@
 # Last edited: WINTERMUTE 2026-10-22 -- --warmup-steps/--warmup-epochs (any optimizer) and --adagc (per-tensor clip); default off
 # Last edited: WINTERMUTE 2026-10-22 -- --optimizer ademamix (scripts/latch/ademamix.py); --optimizer kl_soap (NVIDIA KL-SOAP on hidden matrices)
 # Last edited: WINTERMUTE 2026-10-22 -- --val-t-bins (default 10): held-out loss per t-bin each epoch -> val_by_t.jsonl + checkpoint
+# Last edited: WINTERMUTE 2026-10-23 -- --save-every N: ep<N>.pt every N epochs + the last epoch (incl. an early stop)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -873,7 +874,8 @@ def train(args):
         else:
             ckpt_path = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}.pt")
         ckpt_paths = [ckpt_path] if ckpt_path is not None else []
-        if args.save_every_epoch and (ckpt_path is None or not ckpt_path.endswith(f"_ep{epoch+1}.pt")):
+        _periodic = args.save_every > 0 and ((epoch + 1) % args.save_every == 0 or epoch + 1 == args.epochs or stop_cooked)
+        if (args.save_every_epoch or _periodic) and (ckpt_path is None or not ckpt_path.endswith(f"_ep{epoch+1}.pt")):
             ckpt_paths.append(os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{epoch+1}.pt"))
         if ckpt_paths:
             _ck = ({
@@ -1003,6 +1005,8 @@ if __name__ == "__main__":
     p.add_argument("--save-dir", default="latch_weights_sa3")
     p.add_argument("--save-best-only", action="store_true",
                    help="Save only when train-loss improves (Schedule-Free averaged iterate)")
+    p.add_argument("--save-every", type=int, default=0,
+                   help="Also write latch_sa3_<feature>_ep<N>.pt every N epochs and at the last epoch (incl. an early stop); 0 = off")
     p.add_argument("--save-every-epoch", action="store_true",
                    help="Also write latch_sa3_<feature>_ep<N>.pt every epoch, alongside the _best.pt that "
                         "--save-best-only keeps. Val loss goes flat long before a diffusion-style head stops "
