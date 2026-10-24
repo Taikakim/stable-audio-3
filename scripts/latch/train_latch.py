@@ -12,6 +12,7 @@
 # Last edited: WINTERMUTE 2026-10-22 -- --val-t-bins (default 10): held-out loss per t-bin each epoch -> val_by_t.jsonl + checkpoint
 # Last edited: WINTERMUTE 2026-10-23 -- --save-every N: ep<N>.pt every N epochs + the last epoch (incl. an early stop)
 # Last edited: WINTERMUTE 2026-10-23 -- --save-resume / --resume-from (full continuation), --step-log / --layer-log (local per-step telemetry), --device
+# Last edited: WINTERMUTE 2026-10-24 -- --epoch-hook (command after every epoch; exit 3 stops, exit 4 = OOM -> offload head + opt state, retry); default off
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -1013,6 +1014,9 @@ def train(args):
                                 "cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else None}},
                        _rp + ".tmp")
             os.replace(_rp + ".tmp", _rp)
+        if args.epoch_hook and _epoch_hook(args, epoch + 1, model, opt, device):
+            print(f"epoch hook asked to stop after epoch {epoch+1} (see epoch_hook.jsonl)", flush=True)
+            break
         if stop_cooked:
             print(f"cooked run: held-out loss {val_loss:.4f} vs best {best_loss:.4f} (above {args.stop_val_ratio}x for "
                   f"{cooked} epochs, or rising {args.stop_rising_epochs} epochs running and > 5% above best): stopping "
@@ -1023,6 +1027,51 @@ def train(args):
         steplog.close()
     if wb is not None:
         wb.finish()
+
+
+def _move_train_state(model, opt, dev):
+    """Move the head's weights and every tensor in the optimizer state to dev (in place: the Parameter objects the
+    optimizer holds stay the same, only their data moves). Used to free VRAM around the epoch hook."""
+    model.to(dev)
+    for st in opt.state.values():
+        for k, v in st.items():
+            if torch.is_tensor(v):
+                st[k] = v.to(dev)
+    for g in opt.param_groups:
+        for k, v in g.items():
+            if torch.is_tensor(v):
+                g[k] = v.to(dev)
+
+
+def _epoch_hook(args, ep, model, opt, device):
+    """Run `--epoch-hook` after epoch `ep` (checkpoint + resume state already on disk) as `<cmd> <epoch> <ep checkpoint>`.
+    Exit 0 = continue, 3 = stop the run here, 4 = out of GPU memory: the head and optimizer state are moved to the CPU and
+    the hook runs once more, then they move back. Any other exit is logged and training continues (an eval failure is
+    not a reason to lose the run). Runs in a separate process, so the trainer's RNG streams are untouched."""
+    import gc, shlex, subprocess, time as _t
+    ck = os.path.join(args.save_dir, f"latch_sa3_{args.feature}_ep{ep}.pt")
+    if not os.path.exists(ck):
+        print(f"[epoch-hook] no {os.path.basename(ck)} (needs --save-every-epoch); skipped", flush=True)
+        return False
+    offloaded, rc, t0 = False, None, _t.time()
+    for attempt in (1, 2):
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        rc = subprocess.call(shlex.split(args.epoch_hook) + [str(ep), ck])
+        if rc != 4 or attempt == 2 or device.type != "cuda":
+            break
+        print("[epoch-hook] out of GPU memory: moving the head and optimizer state to the CPU and retrying", flush=True)
+        _move_train_state(model, opt, torch.device("cpu"))
+        offloaded = True
+    if offloaded:
+        _move_train_state(model, opt, device)
+    rec = {"epoch": ep, "rc": rc, "offloaded": offloaded, "sec": round(_t.time() - t0, 1), "cmd": args.epoch_hook}
+    with open(os.path.join(args.save_dir, "epoch_hook.jsonl"), "a", encoding="utf-8") as _f:
+        _f.write(json.dumps(rec) + "\n")
+    if rc not in (0, 3):
+        print(f"[epoch-hook] exit {rc} after epoch {ep}; training continues", flush=True)
+    return rc == 3
 
 
 if __name__ == "__main__":
@@ -1100,6 +1149,10 @@ if __name__ == "__main__":
                         "layers.jsonl every --layer-log steps (per tensor + per model part)")
     p.add_argument("--layer-log", type=int, default=20)
     p.add_argument("--device", default=None, help="cuda / cpu (default: cuda when available)")
+    p.add_argument("--epoch-hook", default="",
+                   help="Command run after every epoch as '<cmd> <epoch> <ep checkpoint>' (needs --save-every-epoch), e.g. "
+                        "SAO/eval/epoch_ring_hook.sh: exit 3 stops the run, exit 4 = out of GPU memory (retried once with the "
+                        "head and optimizer state offloaded to the CPU); default off")
     p.add_argument("--save-every", type=int, default=0,
                    help="Also write latch_sa3_<feature>_ep<N>.pt every N epochs and at the last epoch (incl. an early stop); 0 = off")
     p.add_argument("--save-every-epoch", action="store_true",
