@@ -13,6 +13,7 @@
 # Last edited: WINTERMUTE 2026-10-23 -- --save-every N: ep<N>.pt every N epochs + the last epoch (incl. an early stop)
 # Last edited: WINTERMUTE 2026-10-23 -- --save-resume / --resume-from (full continuation), --step-log / --layer-log (local per-step telemetry), --device
 # Last edited: WINTERMUTE 2026-10-24 -- --epoch-hook (command after every epoch; exit 3 stops, exit 4 = OOM -> offload head + opt state, retry); default off
+# Last edited: WINTERMUTE 2026-10-25 -- --t-sampling iid/stratified/antithetic (training t per micro-batch, EXPERIMENTS E14); default iid
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -84,6 +85,21 @@ def forward_noise(z0, noise, t):
     """Flow-matching linear interpolation z_t = (1-t)*z0 + t*noise. t: (B,)."""
     t = t.view(-1, 1, 1)
     return (1.0 - t) * z0 + t * noise
+
+
+def sample_t(n, mode="iid", device="cpu"):
+    """Training noise levels for one micro-batch, all marginally U(0,1).
+    iid: independent draws (the default). stratified: one draw in each of n equal bins, shuffled, so every micro-batch
+    covers [0,1) evenly instead of clumping (half the held-out loss sits at t > 0.7, docs/training-findings.md T1-T3).
+    antithetic: pairs t, 1-t (odd n: the last item is a plain draw)."""
+    if mode == "iid":
+        return torch.rand(n, device=device)
+    if mode == "stratified":
+        return (torch.randperm(n, device=device) + torch.rand(n, device=device)) / n
+    if mode == "antithetic":
+        h = torch.rand((n + 1) // 2, device=device)
+        return torch.cat([h, 1.0 - h])[:n][torch.randperm(n, device=device)]
+    raise ValueError(f"unknown t sampling {mode!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +718,7 @@ def train(args):
             mask = batch["mask"].to(device).float() * batch["weight"].to(device)
             if args.standardize:
                 targets = (targets - std_mean) / std_std
-            t = torch.rand(latents.shape[0], device=device)
+            t = sample_t(latents.shape[0], args.t_sampling, device)
             if rec_sampler is not None:
                 grp_t += t.tolist()
             noise = torch.randn_like(latents)
@@ -1309,6 +1325,9 @@ if __name__ == "__main__":
                    "correlation between the hidden channels over all (batch x time) positions. 0 = off. Owner 2026-10-16: force the head to spread the solution over many units instead of a few loud co-active ones.")
     p.add_argument("--val-t-bins", type=int, default=10, help="also report the held-out loss split into this many bins of t (the val pass's own fixed t draws, so no extra compute and val= unchanged); "
                    "printed per epoch, appended to <save-dir>/val_by_t.jsonl, saved as val_loss_by_t. 0 = off")
+    p.add_argument("--t-sampling", choices=["iid", "stratified", "antithetic"], default="iid",
+                   help="training t per micro-batch: iid U(0,1) (default), stratified (one draw per 1/B bin) or antithetic "
+                        "(t, 1-t pairs); same marginal, lower variance of the batch's t mix (EXPERIMENTS E14). Val unchanged")
     p.add_argument("--max-steps", type=int, default=0, help="stop after this many optimizer steps (0 = run all epochs); epochs is raised to cover it")
     p.add_argument("--mod-sf-c-warmup", type=int, default=None,
                    help="--optimizer modular: ScheduleFree+ burn-in steps before averaging (default 2 x --mod-warmup)")
