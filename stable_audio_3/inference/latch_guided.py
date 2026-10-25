@@ -2,7 +2,10 @@
 # Last edited: WINTERMUTE 2026-10-15 — guide_schedule="flat" option (constant per-step weight) beside the TFG alpha schedule
 # Last edited: WINTERMUTE 2026-10-15 — guide_anchor (cap x_t std at its healthy value per sigma, every step)
 # Last edited: WINTERMUTE 2026-10-15 — guide_rescale (per-step std rescale after each guidance edit, LatCH analogue of CFG rescale)
+# Last edited: WINTERMUTE 2026-10-25 — per-guide fade_in_pct / fade_out_pct / fade_shape: tapered window edges (E18)
 """Gradient-enabled Euler sampler with LatCH Training-Free Guidance for SA3 (Phase 1)."""
+
+import math
 
 import torch
 from tqdm import tqdm
@@ -133,7 +136,7 @@ def sample_flow_euler_multi_latch_guided(
         # Each guide spends all of rho/mu*weight inside its window instead of only the
         # window's share of a whole-schedule budget -- see _st_weights for the numbers
         # and the 10.8x legacy-gain caveat.
-        g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule)
+        g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule, *_guide_fades(g, num_steps))
         g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
                                                 w_sec=g.get("w_sec"), fps=g.get("fps"))
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
@@ -304,7 +307,7 @@ def sample_flow_pingpong_multi_latch_guided(
     for g in guides:
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"] = int(num_steps * g["end_pct"])
-        g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule)
+        g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule, *_guide_fades(g, num_steps))
         g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
                                                 w_sec=g.get("w_sec"), fps=g.get("fps"))
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
@@ -423,8 +426,29 @@ def _anchor_std(x, t, s0):
     return x * (target / s).clamp(max=1.0)
 
 
-def _window_scale(alpha, start, end, schedule="alpha"):
-    """Per-step weight of one guide over its window [start, end), summing to 1.
+FADE_SHAPES = ("linear", "cosine", "exp")
+_EXP_K = math.log(100.0)   # exp fade: 1 -> 1% across the fade
+
+
+def fade_curve(n, shape="linear", rising=False):
+    """n per-step envelope values in (0, 1) for a fade, sampled at step midpoints u = (j + 0.5) / n.
+    Falling (fade-out): linear 1 - u, cosine 0.5 + 0.5 cos(pi u), exp exp(-ln(100) u). rising=True mirrors it."""
+    if n <= 0:
+        return torch.zeros(0)
+    u = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+    if shape == "linear":
+        e = 1.0 - u
+    elif shape == "cosine":
+        e = 0.5 + 0.5 * torch.cos(math.pi * u)
+    elif shape == "exp":
+        e = torch.exp(-_EXP_K * u)
+    else:
+        raise ValueError(f"fade shape must be one of {FADE_SHAPES}, got {shape!r}")
+    return e.flip(0) if rising else e
+
+
+def _window_scale(alpha, start, end, schedule="alpha", fade_in=0, fade_out=0, fade_shape="linear"):
+    """Per-step weight of one guide over its window [start, end).
 
     "alpha" is TFG's s(t) = alpha_t / sum(alpha_t) (Ye et al. 2024, used as-is by the
     LatCH paper, 2603.04366 Eq. 3), with alpha = 1 - t here: tiny at the noisiest
@@ -432,6 +456,13 @@ def _window_scale(alpha, start, end, schedule="alpha"):
     arrangement and rhythm are already fixed. "flat" gives every active step the
     same weight, so the early steps get a real share. Both are normalised over the
     window, so rho/mu stay a budget and keep their meaning across schedules.
+
+    fade_in / fade_out (EXPERIMENTS E18, 2026-10-25): that many steps at the start / end of the window ramp in / out
+    with fade_curve(fade_shape) instead of switching on / off at full weight. The weights are normalised over the
+    PLATEAU (the window minus its fades), so the plateau steps weigh exactly what a hard window over the plateau gives
+    them and a fade only adds its tail: window 0-1 with fade_out 20% equals the hard 0-0.8 window plus a decaying
+    tail, which is the comparison E18 makes. With no fades the result is the old one (sums to 1). If the fades cover
+    the whole window there is no plateau and the window is normalised as a whole.
     """
     m = torch.zeros_like(alpha)
     m[start:end] = 1.0
@@ -441,7 +472,28 @@ def _window_scale(alpha, start, end, schedule="alpha"):
         w = alpha * m
     else:
         raise ValueError(f"latch schedule must be 'alpha' or 'flat', got {schedule!r}")
-    return w / w.sum().clamp(min=1e-8)
+    n = max(0, end - start)
+    fi, fo = max(0, int(fade_in)), max(0, int(fade_out))
+    if fi + fo == 0 or n == 0:
+        return w / w.sum().clamp(min=1e-8)
+    fi, fo = min(fi, n), min(fo, n - min(fi, n))
+    env = torch.ones_like(alpha)
+    if fi:
+        env[start:start + fi] = fade_curve(fi, fade_shape, rising=True).to(env)
+    if fo:
+        env[end - fo:end] = fade_curve(fo, fade_shape).to(env)
+    plateau = w.clone()
+    plateau[start:start + fi] = 0.0
+    plateau[end - fo:end] = 0.0
+    norm = plateau.sum() if plateau.sum() > 0 else (w * env).sum()
+    return (w * env) / norm.clamp(min=1e-8)
+
+
+def _guide_fades(g, num_steps):
+    """(fade_in, fade_out, shape) in steps from a guide's fade_in_pct / fade_out_pct / fade_shape (fractions of all steps)."""
+    return (int(round(num_steps * float(g.get("fade_in_pct", 0.0) or 0.0))),
+            int(round(num_steps * float(g.get("fade_out_pct", 0.0) or 0.0))),
+            str(g.get("fade_shape") or "linear"))
 
 
 def _st_weights(sigmas_1d, active_mask=None):

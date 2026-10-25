@@ -1,6 +1,7 @@
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_schedule"] ("alpha" | "flat") forwarded to the guided samplers
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_rescale"] (0..1 per-step std rescale) forwarded to the guided samplers
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_anchor"] (trajectory std ceiling s0) forwarded to the guided samplers
+# Last edited: WINTERMUTE 2026-10-25 — latch config fade_in_pct / fade_out_pct / fade_shape forwarded to the guide (E18)
 import json
 import numpy as np
 import torch
@@ -617,6 +618,10 @@ class StableAudioModel:
                     "weight": float(cfg.get("weight", 1.0)),
                     "start_pct": float(cfg.get("start_pct", 0.0)),
                     "end_pct": float(cfg.get("end_pct", 1.0)),
+                    # tapered window edges (E18): fractions of all steps, inside [start_pct, end_pct)
+                    "fade_in_pct": float(cfg.get("fade_in_pct", 0.0)),
+                    "fade_out_pct": float(cfg.get("fade_out_pct", 0.0)),
+                    "fade_shape": str(cfg.get("fade_shape", "linear")),
                     # cfg override wins over head metadata: lets a caller run e.g.
                     # scalar_pooled guidance on an mse-trained scalar head (the
                     # constant-target-flatness fix, 2026-07-10) without retraining.
