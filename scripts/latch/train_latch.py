@@ -14,6 +14,7 @@
 # Last edited: WINTERMUTE 2026-10-23 -- --save-resume / --resume-from (full continuation), --step-log / --layer-log (local per-step telemetry), --device
 # Last edited: WINTERMUTE 2026-10-24 -- --epoch-hook (command after every epoch; exit 3 stops, exit 4 = OOM -> offload head + opt state, retry); default off
 # Last edited: WINTERMUTE 2026-10-25 -- --t-sampling iid/stratified/antithetic (training t per micro-batch, EXPERIMENTS E14); default iid
+# Last edited: WINTERMUTE 2026-10-25 -- --train-frac (seeded fraction of train tracks) and --extra-train-dirs (train-only roots); val + stats unchanged
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -71,7 +72,7 @@ import random  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from torch.utils.data import DataLoader, Subset  # noqa: E402
+from torch.utils.data import ConcatDataset, DataLoader, Subset  # noqa: E402
 
 from scripts.latch.latch_dataset import LatCHDataset, collate_varlen  # noqa: E402
 from scripts.latch.latch_model import LatCH  # noqa: E402
@@ -135,6 +136,17 @@ def split_indices(groups, val_frac, seed=0):
     if not train or not val:
         raise ValueError(f"val split produced an empty side (train={len(train)}, val={len(val)})")
     return train, val
+
+
+def subsample_groups(groups, idx, frac, seed=0):
+    """Keep a seeded `frac` of the GROUPS among `idx` (whole tracks, as in split_indices), returning the kept indices in
+    their original order. frac >= 1 returns idx unchanged."""
+    if frac >= 1.0:
+        return list(idx)
+    uniq = sorted({groups[i] for i in idx})
+    random.Random(seed).shuffle(uniq)
+    keep = set(uniq[:max(1, int(round(frac * len(uniq))))])
+    return [i for i in idx if groups[i] in keep]
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +476,24 @@ def train(args):
         train_ds = Subset(ds, tr_idx)
     else:
         train_ds, tr_idx = ds, list(range(len(ds)))
+    # --train-frac / --extra-train-dirs: change only what the head trains on. tr_idx stays the full train split, so the
+    # standardization stats and the held-out set are exactly those of the full run and val losses compare across arms.
+    if args.train_frac < 1.0 or args.extra_train_dirs:
+        if args.flight_recorder or args.skip_spike_ratio > 0:
+            raise SystemExit("--train-frac / --extra-train-dirs do not support --flight-recorder / --skip-spike-ratio")
+        used = tr_idx
+        if args.train_frac < 1.0:
+            g = ds.group_keys(args.val_group_by)
+            used = subsample_groups(g, tr_idx, args.train_frac, seed=args.train_frac_seed)
+            print(f"Train subset: {len(used)} of {len(tr_idx)} train crops ({len({g[i] for i in used})} of "
+                  f"{len({g[i] for i in tr_idx})} {args.val_group_by} groups, --train-frac {args.train_frac}, seed {args.train_frac_seed})")
+        train_ds = Subset(ds, used)
+        if args.extra_train_dirs:
+            xd = args.extra_train_dirs if len(args.extra_train_dirs) > 1 else args.extra_train_dirs[0]
+            extra = LatCHDataset(xd, target_feature=args.feature, db_path=args.db_path, target_source=args.target_source,
+                                 chroma_dir=args.chroma_dir, chroma_key=args.chroma_key, voiced_field=args.voiced_field)
+            train_ds = ConcatDataset([train_ds, extra])
+            print(f"Extra train-only data: {len(extra)} crops from {args.extra_train_dirs} (never in val)")
 
     rec_sampler = None
     if args.flight_recorder or args.skip_spike_ratio > 0:
@@ -1122,6 +1152,12 @@ if __name__ == "__main__":
                         "= no val set, and `_best.pt` is then selected on TRAINING loss, which "
                         "is not a convergence signal. Set this for any run you intend to "
                         "believe.")
+    p.add_argument("--train-frac", type=float, default=1.0,
+                   help="train on a seeded fraction of the train split's groups (whole tracks); val set and "
+                        "standardization stats stay those of the full split. 1.0 (default) = unchanged")
+    p.add_argument("--train-frac-seed", type=int, default=0)
+    p.add_argument("--extra-train-dirs", nargs="+", default=None,
+                   help="latent dirs added to TRAINING only (never held out, never subsampled by --train-frac)")
     p.add_argument("--val-seed", type=int, default=0,
                    help="seed for the group split AND for the fixed val noise/t draws")
     p.add_argument("--val-group-by", default="source_track",
