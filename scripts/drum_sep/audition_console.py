@@ -37,6 +37,14 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     else:
         wiener_comp_sisdr, wiener_comp_lsd, wiener_comp_f1 = float("nan"), float("nan"), float("nan")
 
+    has_audedit = any("audedit" in r for r in comp_results)
+    if has_audedit:
+        audedit_comp_sisdr = float(np.mean([r["audedit"]["si_sdr_db"] for r in comp_results if "audedit" in r]))
+        audedit_comp_lsd = float(np.mean([r["audedit"]["lsd_db"] for r in comp_results if "audedit" in r]))
+        audedit_comp_f1 = float(np.mean([r["audedit"]["onset_f1_20"] for r in comp_results if "audedit" in r]))
+    else:
+        audedit_comp_sisdr, audedit_comp_lsd, audedit_comp_f1 = float("nan"), float("nan"), float("nan")
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -455,6 +463,15 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             <td>{wiener_comp_f1:.3f}</td>
             <td><span class="pill-tag tag-green">Energy Conserved</span></td>
           </tr>
+          <tr>
+            <td><strong>AudEdit Kick (Zero-Shot Flow)</strong></td>
+            <td>Inversion-Free FlowEdit + z0-Anchor (&eta;=0.4)</td>
+            <td>Isolated Kick</td>
+            <td>{audedit_comp_sisdr:+.2f} dB</td>
+            <td>{audedit_comp_lsd:.2f} dB</td>
+            <td>{audedit_comp_f1:.3f}</td>
+            <td><span class="pill-tag tag-orange">Zero-Shot Flow (June)</span></td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -544,6 +561,32 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
                 "badge": "Energy Conserved",
                 "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_wiener.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_wiener.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_wiener.get("onset_f1_20", float("nan")):.3f}</strong></span>',
                 "src": aud["sa3_wiener_kick"]
+            })
+
+        # AudEdit Kick (Zero-Shot Flow)
+        if "audedit_kick" in aud:
+            m_flow = comp.get("audedit", {})
+            card_list.append({
+                "name": "AudEdit Kick (Zero-Shot Flow)",
+                "color": "var(--orange)",
+                "border": "rgba(251, 146, 60, 0.5)",
+                "bg": "rgba(251, 146, 60, 0.04)",
+                "badge": "FlowEdit + z0-Anchor",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_flow.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_flow.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_flow.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["audedit_kick"]
+            })
+
+        # AudEdit Kick (Wiener Masked)
+        if "audedit_wiener_kick" in aud:
+            m_flow_w = comp.get("audedit_wiener", {})
+            card_list.append({
+                "name": "AudEdit Kick (Wiener Masked)",
+                "color": "var(--yellow)",
+                "border": "rgba(245, 158, 11, 0.5)",
+                "bg": "rgba(245, 158, 11, 0.04)",
+                "badge": "Flow + Wiener",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_flow_w.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_flow_w.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_flow_w.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["audedit_wiener_kick"]
             })
 
         # Snare, Hi-Hat, Percussion
