@@ -366,6 +366,53 @@ def separate_long_audio(model, ae, mix_wav: np.ndarray, prompt="solo kick drum, 
     return np.clip(np.nan_to_num(out_audio, nan=0.0), -1.0, 1.0)
 
 
+def apply_wiener_masking(est_wav: np.ndarray, mix_wav: np.ndarray, alpha: float = 1.5,
+                         n_fft: int = 2048, hop_length: int = 512, eps: float = 1e-10) -> np.ndarray:
+    """Apply spectrogram Wiener masking against the mix bus to ensure energy conservation and zero hallucination.
+
+    Args:
+        est_wav: (channels, samples) generated separated stem audio.
+        mix_wav: (samples, channels) or (channels, samples) original mixture bus audio.
+        alpha: Exponent for magnitude weighting (1.0 = linear amplitude ratio, 2.0 = power ratio).
+    Returns:
+        reconciled_wav: (channels, samples) energy-conserved masked stem audio.
+    """
+    if mix_wav.ndim == 1:
+        mix_wav = np.stack([mix_wav, mix_wav], axis=0)
+    elif mix_wav.shape[0] > 2 and mix_wav.shape[1] == 2:
+        mix_wav = mix_wav.T
+
+    if est_wav.ndim == 1:
+        est_wav = np.stack([est_wav, est_wav], axis=0)
+    elif est_wav.shape[0] > 2 and est_wav.shape[1] == 2:
+        est_wav = est_wav.T
+
+    samples = min(est_wav.shape[-1], mix_wav.shape[-1])
+    est_crop = est_wav[:, :samples]
+    mix_crop = mix_wav[:, :samples]
+
+    device = "cpu"
+    est_t = torch.from_numpy(est_crop).float().to(device)
+    mix_t = torch.from_numpy(mix_crop).float().to(device)
+    window = torch.hann_window(n_fft, device=device)
+
+    X_est = torch.stft(est_t, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+    X_mix = torch.stft(mix_t, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+
+    mag_est = torch.abs(X_est)
+    mag_mix = torch.abs(X_mix)
+
+    mag_res = torch.clamp(mag_mix - mag_est, min=0.0)
+
+    est_p = mag_est ** alpha
+    res_p = mag_res ** alpha
+    mask = est_p / (est_p + res_p + eps)
+    mask = torch.clamp(mask, 0.0, 1.0)
+
+    X_masked = mask * X_mix
+    recon_t = torch.istft(X_masked, n_fft=n_fft, hop_length=hop_length, window=window, length=samples)
+    recon = recon_t.cpu().numpy()
+    return np.clip(np.nan_to_num(recon, nan=0.0), -1.0, 1.0)
 
 
 def main():
@@ -382,6 +429,10 @@ def main():
     p.add_argument("--steps", type=int, default=25, help="Diffusion sampling steps")
     p.add_argument("--cfg", type=float, default=1.0, help="Classifier-free guidance scale")
     p.add_argument("--max_samples", type=int, default=10, help="Max validation samples to evaluate")
+    p.add_argument("--wiener_alpha", type=float, default=1.5,
+                   help="Exponent for STFT Wiener mask reconciliation against mix bus (default 1.5, set <=0 to disable)")
+    p.add_argument("--reuse_existing", action="store_true",
+                   help="Reuse existing separated audio files from disk if available (fast metric recompute)")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -390,20 +441,26 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. Load SAME-L autoencoder for decoding & encoding
-    print("Loading SAME-L autoencoder...")
-    cfg_path, ckpt_path = ae_models["same-l"].resolve()
-    ae = load_autoencoder(cfg_path, ckpt_path, device=device)
-
-    # 2. Load fine-tuned separation model (Primary)
-    print(f"Loading primary separation model from {args.checkpoint}...")
-    model = load_separation_model(args.checkpoint, device=device)
-
-    # Optional Compare model (e.g. Arm A)
+    model = None
+    ae = None
     compare_model = None
-    if args.compare_checkpoint and Path(args.compare_checkpoint).exists():
-        print(f"Loading comparison model from {args.compare_checkpoint}...")
-        compare_model = load_separation_model(args.compare_checkpoint, device=device)
+
+    if not args.reuse_existing:
+        # 1. Load SAME-L autoencoder for decoding & encoding
+        print("Loading SAME-L autoencoder...")
+        cfg_path, ckpt_path = ae_models["same-l"].resolve()
+        ae = load_autoencoder(cfg_path, ckpt_path, device=device)
+
+        # 2. Load fine-tuned separation model (Primary)
+        print(f"Loading primary separation model from {args.checkpoint}...")
+        model = load_separation_model(args.checkpoint, device=device)
+
+        # Optional Compare model (e.g. Arm A)
+        if args.compare_checkpoint and Path(args.compare_checkpoint).exists():
+            print(f"Loading comparison model from {args.compare_checkpoint}...")
+            compare_model = load_separation_model(args.compare_checkpoint, device=device)
+    else:
+        print("Reusing existing separated audio from disk (--reuse_existing). Skipping model load.")
 
     # 3. Evaluate on held-out validation samples
     val_manifest_path = Path(args.val_dir) / "manifest.json"
@@ -427,26 +484,50 @@ def main():
 
             print(f"[{s_idx+1}/{len(samples)}] {song} (win {window}, {remix})...")
 
-            # Decode ground truth kick & mixture for audio comparison
-            with torch.inference_mode():
-                gt_k_t = torch.from_numpy(target_lat).unsqueeze(0).to(device=device, dtype=torch.float32)
-                mix_t = torch.from_numpy(mix_lat).unsqueeze(0).to(device=device, dtype=torch.float32)
-                gt_k_wav = ae.decode(gt_k_t).squeeze(0).cpu().float().numpy()
-                mix_wav = ae.decode(mix_t).squeeze(0).cpu().float().numpy()
+            sample_tag = f"val_{s_idx:03d}_{window}_{remix}"
+            mix_p = audio_out / f"{sample_tag}_mix.wav"
+            gt_p = audio_out / f"{sample_tag}_gt_kick.wav"
+            sa3_path = audio_out / f"{sample_tag}_sa3_kick.wav"
 
-            # Separate target kick using trained model
-            est_k_wav = separate_window(model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+            if args.reuse_existing and mix_p.exists() and gt_p.exists() and sa3_path.exists():
+                mix_wav, _ = sf.read(str(mix_p))
+                gt_k_wav, _ = sf.read(str(gt_p))
+                est_k_wav, _ = sf.read(str(sa3_path))
+                if mix_wav.ndim > 1 and mix_wav.shape[0] > 2:
+                    mix_wav = mix_wav.T
+                if gt_k_wav.ndim > 1 and gt_k_wav.shape[0] > 2:
+                    gt_k_wav = gt_k_wav.T
+                if est_k_wav.ndim > 1 and est_k_wav.shape[0] > 2:
+                    est_k_wav = est_k_wav.T
+            else:
+                # Decode ground truth kick & mixture for audio comparison
+                with torch.inference_mode():
+                    gt_k_t = torch.from_numpy(target_lat).unsqueeze(0).to(device=device, dtype=torch.float32)
+                    mix_t = torch.from_numpy(mix_lat).unsqueeze(0).to(device=device, dtype=torch.float32)
+                    gt_k_wav = ae.decode(gt_k_t).squeeze(0).cpu().float().numpy()
+                    mix_wav = ae.decode(mix_t).squeeze(0).cpu().float().numpy()
+
+                # Separate target kick using trained model
+                est_k_wav = separate_window(model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+                sf.write(str(sa3_path), est_k_wav.T, SR)
+                sf.write(str(mix_p), mix_wav.T, SR)
+                sf.write(str(gt_p), gt_k_wav.T, SR)
 
             # Mono downmix for metric calculation
             ref_mono = np.mean(gt_k_wav, axis=0)
             est_mono = np.mean(est_k_wav, axis=0)
             metrics = compute_all_metrics(ref_mono, est_mono, SR)
 
+            # Apply Wiener Masking Reconciliation if requested
+            if args.wiener_alpha > 0:
+                w_k_wav = apply_wiener_masking(est_k_wav, mix_wav, alpha=args.wiener_alpha)
+                sf.write(str(audio_out / f"{sample_tag}_wiener_kick.wav"), w_k_wav.T, SR)
+                w_mono = np.mean(w_k_wav, axis=0)
+                metrics["wiener"] = compute_all_metrics(ref_mono, w_mono, SR)
+
             # Save audio files
-            sample_tag = f"val_{s_idx:03d}_{window}_{remix}"
             sf.write(str(audio_out / f"{sample_tag}_mix.wav"), mix_wav.T, SR)
             sf.write(str(audio_out / f"{sample_tag}_gt_kick.wav"), gt_k_wav.T, SR)
-            sf.write(str(audio_out / f"{sample_tag}_sa3_kick.wav"), est_k_wav.T, SR)
 
             metrics["sample_tag"] = sample_tag
             metrics["song"] = song
@@ -454,7 +535,10 @@ def main():
             metrics["remix"] = remix
             val_results.append(metrics)
 
-            print(f"  -> SI-SDR: {metrics['si_sdr_db']:.2f} dB | LSD: {metrics['lsd_db']:.2f} dB | Onset F1: {metrics['onset_f1_20']:.3f}")
+            msg = f"  -> SA3 Kick: SI-SDR: {metrics['si_sdr_db']:.2f} dB | LSD: {metrics['lsd_db']:.2f} dB | Onset F1: {metrics['onset_f1_20']:.3f}"
+            if "wiener" in metrics:
+                msg += f" | Wiener: SI-SDR: {metrics['wiener']['si_sdr_db']:.2f} dB | LSD: {metrics['wiener']['lsd_db']:.2f} dB"
+            print(msg)
 
     # 4. Evaluate on Benchmark Comparison Multitracks
     comp_results = []
@@ -478,17 +562,23 @@ def main():
             gt_wav, _ = sf.read(str(gt_path))
             gt_mono = np.mean(gt_wav, axis=-1) if gt_wav.ndim > 1 else gt_wav
 
-            # Separate with Primary Model (using sliding-window inference on long tracks)
-            print(f"  Separating with primary model ({Path(args.checkpoint).name})...")
-            sa3_wav = separate_long_audio(model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
-            sa3_mono = np.mean(sa3_wav, axis=0)
-
             track_audio_out = audio_out / track_id
             track_audio_out.mkdir(parents=True, exist_ok=True)
             sf.write(str(track_audio_out / "mix.wav"), mix_wav, SR)
             sf.write(str(track_audio_out / "ground_truth.wav"), gt_wav, SR)
-            sf.write(str(track_audio_out / "sa3_kick.wav"), sa3_wav.T, SR)
 
+            # Separate with Primary Model (using sliding-window inference on long tracks)
+            sa3_path = track_audio_out / "sa3_kick.wav"
+            if args.reuse_existing and sa3_path.exists():
+                sa3_wav, _ = sf.read(str(sa3_path))
+                if sa3_wav.ndim > 1 and sa3_wav.shape[0] > 2:
+                    sa3_wav = sa3_wav.T
+            else:
+                print(f"  Separating with primary model ({Path(args.checkpoint).name})...")
+                sa3_wav = separate_long_audio(model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
+                sf.write(str(sa3_path), sa3_wav.T, SR)
+
+            sa3_mono = np.mean(sa3_wav, axis=0)
             m_sa3 = compute_all_metrics(gt_mono, sa3_mono, SR)
             print(f"  -> SA3 Kick:      SI-SDR: {m_sa3['si_sdr_db']:6.2f} dB | LSD: {m_sa3['lsd_db']:5.2f} dB | Onset F1: {m_sa3['onset_f1_20']:.3f} | Attack: {m_sa3.get('attack_db', float('nan')):+5.2f} dB")
 
@@ -502,12 +592,30 @@ def main():
                 }
             }
 
+            # Wiener Reconciliation
+            if args.wiener_alpha > 0:
+                print(f"  Reconciling via STFT Wiener masking (alpha={args.wiener_alpha})...")
+                sa3_w_wav = apply_wiener_masking(sa3_wav, mix_wav.T, alpha=args.wiener_alpha)
+                sf.write(str(track_audio_out / "sa3_wiener_kick.wav"), sa3_w_wav.T, SR)
+                sa3_w_mono = np.mean(sa3_w_wav, axis=0)
+                m_sa3_w = compute_all_metrics(gt_mono, sa3_w_mono, SR)
+                row["sa3_wiener"] = m_sa3_w
+                row["audio"]["sa3_wiener_kick"] = f"audio/{track_id}/sa3_wiener_kick.wav"
+                print(f"  -> SA3 Wiener:    SI-SDR: {m_sa3_w['si_sdr_db']:6.2f} dB | LSD: {m_sa3_w['lsd_db']:5.2f} dB | Onset F1: {m_sa3_w['onset_f1_20']:.3f} | Attack: {m_sa3_w.get('attack_db', float('nan')):+5.2f} dB")
+
             # Optional Comparison Model (e.g. Arm A)
             if compare_model is not None:
-                print(f"  Separating with compare model ({Path(args.compare_checkpoint).name})...")
-                cmp_wav = separate_long_audio(compare_model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
+                cmp_path = track_audio_out / "sa3_compare_kick.wav"
+                if args.reuse_existing and cmp_path.exists():
+                    cmp_wav, _ = sf.read(str(cmp_path))
+                    if cmp_wav.ndim > 1 and cmp_wav.shape[0] > 2:
+                        cmp_wav = cmp_wav.T
+                else:
+                    print(f"  Separating with compare model ({Path(args.compare_checkpoint).name})...")
+                    cmp_wav = separate_long_audio(compare_model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
+                    sf.write(str(cmp_path), cmp_wav.T, SR)
+
                 cmp_mono = np.mean(cmp_wav, axis=0)
-                sf.write(str(track_audio_out / "sa3_compare_kick.wav"), cmp_wav.T, SR)
                 m_cmp = compute_all_metrics(gt_mono, cmp_mono, SR)
                 row["sa3_compare"] = m_cmp
                 row["audio"]["sa3_compare_kick"] = f"audio/{track_id}/sa3_compare_kick.wav"
@@ -552,10 +660,13 @@ def main():
             "compare_checkpoint": args.compare_checkpoint,
             "steps": args.steps,
             "cfg": args.cfg,
+            "wiener_alpha": args.wiener_alpha,
             "n_val_samples": len(val_results),
             "mean_val_si_sdr_db": float(np.mean([r["si_sdr_db"] for r in val_results])) if val_results else 0.0,
             "mean_val_lsd_db": float(np.mean([r["lsd_db"] for r in val_results])) if val_results else 0.0,
             "mean_val_onset_f1_20": float(np.mean([r["onset_f1_20"] for r in val_results])) if val_results else 0.0,
+            "mean_val_wiener_si_sdr_db": float(np.mean([r["wiener"]["si_sdr_db"] for r in val_results if "wiener" in r])) if val_results else 0.0,
+            "mean_val_wiener_lsd_db": float(np.mean([r["wiener"]["lsd_db"] for r in val_results if "wiener" in r])) if val_results else 0.0,
             "val_samples": val_results,
             "comp_samples": comp_results
         }, f, indent=2)
@@ -566,20 +677,25 @@ def main():
         "checkpoint": args.checkpoint,
         "compare_checkpoint": args.compare_checkpoint,
         "steps": args.steps,
-        "cfg": args.cfg
+        "cfg": args.cfg,
+        "wiener_alpha": args.wiener_alpha
     })
 
     print(f"\n================================================================================")
     print("GATE G2 EVALUATION COMPLETE")
     print(f"Results saved to {summary_path}")
     if val_results:
-        print(f"Held-out Val Mean SI-SDR:  {np.mean([r['si_sdr_db'] for r in val_results]):.2f} dB")
-        print(f"Held-out Val Mean LSD:     {np.mean([r['lsd_db'] for r in val_results]):.2f} dB")
-        print(f"Held-out Val Mean Onset F1: {np.mean([r['onset_f1_20'] for r in val_results]):.3f}")
+        print(f"Held-out Val Mean SI-SDR:         {np.mean([r['si_sdr_db'] for r in val_results]):.2f} dB")
+        if any("wiener" in r for r in val_results):
+            print(f"Held-out Val Mean Wiener SI-SDR:  {np.mean([r['wiener']['si_sdr_db'] for r in val_results if 'wiener' in r]):.2f} dB")
+        print(f"Held-out Val Mean LSD:            {np.mean([r['lsd_db'] for r in val_results]):.2f} dB")
+        print(f"Held-out Val Mean Onset F1:       {np.mean([r['onset_f1_20'] for r in val_results]):.3f}")
     if comp_results:
-        print(f"Benchmark Tracks Mean SI-SDR: {np.mean([r['sa3']['si_sdr_db'] for r in comp_results]):.2f} dB")
-        print(f"Benchmark Tracks Mean LSD:    {np.mean([r['sa3']['lsd_db'] for r in comp_results]):.2f} dB")
-        print(f"Benchmark Tracks Mean Onset:  {np.mean([r['sa3']['onset_f1_20'] for r in comp_results]):.3f}")
+        print(f"Benchmark Tracks Mean SI-SDR:        {np.mean([r['sa3']['si_sdr_db'] for r in comp_results]):.2f} dB")
+        if any("sa3_wiener" in r for r in comp_results):
+            print(f"Benchmark Tracks Mean Wiener SI-SDR: {np.mean([r['sa3_wiener']['si_sdr_db'] for r in comp_results if 'sa3_wiener' in r]):.2f} dB")
+        print(f"Benchmark Tracks Mean LSD:           {np.mean([r['sa3']['lsd_db'] for r in comp_results]):.2f} dB")
+        print(f"Benchmark Tracks Mean Onset:         {np.mean([r['sa3']['onset_f1_20'] for r in comp_results]):.3f}")
     print(f"Audition Console: file://{out_dir}/index.html")
     print(f"================================================================================")
 

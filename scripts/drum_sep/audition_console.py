@@ -37,6 +37,14 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     else:
         cmp_sisdr, cmp_lsd, cmp_f1 = float("nan"), float("nan"), float("nan")
 
+    has_wiener = any("sa3_wiener" in r for r in comp_results)
+    if has_wiener:
+        wiener_comp_sisdr = float(np.mean([r["sa3_wiener"]["si_sdr_db"] for r in comp_results if "sa3_wiener" in r]))
+        wiener_comp_lsd = float(np.mean([r["sa3_wiener"]["lsd_db"] for r in comp_results if "sa3_wiener" in r]))
+        wiener_comp_f1 = float(np.mean([r["sa3_wiener"]["onset_f1_20"] for r in comp_results if "sa3_wiener" in r]))
+    else:
+        wiener_comp_sisdr, wiener_comp_lsd, wiener_comp_f1 = float("nan"), float("nan"), float("nan")
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -408,12 +416,21 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
           </tr>
           <tr class="highlight-target">
             <td><strong>SA3 Gate G2 (Arm A-v2)</strong></td>
-            <td>LoRA + Active Modular Mix Inlet</td>
+            <td>LoRA + Active Modular Mix Inlet (Generative)</td>
             <td>Isolated Kick</td>
             <td>{sa3_comp_sisdr:+.2f} dB</td>
             <td>{sa3_comp_lsd:.2f} dB</td>
             <td>{sa3_comp_f1:.3f}</td>
-            <td><span class="pill-tag tag-blue">Gate G2 Target</span></td>
+            <td><span class="pill-tag tag-blue">Generative Output</span></td>
+          </tr>
+          <tr style="background: rgba(16, 185, 129, 0.08); font-weight: 600;">
+            <td><strong>SA3 Gate G2 (Wiener Reconciled)</strong></td>
+            <td>LoRA Prior + STFT Wiener Masking (&alpha;=1.5)</td>
+            <td>Isolated Kick</td>
+            <td>{wiener_comp_sisdr:+.2f} dB</td>
+            <td>{wiener_comp_lsd:.2f} dB</td>
+            <td>{wiener_comp_f1:.3f}</td>
+            <td><span class="pill-tag tag-green">Energy Conserved</span></td>
           </tr>
         </tbody>
       </table>
@@ -435,6 +452,7 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
         m_cmp = comp.get("sa3_compare", {})
         m_bs = comp.get("bs_roformer", {})
         m_msg = comp.get("msgld", {})
+        m_wiener = comp.get("sa3_wiener", {})
 
         html += f"""
     <div class="track-section" id="track_{c_idx}">
@@ -471,7 +489,7 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
           </div>
         </div>
 
-        <!-- SA3 Gate G2 Arm A-v2 Kick -->
+        <!-- SA3 Gate G2 Arm A-v2 Kick (Generative) -->
         <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.04);">
           <div class="stem-header">
             <span class="stem-name" style="color: var(--accent);">SA3 Gate G2 (Arm A-v2)</span>
@@ -488,6 +506,26 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
         </div>
 """
         stem_idx = 3
+        if "sa3_wiener_kick" in aud:
+            html += f"""
+        <!-- SA3 Gate G2 (Wiener Reconciled) -->
+        <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.04);">
+          <div class="stem-header">
+            <span class="stem-name" style="color: var(--green);">SA3 Kick (Wiener Masked)</span>
+            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
+          </div>
+          <div class="stem-metrics">
+            <span class="m-badge">SI-SDR: <strong>{m_wiener.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
+            <span class="m-badge">LSD: <strong>{m_wiener.get('lsd_db', float('nan')):.2f} dB</strong></span>
+            <span class="m-badge">Onset F1: <strong>{m_wiener.get('onset_f1_20', float('nan')):.3f}</strong></span>
+          </div>
+          <div class="audio-wrap">
+            <audio controls src="{aud.get('sa3_wiener_kick', '')}" preload="none"></audio>
+          </div>
+        </div>
+"""
+            stem_idx += 1
+
         if "sa3_compare_kick" in aud:
             html += f"""
         <!-- SA3 Gate G2 Arm A Kick (Prior) -->
@@ -565,6 +603,14 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             song = v.get("song", "Validation Sample")
             win = v.get("window", 0)
             remix = v.get("remix", "orig")
+            vw = v.get("wiener", {})
+
+            wiener_badge = ""
+            if vw:
+                wiener_badge = f'<span class="m-badge" style="background: rgba(16, 185, 129, 0.15); color: var(--green);">Wiener SI-SDR: <strong>{vw.get("si_sdr_db", float("nan")):.2f} dB</strong></span>'
+
+            has_val_wiener = (out_dir / f"audio/{s_tag}_wiener_kick.wav").exists()
+            grid_cols = "repeat(4, 1fr)" if has_val_wiener else "repeat(3, 1fr)"
 
             html += f"""
     <div class="track-section" id="val_track_{v_idx}">
@@ -576,9 +622,10 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
           <span class="m-badge">SI-SDR: <strong>{v.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
           <span class="m-badge">LSD: <strong>{v.get('lsd_db', float('nan')):.2f} dB</strong></span>
           <span class="m-badge">Onset F1: <strong>{v.get('onset_f1_20', float('nan')):.3f}</strong></span>
+          {wiener_badge}
         </div>
       </div>
-      <div class="stems-grid" style="grid-template-columns: repeat(3, 1fr);">
+      <div class="stems-grid" style="grid-template-columns: {grid_cols};">
         <div class="stem-card">
           <span class="stem-name">Drum Bus Mixture</span>
           <div class="audio-wrap">
@@ -592,11 +639,22 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
           </div>
         </div>
         <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.04);">
-          <span class="stem-name" style="color: var(--accent);">SA3 Gate G2 Separated Kick</span>
+          <span class="stem-name" style="color: var(--accent);">SA3 Gate G2 Kick (Generative)</span>
           <div class="audio-wrap">
             <audio controls src="audio/{s_tag}_sa3_kick.wav" preload="none"></audio>
           </div>
         </div>
+"""
+            if has_val_wiener:
+                html += f"""
+        <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.04);">
+          <span class="stem-name" style="color: var(--green);">SA3 Kick (Wiener Masked)</span>
+          <div class="audio-wrap">
+            <audio controls src="audio/{s_tag}_wiener_kick.wav" preload="none"></audio>
+          </div>
+        </div>
+"""
+            html += """
       </div>
     </div>
 """
