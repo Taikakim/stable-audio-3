@@ -187,8 +187,13 @@ class MirCtrlConditioner(nn.Module):
         self.dropout_prob = float(dropout_prob)
 
     def forward(self, items, device):
-        ts = [torch.as_tensor(np.asarray(x), dtype=torch.float32) for x in items]
-        t = torch.stack(ts, 0).to(device)
+        ts = []
+        for x in items:
+            if isinstance(x, torch.Tensor):
+                ts.append(x.to(device=device, dtype=torch.float32))
+            else:
+                ts.append(torch.as_tensor(np.asarray(x), dtype=torch.float32, device=device))
+        t = torch.stack(ts, 0)
         assert t.shape[1] == self.n_channels, (t.shape, self.n_channels)
         if self.training and self.dropout_prob > 0:
             keep = (torch.rand(t.shape[0], device=t.device) >= self.dropout_prob)

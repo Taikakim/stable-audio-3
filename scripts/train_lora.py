@@ -337,6 +337,16 @@ def train(args):
               f"dropout={args.mir_ctrl_dropout} -> modular local-cond proj "
               f"({sum(p.numel() for p in _ctrl_params):,} new trainable params)")
 
+    if args.sep_data:
+        # SA3 Drum Separator (KUANG Gate G2): drum bus latent -> native modular local-cond inlet
+        from mir_control import (MirCtrlConditioner, install_mir_control)
+        _tfm = model.model.model.transformer
+        _ctrl_params = install_mir_control(model, _tfm, n_channels=256, cond_id="mix_lat",
+                                           blocks=getattr(args, "mir_ctrl_blocks", "12-23"))
+        model.conditioner.conditioners["mix_lat"] = MirCtrlConditioner(
+            n_channels=256, dropout_prob=getattr(args, "mir_ctrl_dropout", 0.1))
+        print(f"[drum_sep] installed mix_lat inlet ({sum(p.numel() for p in _ctrl_params):,} new trainable params)")
+
     sample_rate = model.sample_rate
     ds_ratio = model.pretransform.downsampling_ratio
 
@@ -360,7 +370,16 @@ def train(args):
             if hasattr(cond, "tokenizer") and hasattr(cond, "max_length"):
                 tokenizers[key] = (cond.tokenizer, cond.max_length)
 
-    if args.arc_data:
+    if args.sep_data:
+        from stable_audio_3.data.dataset import DrumSepDataset
+        dataset = DrumSepDataset(
+            args.sep_data,
+            sample_rate=sample_rate,
+            downsampling_ratio=ds_ratio,
+            tokenizers=tokenizers,
+        )
+        print(f"[drum_sep] loaded {len(dataset)} paired separation samples from {args.sep_data}")
+    elif args.arc_data:
         # ARC-Forcing rollouts: fixed-length samples carrying their own inpaint
         # conditioning (drifted context clamped); no cropping on this path.
         dataset = ArcRolloutDataset(
@@ -501,7 +520,7 @@ def train(args):
         # Linear freezes the zero base and row-scales zeros: the inlet stays dead
         # forever; cost a morning of bit-zero ablation gains to find, 2026-08-21).
         "exclude": ((list(args.exclude) if args.exclude else []) + ["modular_local_embeds"]
-                    if args.mir_ctrl_pack else args.exclude),
+                    if (args.mir_ctrl_pack or args.sep_data) else args.exclude),
         "phm_n": args.phm_n,
     }
     # Decoupled weight decay: None => optimiser-appropriate default preserving prior
@@ -681,7 +700,7 @@ def train(args):
         ema_update_after_step=args.ema_warmup_steps,
         log_loss_info=False,
         optimizer_configs=optimizer_config,
-        pre_encoded=bool(args.encoded_dir or args.arc_data),
+        pre_encoded=bool(args.encoded_dir or args.arc_data or args.sep_data),
         timestep_sampler="trunc_logit_normal",
         timestep_sampler_options={},
         inpainting_config={"mask_kwargs": {"mask_type_probabilities": [0.1, 0.8, 0.1]}},
@@ -1019,6 +1038,13 @@ def main():
              "with the drifted rollout context CLAMPED via the inpaint conditioning "
              "keys; loss on the free (mask=0) region only. Mutually exclusive with "
              "--data_dir/--encoded_dir; samples are fixed-length (T multiple of 256).",
+    )
+    p.add_argument(
+        "--sep-data", "--sep_data",
+        dest="sep_data",
+        default=None,
+        help="Drum separation paired dataset directory (.npz pairs containing target_lat and mix_lat). "
+             "Installs mix_lat modular inlet through install_mir_control.",
     )
     p.add_argument(
         "--beat-aware-crop",
@@ -1573,10 +1599,12 @@ def main():
         p.error("--full-finetune injects NO adapter, so --lora_checkpoint / "
                 "--warm_start_ckpt (adapter-resume paths) do not apply. Use "
                 "--resume_ckpt to continue a full-finetune Lightning checkpoint.")
-    if args.arc_data and (args.encoded_dir or args.data_dir):
-        p.error("--arc-data is mutually exclusive with --data_dir/--encoded_dir")
-    if not args.encoded_dir and not args.data_dir and not args.arc_data:
-        p.error("one of --data_dir, --encoded_dir or --arc-data is required")
+    if args.arc_data and (args.encoded_dir or args.data_dir or args.sep_data):
+        p.error("--arc-data is mutually exclusive with other dataset modes")
+    if args.sep_data and (args.encoded_dir or args.data_dir or args.arc_data):
+        p.error("--sep-data is mutually exclusive with other dataset modes")
+    if not args.encoded_dir and not args.data_dir and not args.arc_data and not args.sep_data:
+        p.error("one of --data_dir, --encoded_dir, --arc-data or --sep-data is required")
     train(args)
 
 

@@ -69,9 +69,32 @@ def si_sdr_db(ref, est, eps=1e-9):
     return float(10.0 * np.log10((np.dot(s, s) + eps) / (np.dot(est - s, est - s) + eps)))
 
 
+def _py_peak_pick(x, pre_max, post_max, pre_avg, post_avg, delta, wait, peaks):
+    peaks[0] = (x[0] >= np.max(x[:min(post_max, x.shape[0])]))
+    peaks[0] &= (x[0] >= np.mean(x[:min(post_avg, x.shape[0])]) + delta)
+    n = wait + 1 if peaks[0] else 1
+    while n < x.shape[0]:
+        maxn = np.max(x[max(0, n - pre_max):min(n + post_max, x.shape[0])])
+        peaks[n] = (x[n] == maxn)
+        if not peaks[n]:
+            n += 1
+            continue
+        avgn = np.mean(x[max(0, n - pre_avg):min(n + post_avg, x.shape[0])])
+        peaks[n] &= (x[n] >= avgn + delta)
+        if not peaks[n]:
+            n += 1
+            continue
+        n += wait + 1
+
+
 def detect_onsets(y, sr=SR):
     """Onset times (s), librosa's default detector; empty for (near) silent input."""
     import librosa
+    try:
+        import librosa.util.utils as lu
+        lu.__peak_pick = _py_peak_pick
+    except Exception:
+        pass
     if np.max(np.abs(y)) < 1e-4:
         return np.zeros(0)
     return librosa.onset.onset_detect(y=np.asarray(y, np.float32), sr=sr, units="time", backtrack=False)

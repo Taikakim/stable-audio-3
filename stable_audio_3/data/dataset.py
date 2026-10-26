@@ -757,6 +757,99 @@ class ArcRolloutDataset(torch.utils.data.Dataset):
             return self[random.randrange(len(self))]
 
 
+class DrumSepDataset(torch.utils.data.Dataset):
+    """Drum separation paired dataset (Gate G2, DRUM_SEPARATION_SA3_PLAN.md).
+    Reads .npz files containing target_lat (stem) and mix_lat (drum bus mixture).
+    Returns (target_lat, info) where info routes:
+      - 'mix_lat': mix_lat tensor [C, T] for Arm A (modular local conditioning inlet)
+      - 'inpaint_mask' and 'inpaint_masked_input': for Arm B (inpaint route)
+      - 'prompt': text caption
+      - 'padding_mask': [tensor(1, T)]
+      - 'seconds_total': float
+    """
+
+    def __init__(
+        self,
+        path,
+        sample_rate=44100,
+        downsampling_ratio=4096,
+        tokenizers: Optional[dict] = None,
+    ):
+        super().__init__()
+        paths = path if isinstance(path, list) else [path]
+        self.filenames = []
+        self.manifest = None
+        for p in paths:
+            _, files = fast_scandir(p, ["npz"])
+            self.filenames.extend(f for f in files if not f.endswith(".TIMESERIES.npz"))
+            manifest_path = os.path.join(p, "manifest.json")
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r") as f:
+                        self.manifest = json.load(f)
+                except Exception as e:
+                    print(f"Couldn't load manifest file {manifest_path}: {e}")
+        self.filenames.sort()
+        self.sample_rate = sample_rate
+        self.downsampling_ratio = downsampling_ratio
+        self.tokenizers = tokenizers
+        print(f"Found {len(self.filenames)} drum separation paired samples")
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        npz_filename = self.filenames[idx]
+        try:
+            with np.load(npz_filename) as npz:
+                target = npz["target_lat"].astype(np.float32)  # [C, T]
+                mix = npz["mix_lat"].astype(np.float32)        # [C, T]
+                prompt = str(npz["prompt"])
+                stem_tag = str(npz["stem_tag"]) if "stem_tag" in npz.files else "kick"
+                song = str(npz["song"]) if "song" in npz.files else ""
+                remix_type = str(npz["remix_type"]) if "remix_type" in npz.files else "orig"
+
+            latents = torch.from_numpy(target)
+            mix_lat = torch.from_numpy(mix)
+            t_total = latents.shape[1]
+
+            info = {
+                "path": npz_filename,
+                "latent_filename": npz_filename,
+                "prompt": prompt,
+                "stem_tag": stem_tag,
+                "song": song,
+                "remix_type": remix_type,
+                "seconds_total": t_total * self.downsampling_ratio / self.sample_rate,
+                "padding_mask": [torch.ones(t_total, dtype=torch.bool)],
+                "mix_lat": mix_lat,
+                # Inpaint keys for Arm B
+                "inpaint_mask": [torch.zeros((1, t_total), dtype=torch.float32)],
+                "inpaint_masked_input": [mix_lat],
+            }
+
+            if self.tokenizers is not None:
+                for key, (tokenizer, max_length) in self.tokenizers.items():
+                    if key in info and isinstance(info[key], str):
+                        info[f"{key}_text"] = info[key]
+                        encoded = tokenizer(
+                            info[key],
+                            truncation=True,
+                            max_length=max_length,
+                            padding="max_length",
+                            return_tensors="pt",
+                        )
+                        info[key] = {
+                            "input_ids": encoded["input_ids"].squeeze(0),
+                            "attention_mask": encoded["attention_mask"].squeeze(0),
+                        }
+
+            return (latents, info)
+        except Exception as e:
+            print(f"Couldn't load file {npz_filename}: {e}")
+            return self[random.randrange(len(self))]
+
+
 # get_dbmax and is_silence copied from https://github.com/drscotthawley/aeiou/blob/main/aeiou/core.py under Apache 2.0 License
 # License can be found in LICENSES/LICENSE_AEIOU.txt
 def get_dbmax(
