@@ -884,7 +884,7 @@ def train(args):
             finally:
                 cond_mod.train(was_training)
 
-    if args.mir_ctrl_pack:
+    if args.mir_ctrl_pack or args.sep_data:
         # The wrapper's LoRA branch just ran self.diffusion.model.requires_grad_(False)
         # (training/diffusion.py:251) which re-froze the control projections installed
         # above; flip them back on so configure_optimizers picks them up.
@@ -893,7 +893,7 @@ def train(args):
             if "modular_local_embeds" in _n:
                 _p.requires_grad_(True)
                 _n_on += 1
-        print(f"[mir_ctrl] re-enabled {_n_on} projection param tensors after wrapper freeze")
+        print(f"[modular_local_embeds] re-enabled {_n_on} projection param tensors after wrapper freeze")
 
     callbacks = [ckpt_callback, exc_callback]
     if args.mir_ctrl_pack and args.save_dir:

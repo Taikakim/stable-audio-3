@@ -1114,7 +1114,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             raise ValueError("No LoRA config -- this wrapper is not in LoRA mode")
         state_dict = {
             **get_lora_state_dict(self.diffusion.model),
-            **get_lora_state_dict(self.diffusion.conditioner)
+            **get_lora_state_dict(self.diffusion.conditioner),
+            **{k: v for k, v in self.diffusion.model.state_dict().items() if "modular_local_embeds" in k}
         }
         save_lora_safetensors(state_dict, self.lora_config, path)
 
@@ -1217,7 +1218,8 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             checkpoint.clear()
             checkpoint['state_dict'] = {
                 **get_lora_state_dict(self.diffusion.model),
-                **get_lora_state_dict(self.diffusion.conditioner)
+                **get_lora_state_dict(self.diffusion.conditioner),
+                **{k: v for k, v in self.diffusion.model.state_dict().items() if "modular_local_embeds" in k}
             }
             checkpoint['lora_config'] = self.lora_config
             checkpoint.update(resume_state)
@@ -1230,6 +1232,13 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
     def on_load_checkpoint(self, checkpoint):
         # Consumed when AdaGC is built lazily at the first clipping call of the resumed run.
         self._adagc_pending = checkpoint.get('adagc_state')
+        if self.lora_config is not None and 'state_dict' in checkpoint:
+            sd = checkpoint['state_dict']
+            if any(not k.startswith("diffusion.") for k in sd.keys()):
+                checkpoint['state_dict'] = {
+                    (f"diffusion.{k}" if not k.startswith("diffusion.") else k): v
+                    for k, v in sd.items()
+                }
 
     # ------------------------------------------------------------------
     # FusionOpt Schedule-Free lifecycle hooks
