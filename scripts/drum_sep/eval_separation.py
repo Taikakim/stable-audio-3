@@ -30,7 +30,10 @@ import soundfile as sf
 import torch
 import torchaudio
 
-from stable_audio_3.loading_utils import load_model, load_autoencoder
+from safetensors.torch import load_file
+from stable_audio_tools.models.utils import copy_state_dict
+from stable_audio_3.factory import create_diffusion_cond_from_config
+from stable_audio_3.loading_utils import load_autoencoder
 from stable_audio_3.model_configs import base_models, ae_models
 from stable_audio_3.models.lora.loader import load_and_apply_loras
 from stable_audio_3.models.lora.utils import load_lora_checkpoint
@@ -42,12 +45,31 @@ SR = 44100
 DOWNSAMPLING_RATIO = 4096
 
 
+def load_model(model_name: str, device: torch.device, dtype: torch.dtype = torch.bfloat16):
+    if model_name not in base_models:
+        raise ValueError(f"LoRA eval requires a base model. Got '{model_name}', valid: {list(base_models)}")
+    model_cfg = base_models[model_name]
+    local_config, local_ckpt = model_cfg.resolve()
+    with open(local_config) as f:
+        model_config = json.load(f)
+    model = create_diffusion_cond_from_config(model_config)
+    copy_state_dict(model, load_file(local_ckpt))
+    model.to(device=device, dtype=dtype).eval().requires_grad_(False)
+    if model.pretransform is not None:
+        model.pretransform.enable_grad = False
+    return model, model_config
+
+
+
 # -----------------------------------------------------------------------------
 # Metric Calculations
 # -----------------------------------------------------------------------------
 
-def _py_peak_pick(x, pre_max, post_max, pre_avg, post_avg, delta, wait):
-    peaks = np.ones(x.shape[0], dtype=bool)
+def _py_peak_pick(x, pre_max, post_max, pre_avg, post_avg, delta, wait, peaks=None):
+    if peaks is None:
+        peaks = np.zeros(x.shape, dtype=bool)
+    else:
+        peaks.fill(False)
     for n in range(x.shape[0]):
         i = max(0, n - pre_max)
         j = min(n + post_max + 1, x.shape[0])
@@ -224,14 +246,21 @@ def separate_window(model, ae, mix_lat_np: np.ndarray, prompt="solo kick drum, p
                     steps=25, cfg_scale=2.0, device="cuda"):
     """Separate target stem from mix_lat array (256, T)."""
     T_lat = mix_lat_np.shape[-1]
-    mix_lat_t = torch.from_numpy(mix_lat_np).to(device=device, dtype=torch.float32).unsqueeze(0) # (1, 256, T)
+    mix_lat_t = torch.from_numpy(mix_lat_np).to(device=device, dtype=torch.float32) # (256, T)
 
-    cond = {
+    raw_cond = [{
         "prompt": prompt,
         "seconds_total": T_lat * DOWNSAMPLING_RATIO / SR,
         "mix_lat": mix_lat_t,
-        "padding_mask": [torch.ones(T_lat, dtype=torch.bool, device=device)],
-    }
+    }]
+
+    conditioning = model.conditioner(raw_cond, device)
+    conditioning['inpaint_mask'] = [torch.zeros(1, 1, T_lat, device=device)]
+    conditioning['inpaint_masked_input'] = [torch.zeros(1, 256, T_lat, device=device)]
+    cond_inputs = model.get_conditioning_inputs(conditioning)
+
+    model_dtype = next(model.model.parameters()).dtype
+    noise = torch.randn(1, 256, T_lat, device=device, dtype=model_dtype)
 
     # Attention workaround for GFX1201 / RDNA 4
     orig_fa = T.flash_attn_func
@@ -241,13 +270,18 @@ def separate_window(model, ae, mix_lat_np: np.ndarray, prompt="solo kick drum, p
 
     with torch.inference_mode():
         sampled_lat = sample_diffusion(
-            model,
-            conditioning=cond,
-            batch_size=1,
+            model=model.model,
+            noise=noise,
+            cond_inputs=cond_inputs,
+            diffusion_objective="rectified_flow",
             steps=steps,
             cfg_scale=cfg_scale,
-            seed=42,
-            device=device,
+            conditioning=raw_cond,
+            sample_rate=SR,
+            pretransform=model.pretransform,
+            batch_cfg=True,
+            disable_tqdm=True,
+            decode=False,
         )
 
         # Decode to audio
@@ -261,6 +295,7 @@ def separate_window(model, ae, mix_lat_np: np.ndarray, prompt="solo kick drum, p
 
     est_wav = est_audio.squeeze(0).cpu().float().numpy() # (2, N)
     return est_wav
+
 
 
 def main():
