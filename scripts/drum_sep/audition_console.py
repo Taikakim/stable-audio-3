@@ -1,6 +1,6 @@
-"""Interactive HTML Audition Console Generator for SA3 Gate G2 Drum Separation.
-Generates a standalone, dark-themed HTML report with synchronized multi-track playback,
-live A/B solo comparison, and comparative objective metrics across all baselines.
+"""Interactive HTML Audition Console Generator for SA3 Gate G3 Multi-Stem Drum Separation.
+Generates a dark-themed HTML report with synchronized multi-track playback,
+master timeline scrubbers, instant single-stem A/B solo auditioning, and objective metrics.
 """
 
 from pathlib import Path
@@ -29,14 +29,6 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     msg_comp_lsd = float(np.mean([r["msgld"]["lsd_db"] for r in comp_results if "msgld" in r])) if comp_results else float("nan")
     msg_comp_f1 = float(np.mean([r["msgld"]["onset_f1_20"] for r in comp_results if "msgld" in r])) if comp_results else float("nan")
 
-    cmp_has_compare = any("sa3_compare" in r for r in comp_results)
-    if cmp_has_compare:
-        cmp_sisdr = float(np.mean([r["sa3_compare"]["si_sdr_db"] for r in comp_results if "sa3_compare" in r]))
-        cmp_lsd = float(np.mean([r["sa3_compare"]["lsd_db"] for r in comp_results if "sa3_compare" in r]))
-        cmp_f1 = float(np.mean([r["sa3_compare"]["onset_f1_20"] for r in comp_results if "sa3_compare" in r]))
-    else:
-        cmp_sisdr, cmp_lsd, cmp_f1 = float("nan"), float("nan"), float("nan")
-
     has_wiener = any("sa3_wiener" in r for r in comp_results)
     if has_wiener:
         wiener_comp_sisdr = float(np.mean([r["sa3_wiener"]["si_sdr_db"] for r in comp_results if "sa3_wiener" in r]))
@@ -49,7 +41,7 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>SA3 Drum Separator — Gate G2 Kick Separation Audition Console</title>
+  <title>SA3 Drum Separator — Gate G3 Multi-Stem Audition Console</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {{
@@ -197,12 +189,12 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     .tag-yellow {{ background: rgba(245, 158, 11, 0.2); color: var(--yellow); }}
     .tag-red {{ background: rgba(239, 68, 68, 0.2); color: var(--red); }}
 
-    /* Track Cards */
+    /* Track Cards & Transport */
     .track-section {{
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 12px;
-      margin-bottom: 24px;
+      margin-bottom: 32px;
       overflow: hidden;
     }}
     .track-header {{
@@ -213,31 +205,92 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
       justify-content: space-between;
       align-items: center;
       flex-wrap: wrap;
-      gap: 12px;
+      gap: 16px;
     }}
-    .track-title {{
-      font-size: 16px;
-      font-weight: 700;
-      color: #ffffff;
+    .track-title-block {{
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 14px;
     }}
-    .sync-btn {{
-      background: var(--accent);
-      color: #000;
-      border: none;
-      padding: 8px 16px;
-      border-radius: 6px;
+    .track-title-text {{
+      font-size: 17px;
       font-weight: 700;
+      color: #ffffff;
+    }}
+    .now-playing-pill {{
       font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      background: rgba(56, 189, 248, 0.15);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      color: var(--accent);
+      font-feature-settings: "tnum";
+    }}
+    .now-playing-pill strong {{
+      color: #ffffff;
+    }}
+
+    /* Master Transport Controls */
+    .master-transport {{
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      background: #090e1a;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+    }}
+    .transport-play-btn {{
+      background: var(--accent);
+      color: #070b14;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      font-weight: 800;
+      font-size: 13px;
       cursor: pointer;
       display: flex;
       align-items: center;
-      gap: 6px;
-      transition: background 0.15s;
+      gap: 8px;
+      transition: background 0.15s, transform 0.05s;
     }}
-    .sync-btn:hover {{ background: #7dd3fc; }}
+    .transport-play-btn:hover {{ background: #7dd3fc; }}
+    .transport-play-btn:active {{ transform: scale(0.98); }}
+    .transport-time {{
+      font-family: monospace;
+      font-size: 13px;
+      color: var(--text-muted);
+      min-width: 95px;
+      font-weight: 600;
+    }}
+    .scrubber-wrap {{
+      flex: 1;
+      display: flex;
+      align-items: center;
+    }}
+    .timeline-slider {{
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: #1e293b;
+      outline: none;
+      -webkit-appearance: none;
+      cursor: pointer;
+    }}
+    .timeline-slider::-webkit-slider-thumb {{
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 8px rgba(56, 189, 248, 0.8);
+      transition: transform 0.1s;
+    }}
+    .timeline-slider::-webkit-slider-thumb:hover {{
+      transform: scale(1.25);
+    }}
+
+    /* Stems Grid */
     .stems-grid {{
       padding: 20px;
       display: grid;
@@ -247,11 +300,23 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     .stem-card {{
       background: #131c31;
       border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
+      border-radius: 10px;
+      padding: 14px 16px;
       display: flex;
       flex-direction: column;
       gap: 10px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      position: relative;
+    }}
+    .stem-card:hover {{
+      border-color: rgba(56, 189, 248, 0.4);
+      background: #17233d;
+    }}
+    .stem-card.is-active-solo {{
+      border-color: var(--accent) !important;
+      background: rgba(56, 189, 248, 0.08) !important;
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.2);
     }}
     .stem-header {{
       display: flex;
@@ -277,15 +342,6 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
       font-feature-settings: "tnum";
     }}
     .m-badge strong {{ color: var(--text); }}
-    .audio-wrap {{
-      margin-top: 4px;
-    }}
-    audio {{
-      width: 100%;
-      height: 36px;
-      border-radius: 4px;
-      outline: none;
-    }}
     .solo-btn {{
       background: rgba(255,255,255,0.08);
       color: var(--text-muted);
@@ -293,19 +349,17 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
       border-radius: 4px;
       font-size: 11px;
       font-weight: 700;
-      padding: 4px 8px;
+      padding: 4px 10px;
       cursor: pointer;
       transition: all 0.15s;
     }}
-    .solo-btn:hover {{
-      background: rgba(56, 189, 248, 0.2);
-      color: var(--accent);
+    .stem-card.is-active-solo .solo-btn {{
+      background: var(--accent);
+      color: #070b14;
       border-color: var(--accent);
     }}
-    .solo-btn.active {{
-      background: var(--accent);
-      color: #000;
-      border-color: var(--accent);
+    audio {{
+      display: none; /* hidden; driven seamlessly by master transport */
     }}
   </style>
 </head>
@@ -314,28 +368,24 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     <header>
       <h1>
         SA3 Drum Separator
-        <span class="badge-gate">Gate G2 Verified</span>
+        <span class="badge-gate">Gate G3 Multi-Stem</span>
       </h1>
       <p class="subtitle">
-        Conditioned Kick Drum Separation benchmark on discrete AMD Radeon RX 9070 XT (16 GB VRAM).
-        Comparing SA3 Medium Base with active modular local-conditioning inlet against Ground Truth, BS-RoFormer, Separate-and-Detect (MSG-LD), and zero-training priors.
+        Unified prompt-conditioned drum sub-kit separation (Kick, Snare, Hi-Hats, Percussion) on discrete AMD Radeon RX 9070 XT.
+        Model: SA3 Medium Base DiT (LoRA rank 32 + 256-ch modular mixture inlet) evaluated with STFT Wiener Mask Reconciliation.
       </p>
       <div class="stat-row">
         <div class="stat-pill">
           <span class="val">{sa3_comp_sisdr:+.2f} dB</span>
-          <span class="lbl">SA3 Benchmark SI-SDR</span>
+          <span class="lbl">Benchmark Kick SI-SDR</span>
+        </div>
+        <div class="stat-pill">
+          <span class="val">{wiener_comp_sisdr:+.2f} dB</span>
+          <span class="lbl">Wiener Reconciled SI-SDR</span>
         </div>
         <div class="stat-pill">
           <span class="val">{sa3_comp_lsd:.2f} dB</span>
-          <span class="lbl">SA3 Benchmark LSD</span>
-        </div>
-        <div class="stat-pill">
-          <span class="val">{sa3_comp_f1:.3f}</span>
-          <span class="lbl">SA3 Onset F1 @ 20ms</span>
-        </div>
-        <div class="stat-pill">
-          <span class="val">{val_sisdr:+.2f} dB</span>
-          <span class="lbl">Held-Out Val SI-SDR</span>
+          <span class="lbl">Benchmark Kick LSD</span>
         </div>
         <div class="stat-pill">
           <span class="val">{val_f1:.3f}</span>
@@ -361,31 +411,13 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
         </thead>
         <tbody>
           <tr>
-            <td><strong>SAME-L Codec Ceiling</strong></td>
-            <td>Autoencoder Reconstruction</td>
-            <td>Isolated Kick</td>
-            <td>+27.00 dB</td>
-            <td>1.12 dB</td>
-            <td>1.000</td>
-            <td><span class="pill-tag tag-green">Gate G0 Ceiling</span></td>
-          </tr>
-          <tr>
-            <td><strong>SA3 Medium Base (Prior)</strong></td>
-            <td>Solo Kit Piece Prompt (Zero-Train)</td>
-            <td>Isolated Kick</td>
-            <td>-23.50 dB</td>
-            <td>32.10 dB</td>
-            <td>0.040</td>
-            <td><span class="pill-tag tag-red">Gate G1 Failed</span></td>
-          </tr>
-          <tr>
-            <td><strong>SA3 Medium Base (SDEdit)</strong></td>
-            <td>Noise Gating on Drum Bus (&sigma;=0.5)</td>
-            <td>Isolated Kick</td>
-            <td>-31.40 dB</td>
-            <td>28.50 dB</td>
-            <td>0.050</td>
-            <td><span class="pill-tag tag-red">Gate G1 Failed</span></td>
+            <td><strong>BS-RoFormer (SW Drums)</strong></td>
+            <td>Sub-band Time-Frequency Transformer</td>
+            <td>Full Drums</td>
+            <td>{bs_comp_sisdr:+.2f} dB</td>
+            <td>{bs_comp_lsd:.2f} dB</td>
+            <td>{bs_comp_f1:.3f}</td>
+            <td><span class="pill-tag tag-yellow">Drum Bus Baseline</span></td>
           </tr>
           <tr>
             <td><strong>Separate-and-Detect (MSG-LD)</strong></td>
@@ -397,16 +429,7 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             <td><span class="pill-tag tag-orange">Baseline (16kHz)</span></td>
           </tr>
           <tr>
-            <td><strong>BS-RoFormer (SW Drums)</strong></td>
-            <td>Sub-band Time-Frequency Transformer</td>
-            <td>Full Drums</td>
-            <td>{bs_comp_sisdr:+.2f} dB</td>
-            <td>{bs_comp_lsd:.2f} dB</td>
-            <td>{bs_comp_f1:.3f}</td>
-            <td><span class="pill-tag tag-yellow">Drum Bus Baseline</span></td>
-          </tr>
-          <tr>
-            <td><strong>SA3 Gate G2 (Arm A)</strong></td>
+            <td><strong>SA3 Arm A (Frozen Prior)</strong></td>
             <td>LoRA Prior (Modular Inlet Frozen)</td>
             <td>Isolated Kick</td>
             <td>-35.56 dB</td>
@@ -415,7 +438,7 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             <td><span class="pill-tag tag-purple">Unconditioned Prior</span></td>
           </tr>
           <tr class="highlight-target">
-            <td><strong>SA3 Gate G2 (Arm A-v2)</strong></td>
+            <td><strong>SA3 Kick (Generative)</strong></td>
             <td>LoRA + Active Modular Mix Inlet (Generative)</td>
             <td>Isolated Kick</td>
             <td>{sa3_comp_sisdr:+.2f} dB</td>
@@ -424,7 +447,7 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             <td><span class="pill-tag tag-blue">Generative Output</span></td>
           </tr>
           <tr style="background: rgba(16, 185, 129, 0.08); font-weight: 600;">
-            <td><strong>SA3 Gate G2 (Wiener Reconciled)</strong></td>
+            <td><strong>SA3 Kick (Wiener Reconciled)</strong></td>
             <td>LoRA Prior + STFT Wiener Masking (&alpha;=1.5)</td>
             <td>Isolated Kick</td>
             <td>{wiener_comp_sisdr:+.2f} dB</td>
@@ -437,10 +460,10 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     </div>
 
     <!-- Benchmark Multitrack Audition Section -->
-    <div style="margin-bottom: 16px;">
-      <h2>Studio Multitrack Audition & A/B Comparison</h2>
+    <div style="margin-bottom: 20px;">
+      <h2>Studio Benchmark Multitrack Audition (Full Songs)</h2>
       <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">
-        Click <strong>Sync Play</strong> to start all stems in sync, then click <strong>SOLO</strong> on any stem to audition it in isolation in real time.
+        Click <strong>Play</strong> to start playback with synchronized playheads, then <strong>click any card or SOLO</strong> to audition that stem in isolation. Scrub the master timeline to jump anywhere in the song.
       </p>
     </div>
 """
@@ -453,167 +476,147 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
         m_bs = comp.get("bs_roformer", {})
         m_msg = comp.get("msgld", {})
         m_wiener = comp.get("sa3_wiener", {})
+        title_str = t_id.replace('_', ' ').title()
 
         html += f"""
     <div class="track-section" id="track_{c_idx}">
       <div class="track-header">
-        <div class="track-title">
-          <span>{t_id.replace('_', ' ').title()}</span>
-          <span class="pill-tag tag-blue">Multitrack Ground Truth</span>
+        <div class="track-title-block">
+          <span class="track-title-text">{title_str}</span>
+          <span class="now-playing-pill" id="badge_{c_idx}">Auditioning: <strong>Full Mix (Master Audio)</strong></span>
         </div>
-        <button class="sync-btn" onclick="toggleSync({c_idx})">&#9658; Sync Play All</button>
+      </div>
+      <div class="master-transport">
+        <button class="transport-play-btn" id="play_btn_{c_idx}" onclick="togglePlay({c_idx})">&#9658; Play</button>
+        <span class="transport-time" id="time_{c_idx}">0:00 / 0:30</span>
+        <div class="scrubber-wrap">
+          <input type="range" class="timeline-slider" id="scrub_{c_idx}" min="0" max="30" step="0.05" value="0" oninput="onScrub({c_idx}, this.value)">
+        </div>
       </div>
       <div class="stems-grid">
-        <!-- Mix -->
-        <div class="stem-card">
-          <div class="stem-header">
-            <span class="stem-name">Full Mix (Mixture)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, 0)">SOLO</button>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('mix', '')}" preload="none"></audio>
-          </div>
-        </div>
-
-        <!-- Ground Truth Kick -->
-        <div class="stem-card" style="border-color: rgba(168, 85, 247, 0.4);">
-          <div class="stem-header">
-            <span class="stem-name" style="color: var(--purple);">Studio Kick (Ground Truth)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, 1)">SOLO</button>
-          </div>
-          <div class="stem-metrics">
-            <span class="m-badge">Target: <strong>Clean Stem</strong></span>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('ground_truth', '')}" preload="none"></audio>
-          </div>
-        </div>
-
-        <!-- SA3 Gate G2 Arm A-v2 Kick (Generative) -->
-        <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.04);">
-          <div class="stem-header">
-            <span class="stem-name" style="color: var(--accent);">SA3 Gate G2 (Arm A-v2)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, 2)">SOLO</button>
-          </div>
-          <div class="stem-metrics">
-            <span class="m-badge">SI-SDR: <strong>{m_sa3.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">LSD: <strong>{m_sa3.get('lsd_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">Onset F1: <strong>{m_sa3.get('onset_f1_20', float('nan')):.3f}</strong></span>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('sa3_kick', '')}" preload="none"></audio>
-          </div>
-        </div>
 """
-        stem_idx = 3
+
+        card_list = []
+
+        # 0: Mix
+        if "mix" in aud:
+            card_list.append({
+                "name": "Full Mix (Master Audio)",
+                "color": "var(--text)",
+                "border": "var(--border)",
+                "bg": "#131c31",
+                "badge": "Input Track",
+                "metrics": '<span class="m-badge">Target: <strong>Complete Song</strong></span>',
+                "src": aud["mix"]
+            })
+
+        # 1: Studio Kick Ground Truth
+        if "ground_truth" in aud:
+            card_list.append({
+                "name": "Studio Kick (Ground Truth)",
+                "color": "var(--purple)",
+                "border": "rgba(168, 85, 247, 0.4)",
+                "bg": "#131c31",
+                "badge": "Clean Stem",
+                "metrics": '<span class="m-badge">Target: <strong>Isolated Kick</strong></span>',
+                "src": aud["ground_truth"]
+            })
+
+        # 2: SA3 Kick (Generative)
+        if "sa3_kick" in aud:
+            card_list.append({
+                "name": "SA3 Kick (Generative)",
+                "color": "var(--accent)",
+                "border": "rgba(56, 189, 248, 0.5)",
+                "bg": "rgba(56, 189, 248, 0.04)",
+                "badge": "Gate G3 LoRA",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_sa3.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_sa3.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_sa3.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["sa3_kick"]
+            })
+
+        # 3: SA3 Kick (Wiener Masked)
         if "sa3_wiener_kick" in aud:
-            html += f"""
-        <!-- SA3 Gate G2 (Wiener Reconciled) -->
-        <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.04);">
-          <div class="stem-header">
-            <span class="stem-name" style="color: var(--green);">SA3 Kick (Wiener Masked)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
-          </div>
-          <div class="stem-metrics">
-            <span class="m-badge">SI-SDR: <strong>{m_wiener.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">LSD: <strong>{m_wiener.get('lsd_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">Onset F1: <strong>{m_wiener.get('onset_f1_20', float('nan')):.3f}</strong></span>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('sa3_wiener_kick', '')}" preload="none"></audio>
-          </div>
-        </div>
-"""
-            stem_idx += 1
+            card_list.append({
+                "name": "SA3 Kick (Wiener Masked)",
+                "color": "var(--green)",
+                "border": "rgba(16, 185, 129, 0.5)",
+                "bg": "rgba(16, 185, 129, 0.04)",
+                "badge": "Energy Conserved",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_wiener.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_wiener.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_wiener.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["sa3_wiener_kick"]
+            })
 
-        # Multi-stem pieces (Snare, Hi-Hat, Percussion)
+        # Snare, Hi-Hat, Percussion
         for s_sub in ["snare", "hihat", "percussion"]:
             s_name = "Hi-Hat" if s_sub == "hihat" else s_sub.capitalize()
             if f"sa3_{s_sub}" in aud:
-                html += f"""
-        <!-- SA3 {s_name} (Generative) -->
-        <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.02);">
-          <div class="stem-header">
-            <span class="stem-name" style="color: var(--accent);">SA3 {s_name} (Generative)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get(f'sa3_{s_sub}', '')}" preload="none"></audio>
-          </div>
-        </div>
-"""
-                stem_idx += 1
-
+                card_list.append({
+                    "name": f"SA3 {s_name} (Generative)",
+                    "color": "var(--accent)",
+                    "border": "rgba(56, 189, 248, 0.4)",
+                    "bg": "rgba(56, 189, 248, 0.02)",
+                    "badge": "Gate G3 LoRA",
+                    "metrics": f'<span class="m-badge">Extracted: <strong>{s_name}</strong></span>',
+                    "src": aud[f"sa3_{s_sub}"]
+                })
             if f"sa3_wiener_{s_sub}" in aud:
-                html += f"""
-        <!-- SA3 {s_name} (Wiener Masked) -->
-        <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.02);">
-          <div class="stem-header">
-            <span class="stem-name" style="color: var(--green);">SA3 {s_name} (Wiener Masked)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get(f'sa3_wiener_{s_sub}', '')}" preload="none"></audio>
-          </div>
-        </div>
-"""
-                stem_idx += 1
+                card_list.append({
+                    "name": f"SA3 {s_name} (Wiener Masked)",
+                    "color": "var(--green)",
+                    "border": "rgba(16, 185, 129, 0.4)",
+                    "bg": "rgba(16, 185, 129, 0.02)",
+                    "badge": "Energy Conserved",
+                    "metrics": f'<span class="m-badge">Wiener Masked: <strong>{s_name}</strong></span>',
+                    "src": aud[f"sa3_wiener_{s_sub}"]
+                })
 
-            html += f"""
-        <!-- SA3 Gate G2 Arm A Kick (Prior) -->
-        <div class="stem-card" style="border-color: rgba(168, 85, 247, 0.2);">
-          <div class="stem-header">
-            <span class="stem-name" style="color: #cbd5e1;">SA3 Arm A (Prior Only)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
-          </div>
-          <div class="stem-metrics">
-            <span class="m-badge">SI-SDR: <strong>{m_cmp.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">LSD: <strong>{m_cmp.get('lsd_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">Onset F1: <strong>{m_cmp.get('onset_f1_20', float('nan')):.3f}</strong></span>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('sa3_compare_kick', '')}" preload="none"></audio>
-          </div>
-        </div>
-"""
-            stem_idx += 1
-
+        # Baselines: BS-RoFormer, MSG-LD, Arm A
         if "bs_roformer" in aud:
-            html += f"""
-        <!-- BS-RoFormer -->
-        <div class="stem-card">
-          <div class="stem-header">
-            <span class="stem-name" style="color: var(--yellow);">BS-RoFormer (SW Drums)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
-          </div>
-          <div class="stem-metrics">
-            <span class="m-badge">SI-SDR: <strong>{m_bs.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">LSD: <strong>{m_bs.get('lsd_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">Onset F1: <strong>{m_bs.get('onset_f1_20', float('nan')):.3f}</strong></span>
-          </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('bs_roformer', '')}" preload="none"></audio>
-          </div>
-        </div>
-"""
-            stem_idx += 1
+            card_list.append({
+                "name": "BS-RoFormer (SW Drums)",
+                "color": "var(--yellow)",
+                "border": "var(--border)",
+                "bg": "#131c31",
+                "badge": "Drum Bus Baseline",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_bs.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_bs.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_bs.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["bs_roformer"]
+            })
 
         if "msgld" in aud:
+            card_list.append({
+                "name": "Separate-and-Detect (MSG-LD)",
+                "color": "var(--orange)",
+                "border": "var(--border)",
+                "bg": "#131c31",
+                "badge": "16kHz Diffusion",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_msg.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_msg.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_msg.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["msgld"]
+            })
+
+        if "sa3_compare_kick" in aud:
+            card_list.append({
+                "name": "SA3 Arm A (Frozen Prior)",
+                "color": "#cbd5e1",
+                "border": "rgba(168, 85, 247, 0.2)",
+                "bg": "#131c31",
+                "badge": "Prior Baseline",
+                "metrics": f'<span class="m-badge">SI-SDR: <strong>{m_cmp.get("si_sdr_db", float("nan")):.2f} dB</strong></span><span class="m-badge">LSD: <strong>{m_cmp.get("lsd_db", float("nan")):.2f} dB</strong></span><span class="m-badge">Onset F1: <strong>{m_cmp.get("onset_f1_20", float("nan")):.3f}</strong></span>',
+                "src": aud["sa3_compare_kick"]
+            })
+
+        for s_idx, c_info in enumerate(card_list):
+            is_first = (s_idx == 0)
+            active_class = "is-active-solo" if is_first else ""
             html += f"""
-        <!-- MSG-LD -->
-        <div class="stem-card">
+        <div class="stem-card {active_class}" id="card_{c_idx}_{s_idx}" style="border-color: {c_info['border']}; background: {c_info['bg']};" onclick="soloStem({c_idx}, {s_idx})">
           <div class="stem-header">
-            <span class="stem-name" style="color: var(--orange);">MSG-LD (Separate-and-Detect)</span>
-            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
+            <span class="stem-name" style="color: {c_info['color']};">{c_info['name']}</span>
+            <button class="solo-btn" onclick="event.stopPropagation(); soloStem({c_idx}, {s_idx})">SOLO</button>
           </div>
           <div class="stem-metrics">
-            <span class="m-badge">SI-SDR: <strong>{m_msg.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">LSD: <strong>{m_msg.get('lsd_db', float('nan')):.2f} dB</strong></span>
-            <span class="m-badge">Onset F1: <strong>{m_msg.get('onset_f1_20', float('nan')):.3f}</strong></span>
+            {c_info['metrics']}
           </div>
-          <div class="audio-wrap">
-            <audio controls src="{aud.get('msgld', '')}" preload="none"></audio>
-          </div>
+          <audio id="audio_{c_idx}_{s_idx}" src="{c_info['src']}" preload="metadata"></audio>
         </div>
 """
         html += """
@@ -621,22 +624,22 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
     </div>
 """
 
+    # Section 2: Held-Out Validation Slices
     if val_results:
         html += """
-    <div style="margin-top: 36px; margin-bottom: 16px;">
-      <h2>Held-Out Validation Dataset Samples</h2>
+    <div style="margin-top: 48px; margin-bottom: 20px;">
+      <h2>Held-Out Validation Multitrack Slices (12-Second Crops)</h2>
       <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">
-        Samples from held-out songs in the val split evaluating dynamic mixture separation across unseen multitrack arrangements.
+        12-second crops from held-out multitrack projects. Input is the <strong>Composite Drum Bus</strong> (all drums summed, synths/bass muted).
       </p>
     </div>
 """
         for v_idx, v in enumerate(val_results):
-            s_tag = v.get("sample_tag", f"val_{v_idx}")
-            song = v.get("song", "Validation Sample")
+            s_tag = v["sample_tag"]
+            song = v.get("song", "Track").split(" - ")[-1]
             win = v.get("window", 0)
             remix = v.get("remix", "orig")
-            vw = v.get("wiener", {})
-
+            vw = v.get("wiener")
             wiener_badge = ""
             if vw:
                 wiener_badge = f'<span class="m-badge" style="background: rgba(16, 185, 129, 0.15); color: var(--green);">Wiener SI-SDR: <strong>{vw.get("si_sdr_db", float("nan")):.2f} dB</strong></span>'
@@ -648,13 +651,22 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             wiener_file = f"{s_tag}_wiener_{stem_tag}.wav" if (out_dir / f"audio/{s_tag}_wiener_{stem_tag}.wav").exists() else f"{s_tag}_wiener_kick.wav"
 
             has_val_wiener = (out_dir / f"audio/{wiener_file}").exists()
-            grid_cols = "repeat(4, 1fr)" if has_val_wiener else "repeat(3, 1fr)"
 
+            v_cards = [
+                {"name": "Drum Bus Mixture", "color": "var(--text)", "src": f"audio/{s_tag}_mix.wav", "border": "var(--border)", "bg": "#131c31"},
+                {"name": f"Ground Truth {stem_cap}", "color": "var(--purple)", "src": f"audio/{gt_file}", "border": "rgba(168, 85, 247, 0.4)", "bg": "#131c31"},
+                {"name": f"SA3 {stem_cap} (Generative)", "color": "var(--accent)", "src": f"audio/{sa3_file}", "border": "rgba(56, 189, 248, 0.5)", "bg": "rgba(56, 189, 248, 0.04)"},
+            ]
+            if has_val_wiener:
+                v_cards.append({"name": f"SA3 {stem_cap} (Wiener Masked)", "color": "var(--green)", "src": f"audio/{wiener_file}", "border": "rgba(16, 185, 129, 0.5)", "bg": "rgba(16, 185, 129, 0.04)"})
+
+            val_id = f"val_{v_idx}"
             html += f"""
-    <div class="track-section" id="val_track_{v_idx}">
+    <div class="track-section" id="track_{val_id}">
       <div class="track-header">
-        <div class="track-title">
-          <span>{song} ({stem_cap}, Window {win}, {remix})</span>
+        <div class="track-title-block">
+          <span class="track-title-text">{song} ({stem_cap}, Window {win}, {remix})</span>
+          <span class="now-playing-pill" id="badge_{val_id}">Auditioning: <strong>Ground Truth {stem_cap}</strong></span>
         </div>
         <div class="stem-metrics">
           <span class="m-badge">SI-SDR: <strong>{v.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
@@ -663,33 +675,25 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
           {wiener_badge}
         </div>
       </div>
-      <div class="stems-grid" style="grid-template-columns: {grid_cols};">
-        <div class="stem-card">
-          <span class="stem-name">Drum Bus Mixture</span>
-          <div class="audio-wrap">
-            <audio controls src="audio/{s_tag}_mix.wav" preload="none"></audio>
-          </div>
+      <div class="master-transport">
+        <button class="transport-play-btn" id="play_btn_{val_id}" onclick="togglePlay('{val_id}')">&#9658; Play</button>
+        <span class="transport-time" id="time_{val_id}">0:00 / 0:12</span>
+        <div class="scrubber-wrap">
+          <input type="range" class="timeline-slider" id="scrub_{val_id}" min="0" max="12.07" step="0.05" value="0" oninput="onScrub('{val_id}', this.value)">
         </div>
-        <div class="stem-card" style="border-color: rgba(168, 85, 247, 0.4);">
-          <span class="stem-name" style="color: var(--purple);">Ground Truth {stem_cap}</span>
-          <div class="audio-wrap">
-            <audio controls src="audio/{gt_file}" preload="none"></audio>
-          </div>
-        </div>
-        <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.04);">
-          <span class="stem-name" style="color: var(--accent);">SA3 {stem_cap} (Generative)</span>
-          <div class="audio-wrap">
-            <audio controls src="audio/{sa3_file}" preload="none"></audio>
-          </div>
-        </div>
+      </div>
+      <div class="stems-grid">
 """
-            if has_val_wiener:
+            for vi, vc in enumerate(v_cards):
+                is_active = (vi == 1)
+                active_class = "is-active-solo" if is_active else ""
                 html += f"""
-        <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.04);">
-          <span class="stem-name" style="color: var(--green);">SA3 {stem_cap} (Wiener Masked)</span>
-          <div class="audio-wrap">
-            <audio controls src="audio/{wiener_file}" preload="none"></audio>
+        <div class="stem-card {active_class}" id="card_{val_id}_{vi}" style="border-color: {vc['border']}; background: {vc['bg']};" onclick="soloStem('{val_id}', {vi})">
+          <div class="stem-header">
+            <span class="stem-name" style="color: {vc['color']};">{vc['name']}</span>
+            <button class="solo-btn" onclick="event.stopPropagation(); soloStem('{val_id}', {vi})">SOLO</button>
           </div>
+          <audio id="audio_{val_id}_{vi}" src="{vc['src']}" preload="metadata"></audio>
         </div>
 """
             html += """
@@ -701,46 +705,139 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
   </div>
 
   <script>
-    function toggleSync(trackIdx) {
-      const section = document.getElementById('track_' + trackIdx);
+    const activeStemMap = {};
+
+    function formatTime(sec) {
+      if (!sec || isNaN(sec)) return "0:00";
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    function initSection(secId, defaultStem = 0) {
+      const section = document.getElementById('track_' + secId);
+      if (!section) return;
       const audios = section.querySelectorAll('audio');
-      const btn = section.querySelector('.sync-btn');
-      
-      const anyPlaying = Array.from(audios).some(a => !a.paused);
-      if (anyPlaying) {
+      if (!audios.length) return;
+
+      activeStemMap[secId] = defaultStem;
+
+      // Ensure audios are loaded and muted properly
+      audios.forEach((a, idx) => {
+        a.volume = (idx === defaultStem) ? 1.0 : 0.0;
+        a.muted = (idx !== defaultStem);
+        a.addEventListener('timeupdate', () => {
+          if (activeStemMap[secId] === idx) {
+            const cur = a.currentTime || 0;
+            const dur = a.duration || 30;
+            const slider = document.getElementById('scrub_' + secId);
+            const timeDisplay = document.getElementById('time_' + secId);
+            if (slider) {
+              slider.max = dur;
+              slider.value = cur;
+            }
+            if (timeDisplay) {
+              timeDisplay.innerText = formatTime(cur) + ' / ' + formatTime(dur);
+            }
+          }
+        });
+      });
+    }
+
+    function togglePlay(secId) {
+      const section = document.getElementById('track_' + secId);
+      const audios = section.querySelectorAll('audio');
+      const activeIdx = activeStemMap[secId] !== undefined ? activeStemMap[secId] : 0;
+      const playBtn = document.getElementById('play_btn_' + secId);
+      const activeAudio = audios[activeIdx];
+      const isPlaying = !activeAudio.paused;
+
+      // Pause any other sections on the page
+      document.querySelectorAll('.track-section').forEach(s => {
+        if (s.id !== 'track_' + secId) {
+          s.querySelectorAll('audio').forEach(a => a.pause());
+          const b = s.querySelector('.transport-play-btn');
+          if (b) b.innerHTML = '&#9658; Play';
+        }
+      });
+
+      if (isPlaying) {
         audios.forEach(a => a.pause());
-        btn.innerHTML = '&#9658; Sync Play All';
+        playBtn.innerHTML = '&#9658; Play';
       } else {
-        const t = audios[0].currentTime || 0;
-        audios.forEach(a => {
-          a.currentTime = t;
-          a.play();
-        });
-        btn.innerHTML = '&#10074;&#10074; Pause All';
-      }
-    }
-
-    function soloStem(trackIdx, stemIdx) {
-      const section = document.getElementById('track_' + trackIdx);
-      const cards = section.querySelectorAll('.stem-card');
-      const audios = section.querySelectorAll('audio');
-      const soloBtns = section.querySelectorAll('.solo-btn');
-      
-      const targetBtn = soloBtns[stemIdx];
-      const isAlreadySolo = targetBtn.classList.contains('active');
-
-      if (isAlreadySolo) {
-        soloBtns.forEach(b => b.classList.remove('active'));
-        audios.forEach(a => { a.muted = false; a.volume = 1.0; });
-      } else {
-        soloBtns.forEach(b => b.classList.remove('active'));
-        targetBtn.classList.add('active');
+        const curTime = activeAudio.currentTime;
         audios.forEach((a, i) => {
-          a.muted = (i !== stemIdx);
-          a.volume = (i === stemIdx) ? 1.0 : 0.0;
+          a.currentTime = curTime;
+          if (i === activeIdx) {
+            a.muted = false;
+            a.volume = 1.0;
+          } else {
+            a.muted = true;
+            a.volume = 0.0;
+          }
+          a.play().catch(e => console.log(e));
         });
+        playBtn.innerHTML = '&#10074;&#10074; Pause';
       }
     }
+
+    function onScrub(secId, val) {
+      const section = document.getElementById('track_' + secId);
+      const audios = section.querySelectorAll('audio');
+      const t = parseFloat(val);
+      audios.forEach(a => {
+        a.currentTime = t;
+      });
+      const dur = audios[0].duration || 30;
+      const timeDisplay = document.getElementById('time_' + secId);
+      if (timeDisplay) {
+        timeDisplay.innerText = formatTime(t) + ' / ' + formatTime(dur);
+      }
+    }
+
+    function soloStem(secId, stemIdx) {
+      const section = document.getElementById('track_' + secId);
+      const audios = section.querySelectorAll('audio');
+      const cards = section.querySelectorAll('.stem-card');
+      const badge = document.getElementById('badge_' + secId);
+      const prevIdx = activeStemMap[secId] !== undefined ? activeStemMap[secId] : 0;
+      const isPlaying = !audios[prevIdx].paused;
+      const curTime = audios[prevIdx].currentTime;
+
+      activeStemMap[secId] = stemIdx;
+
+      cards.forEach((c, i) => {
+        if (i === stemIdx) {
+          c.classList.add('is-active-solo');
+          const stemName = c.querySelector('.stem-name').innerText;
+          if (badge) badge.innerHTML = 'Auditioning: <strong>' + stemName + '</strong>';
+        } else {
+          c.classList.remove('is-active-solo');
+        }
+      });
+
+      audios.forEach((a, i) => {
+        a.currentTime = curTime;
+        if (i === stemIdx) {
+          a.muted = false;
+          a.volume = 1.0;
+          if (isPlaying) a.play().catch(e => console.log(e));
+        } else {
+          a.muted = true;
+          a.volume = 0.0;
+          if (isPlaying) a.play().catch(e => console.log(e));
+          else a.pause();
+        }
+      });
+    }
+
+    // Auto-init all sections on page load
+    window.addEventListener('DOMContentLoaded', () => {
+      document.querySelectorAll('.track-section').forEach(s => {
+        const secId = s.id.replace('track_', '');
+        initSection(secId, 0);
+      });
+    });
   </script>
 </body>
 </html>
@@ -748,4 +845,5 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
+
     print(f"[audition_console] Successfully deployed interactive audition console to {html_path}")
