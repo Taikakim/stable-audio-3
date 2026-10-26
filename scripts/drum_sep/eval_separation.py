@@ -260,20 +260,22 @@ def load_separation_model(checkpoint_path: str, model_name="medium-base", device
 # -----------------------------------------------------------------------------
 
 def separate_window(model, ae, mix_lat_np: np.ndarray, prompt="solo kick drum, punchy goa trance kick, dry isolated hit",
-                    steps=25, cfg_scale=2.0, device="cuda"):
+                    steps=25, cfg_scale=1.0, device="cuda"):
     """Separate target stem from mix_lat array (256, T)."""
     T_lat = mix_lat_np.shape[-1]
     mix_lat_t = torch.from_numpy(mix_lat_np).to(device=device, dtype=torch.float32) # (256, T)
+    mix_lat_batch = mix_lat_t.unsqueeze(0) if mix_lat_t.ndim == 2 else mix_lat_t
 
     raw_cond = [{
         "prompt": prompt,
         "seconds_total": T_lat * DOWNSAMPLING_RATIO / SR,
-        "mix_lat": mix_lat_t,
+        "mix_lat": mix_lat_batch.squeeze(0),
     }]
 
     conditioning = model.conditioner(raw_cond, device)
+    # Native inpainting conditioning matches DrumSepDataset training setup
     conditioning['inpaint_mask'] = [torch.zeros(1, 1, T_lat, device=device)]
-    conditioning['inpaint_masked_input'] = [torch.zeros(1, 256, T_lat, device=device)]
+    conditioning['inpaint_masked_input'] = [mix_lat_batch]
     cond_inputs = model.get_conditioning_inputs(conditioning)
 
     model_dtype = next(model.model.parameters()).dtype
@@ -300,18 +302,69 @@ def separate_window(model, ae, mix_lat_np: np.ndarray, prompt="solo kick drum, p
             disable_tqdm=True,
             decode=False,
         )
+        sampled_lat = torch.nan_to_num(sampled_lat, nan=0.0)
 
         # Decode to audio
         if hasattr(ae, "decode_audio"):
             est_audio = ae.decode_audio(sampled_lat.to(dtype=torch.float32))
         else:
             est_audio = ae.decode(sampled_lat.to(dtype=torch.float32))
+        est_audio = torch.nan_to_num(est_audio, nan=0.0).clamp(-1.0, 1.0)
 
     T.flash_attn_func = orig_fa
     T.flash_attn_varlen_func = orig_fa_varlen
 
     est_wav = est_audio.squeeze(0).cpu().float().numpy() # (2, N)
-    return est_wav
+    est_wav = np.nan_to_num(est_wav, nan=0.0)
+    return np.clip(est_wav, -1.0, 1.0)
+
+
+def separate_long_audio(model, ae, mix_wav: np.ndarray, prompt="solo kick drum, punchy goa trance kick, dry isolated hit",
+                        window_frames=130, hop_frames=96, steps=25, cfg_scale=1.0, device="cuda"):
+    """Separate full-length audio by encoding and sliding-window diffusion matching training length (T=130)."""
+    mix_lat = encode_wav(ae, mix_wav, device=device)
+    T_total = mix_lat.shape[-1]
+    total_samples = mix_wav.shape[0] if (mix_wav.ndim == 1 or mix_wav.shape[0] > 2) else mix_wav.shape[1]
+
+    if T_total <= window_frames:
+        out = separate_window(model, ae, mix_lat, prompt=prompt, steps=steps, cfg_scale=cfg_scale, device=device)
+        return out[:, :total_samples]
+
+    # Compute sliding window starts
+    starts = []
+    s = 0
+    while s + window_frames < T_total:
+        starts.append(s)
+        s += hop_frames
+    starts.append(max(0, T_total - window_frames))
+    starts = sorted(list(set(starts)))
+
+    out_audio = np.zeros((2, total_samples), dtype=np.float32)
+    weight = np.zeros(total_samples, dtype=np.float32)
+
+    for s_idx, start in enumerate(starts):
+        end = start + window_frames
+        chunk_lat = mix_lat[:, start:end]
+        chunk_wav = separate_window(model, ae, chunk_lat, prompt=prompt, steps=steps, cfg_scale=cfg_scale, device=device)
+
+        a_start = start * DOWNSAMPLING_RATIO
+        a_end = min(total_samples, a_start + chunk_wav.shape[-1])
+        w_len = a_end - a_start
+
+        fade_samples = min(w_len // 4, int(1.5 * SR))
+        fade = np.ones(w_len, dtype=np.float32)
+        if s_idx > 0 and fade_samples > 0:
+            fade[:fade_samples] = 0.5 * (1.0 - np.cos(np.pi * np.arange(fade_samples) / fade_samples))
+        if s_idx < len(starts) - 1 and fade_samples > 0:
+            fade[-fade_samples:] = 0.5 * (1.0 + np.cos(np.pi * np.arange(fade_samples) / fade_samples))
+
+        out_audio[:, a_start:a_end] += chunk_wav[:, :w_len] * fade
+        weight[a_start:a_end] += fade
+
+    mask = weight > 1e-4
+    out_audio[:, mask] /= weight[mask]
+    return np.clip(np.nan_to_num(out_audio, nan=0.0), -1.0, 1.0)
+
 
 
 
@@ -327,7 +380,7 @@ def main():
     p.add_argument("--out_dir", type=str, default="/home/kim/sao_runs/drum_sep_g2_eval",
                    help="Output directory for evaluations and audition page")
     p.add_argument("--steps", type=int, default=25, help="Diffusion sampling steps")
-    p.add_argument("--cfg", type=float, default=2.0, help="Classifier-free guidance scale")
+    p.add_argument("--cfg", type=float, default=1.0, help="Classifier-free guidance scale")
     p.add_argument("--max_samples", type=int, default=10, help="Max validation samples to evaluate")
     args = p.parse_args()
 
@@ -425,12 +478,9 @@ def main():
             gt_wav, _ = sf.read(str(gt_path))
             gt_mono = np.mean(gt_wav, axis=-1) if gt_wav.ndim > 1 else gt_wav
 
-            # Encode mix to SAME-L latents
-            mix_lat = encode_wav(ae, mix_wav, device=device)
-
-            # Separate with Primary Model
+            # Separate with Primary Model (using sliding-window inference on long tracks)
             print(f"  Separating with primary model ({Path(args.checkpoint).name})...")
-            sa3_wav = separate_window(model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+            sa3_wav = separate_long_audio(model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
             sa3_mono = np.mean(sa3_wav, axis=0)
 
             track_audio_out = audio_out / track_id
@@ -440,7 +490,7 @@ def main():
             sf.write(str(track_audio_out / "sa3_kick.wav"), sa3_wav.T, SR)
 
             m_sa3 = compute_all_metrics(gt_mono, sa3_mono, SR)
-            print(f"  -> SA3 Kick:      SI-SDR: {m_sa3['si_sdr_db']:6.2f} dB | LSD: {m_sa3['lsd_db']:5.2f} dB | Onset F1: {m_sa3['onset_f1_20']:.3f} | Attack: {m_sa3['attack_dev_db']:+5.2f} dB")
+            print(f"  -> SA3 Kick:      SI-SDR: {m_sa3['si_sdr_db']:6.2f} dB | LSD: {m_sa3['lsd_db']:5.2f} dB | Onset F1: {m_sa3['onset_f1_20']:.3f} | Attack: {m_sa3.get('attack_db', float('nan')):+5.2f} dB")
 
             row = {
                 "track_id": track_id,
@@ -455,13 +505,13 @@ def main():
             # Optional Comparison Model (e.g. Arm A)
             if compare_model is not None:
                 print(f"  Separating with compare model ({Path(args.compare_checkpoint).name})...")
-                cmp_wav = separate_window(compare_model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+                cmp_wav = separate_long_audio(compare_model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
                 cmp_mono = np.mean(cmp_wav, axis=0)
                 sf.write(str(track_audio_out / "sa3_compare_kick.wav"), cmp_wav.T, SR)
                 m_cmp = compute_all_metrics(gt_mono, cmp_mono, SR)
                 row["sa3_compare"] = m_cmp
                 row["audio"]["sa3_compare_kick"] = f"audio/{track_id}/sa3_compare_kick.wav"
-                print(f"  -> SA3 Compare:   SI-SDR: {m_cmp['si_sdr_db']:6.2f} dB | LSD: {m_cmp['lsd_db']:5.2f} dB | Onset F1: {m_cmp['onset_f1_20']:.3f} | Attack: {m_cmp['attack_dev_db']:+5.2f} dB")
+                print(f"  -> SA3 Compare:   SI-SDR: {m_cmp['si_sdr_db']:6.2f} dB | LSD: {m_cmp['lsd_db']:5.2f} dB | Onset F1: {m_cmp['onset_f1_20']:.3f} | Attack: {m_cmp.get('attack_db', float('nan')):+5.2f} dB")
 
             # BS-RoFormer baseline
             bs_path = tdir / "bs_roformer_sw_drums.wav"
@@ -474,7 +524,7 @@ def main():
                 m_bs = compute_all_metrics(gt_mono, bs_mono, SR)
                 row["bs_roformer"] = m_bs
                 row["audio"]["bs_roformer"] = f"audio/{track_id}/bs_roformer.wav"
-                print(f"  -> BS-RoFormer:   SI-SDR: {m_bs['si_sdr_db']:6.2f} dB | LSD: {m_bs['lsd_db']:5.2f} dB | Onset F1: {m_bs['onset_f1_20']:.3f} | Attack: {m_bs['attack_dev_db']:+5.2f} dB")
+                print(f"  -> BS-RoFormer:   SI-SDR: {m_bs['si_sdr_db']:6.2f} dB | LSD: {m_bs['lsd_db']:5.2f} dB | Onset F1: {m_bs['onset_f1_20']:.3f} | Attack: {m_bs.get('attack_db', float('nan')):+5.2f} dB")
 
             # MSG-LD baseline
             msgld_path = tdir / "msgld_kick.wav"
@@ -489,7 +539,8 @@ def main():
                 m_msgld = compute_all_metrics(gt_mono, m_wav_t, SR)
                 row["msgld"] = m_msgld
                 row["audio"]["msgld"] = f"audio/{track_id}/msgld_kick.wav"
-                print(f"  -> MSG-LD Kick:   SI-SDR: {m_msgld['si_sdr_db']:6.2f} dB | LSD: {m_msgld['lsd_db']:5.2f} dB | Onset F1: {m_msgld['onset_f1_20']:.3f} | Attack: {m_msgld['attack_dev_db']:+5.2f} dB")
+                print(f"  -> MSG-LD Kick:   SI-SDR: {m_msgld['si_sdr_db']:6.2f} dB | LSD: {m_msgld['lsd_db']:5.2f} dB | Onset F1: {m_msgld['onset_f1_20']:.3f} | Attack: {m_msgld.get('attack_db', float('nan')):+5.2f} dB")
+
 
             comp_results.append(row)
 
