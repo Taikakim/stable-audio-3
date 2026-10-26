@@ -469,7 +469,18 @@ def main():
         print(f"\nEvaluating on held-out validation set from {val_manifest_path}...")
         with open(val_manifest_path) as f:
             manifest = json.load(f)
-        samples = manifest.get("samples", [])[:args.max_samples]
+        all_samples = manifest.get("samples", [])
+        if args.max_samples and len(all_samples) > args.max_samples:
+            stems = ["kick", "snare", "hihat", "percussion"]
+            per_stem = max(1, args.max_samples // len(stems))
+            stratified = []
+            for st in stems:
+                stem_s = [s for s in all_samples if s.get("stem") == st and s.get("remix") == "orig"]
+                stratified.extend(stem_s[:per_stem])
+            samples = stratified if len(stratified) >= args.max_samples // 2 else all_samples[:args.max_samples]
+        else:
+            samples = all_samples[:args.max_samples] if args.max_samples else all_samples
+
 
         for s_idx, s_info in enumerate(samples):
             npz_path = Path(args.val_dir) / s_info["file"]
@@ -570,41 +581,53 @@ def main():
             sf.write(str(track_audio_out / "mix.wav"), mix_wav, SR)
             sf.write(str(track_audio_out / "ground_truth.wav"), gt_wav, SR)
 
-            # Separate with Primary Model (using sliding-window inference on long tracks)
-            sa3_path = track_audio_out / "sa3_kick.wav"
-            if args.reuse_existing and sa3_path.exists():
-                sa3_wav, _ = sf.read(str(sa3_path))
-                if sa3_wav.ndim > 1 and sa3_wav.shape[0] > 2:
-                    sa3_wav = sa3_wav.T
-            else:
-                print(f"  Separating with primary model ({Path(args.checkpoint).name})...")
-                sa3_wav = separate_long_audio(model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
-                sf.write(str(sa3_path), sa3_wav.T, SR)
-
-            sa3_mono = np.mean(sa3_wav, axis=0)
-            m_sa3 = compute_all_metrics(gt_mono, sa3_mono, SR)
-            print(f"  -> SA3 Kick:      SI-SDR: {m_sa3['si_sdr_db']:6.2f} dB | LSD: {m_sa3['lsd_db']:5.2f} dB | Onset F1: {m_sa3['onset_f1_20']:.3f} | Attack: {m_sa3.get('attack_db', float('nan')):+5.2f} dB")
-
             row = {
                 "track_id": track_id,
-                "sa3": m_sa3,
                 "audio": {
                     "mix": f"audio/{track_id}/mix.wav",
                     "ground_truth": f"audio/{track_id}/ground_truth.wav",
-                    "sa3_kick": f"audio/{track_id}/sa3_kick.wav",
                 }
             }
 
-            # Wiener Reconciliation
-            if args.wiener_alpha > 0:
-                print(f"  Reconciling via STFT Wiener masking (alpha={args.wiener_alpha})...")
-                sa3_w_wav = apply_wiener_masking(sa3_wav, mix_wav.T, alpha=args.wiener_alpha)
-                sf.write(str(track_audio_out / "sa3_wiener_kick.wav"), sa3_w_wav.T, SR)
-                sa3_w_mono = np.mean(sa3_w_wav, axis=0)
-                m_sa3_w = compute_all_metrics(gt_mono, sa3_w_mono, SR)
-                row["sa3_wiener"] = m_sa3_w
-                row["audio"]["sa3_wiener_kick"] = f"audio/{track_id}/sa3_wiener_kick.wav"
-                print(f"  -> SA3 Wiener:    SI-SDR: {m_sa3_w['si_sdr_db']:6.2f} dB | LSD: {m_sa3_w['lsd_db']:5.2f} dB | Onset F1: {m_sa3_w['onset_f1_20']:.3f} | Attack: {m_sa3_w.get('attack_db', float('nan')):+5.2f} dB")
+            # Separate all 4 drum pieces with Primary Model
+            stem_configs = [
+                ("kick", "solo kick drum, punchy goa trance kick, dry isolated hit"),
+                ("snare", "acoustic snare drum, snap and crack, punchy tight transient"),
+                ("hihat", "crisp closed hi-hats, bright metallic offbeat 16th pattern"),
+                ("percussion", "tribal percussion, shakers, congas, rolling grooves")
+            ]
+
+            for s_tag, s_prompt in stem_configs:
+                s_path = track_audio_out / f"sa3_{s_tag}.wav"
+                if args.reuse_existing and s_path.exists():
+                    s_wav, _ = sf.read(str(s_path))
+                    if s_wav.ndim > 1 and s_wav.shape[0] > 2:
+                        s_wav = s_wav.T
+                else:
+                    print(f"  Separating {s_tag} with primary model...")
+                    s_wav = separate_long_audio(model, ae, mix_wav, prompt=s_prompt, steps=args.steps, cfg_scale=args.cfg, device=device)
+                    sf.write(str(s_path), s_wav.T, SR)
+
+                row["audio"][f"sa3_{s_tag}"] = f"audio/{track_id}/sa3_{s_tag}.wav"
+
+                if s_tag == "kick":
+                    sa3_wav = s_wav
+                    sa3_mono = np.mean(sa3_wav, axis=0)
+                    m_sa3 = compute_all_metrics(gt_mono, sa3_mono, SR)
+                    row["sa3"] = m_sa3
+                    print(f"  -> SA3 Kick:      SI-SDR: {m_sa3['si_sdr_db']:6.2f} dB | LSD: {m_sa3['lsd_db']:5.2f} dB | Onset F1: {m_sa3['onset_f1_20']:.3f} | Attack: {m_sa3.get('attack_db', float('nan')):+5.2f} dB")
+
+                # Wiener Reconciliation
+                if args.wiener_alpha > 0:
+                    s_w_wav = apply_wiener_masking(s_wav, mix_wav.T, alpha=args.wiener_alpha)
+                    sf.write(str(track_audio_out / f"sa3_wiener_{s_tag}.wav"), s_w_wav.T, SR)
+                    row["audio"][f"sa3_wiener_{s_tag}"] = f"audio/{track_id}/sa3_wiener_{s_tag}.wav"
+                    if s_tag == "kick":
+                        sa3_w_mono = np.mean(s_w_wav, axis=0)
+                        m_sa3_w = compute_all_metrics(gt_mono, sa3_w_mono, SR)
+                        row["sa3_wiener"] = m_sa3_w
+                        print(f"  -> SA3 Wiener:    SI-SDR: {m_sa3_w['si_sdr_db']:6.2f} dB | LSD: {m_sa3_w['lsd_db']:5.2f} dB | Onset F1: {m_sa3_w['onset_f1_20']:.3f} | Attack: {m_sa3_w.get('attack_db', float('nan')):+5.2f} dB")
+
 
             # Optional Comparison Model (e.g. Arm A)
             if compare_model is not None:

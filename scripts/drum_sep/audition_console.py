@@ -526,7 +526,39 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
 """
             stem_idx += 1
 
-        if "sa3_compare_kick" in aud:
+        # Multi-stem pieces (Snare, Hi-Hat, Percussion)
+        for s_sub in ["snare", "hihat", "percussion"]:
+            s_name = "Hi-Hat" if s_sub == "hihat" else s_sub.capitalize()
+            if f"sa3_{s_sub}" in aud:
+                html += f"""
+        <!-- SA3 {s_name} (Generative) -->
+        <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.02);">
+          <div class="stem-header">
+            <span class="stem-name" style="color: var(--accent);">SA3 {s_name} (Generative)</span>
+            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
+          </div>
+          <div class="audio-wrap">
+            <audio controls src="{aud.get(f'sa3_{s_sub}', '')}" preload="none"></audio>
+          </div>
+        </div>
+"""
+                stem_idx += 1
+
+            if f"sa3_wiener_{s_sub}" in aud:
+                html += f"""
+        <!-- SA3 {s_name} (Wiener Masked) -->
+        <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.4); background: rgba(16, 185, 129, 0.02);">
+          <div class="stem-header">
+            <span class="stem-name" style="color: var(--green);">SA3 {s_name} (Wiener Masked)</span>
+            <button class="solo-btn" onclick="soloStem({c_idx}, {stem_idx})">SOLO</button>
+          </div>
+          <div class="audio-wrap">
+            <audio controls src="{aud.get(f'sa3_wiener_{s_sub}', '')}" preload="none"></audio>
+          </div>
+        </div>
+"""
+                stem_idx += 1
+
             html += f"""
         <!-- SA3 Gate G2 Arm A Kick (Prior) -->
         <div class="stem-card" style="border-color: rgba(168, 85, 247, 0.2);">
