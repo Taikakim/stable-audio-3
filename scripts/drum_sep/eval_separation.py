@@ -60,6 +60,22 @@ def load_model(model_name: str, device: torch.device, dtype: torch.dtype = torch
     return model, model_config
 
 
+def encode_wav(ae, wav_np: np.ndarray, device: str = "cuda"):
+    """Encode audio array (channels, samples) to latents (256, T)."""
+    with torch.inference_mode():
+        if wav_np.ndim == 1:
+            wav_np = np.stack([wav_np, wav_np], axis=0)
+        elif wav_np.shape[0] != 2 and wav_np.shape[1] == 2:
+            wav_np = wav_np.T
+        wav_t = torch.from_numpy(wav_np).unsqueeze(0).to(device=device, dtype=torch.float32)
+        if hasattr(ae, "encode_audio"):
+            lat = ae.encode_audio(wav_t)
+        else:
+            lat = ae.encode(wav_t)
+        return lat.squeeze(0).cpu().numpy()
+
+
+
 
 # -----------------------------------------------------------------------------
 # Metric Calculations
@@ -149,9 +165,10 @@ def calc_sdr_metrics(est_wav, ref_wav, sr=SR):
     est = est_wav[:min_len]
     ref = ref_wav[:min_len]
 
+    from scipy.signal import correlate
     max_lag = int(0.2 * sr)
     sub_len = min(len(est), 10 * sr)
-    corr = np.correlate(est[:sub_len], ref[:sub_len], mode="full")
+    corr = correlate(est[:sub_len], ref[:sub_len], mode="full", method="fft")
     lag = np.argmax(corr) - (sub_len - 1)
     if abs(lag) < max_lag and lag != 0:
         if lag > 0:
@@ -300,6 +317,8 @@ def separate_window(model, ae, mix_lat_np: np.ndarray, prompt="solo kick drum, p
 
 def main():
     p = argparse.ArgumentParser(description="Evaluate SA3 Gate G2 Drum Separator")
+    p.add_argument("--compare_checkpoint", type=str, default="/home/kim/sao_runs/drum_sep_g2_kick_armA/epoch=2-step=5000.ckpt",
+                   help="Optional path to comparison checkpoint (e.g. Arm A)")
     p.add_argument("--checkpoint", type=str, required=True, help="Path to trained .ckpt or .safetensors")
     p.add_argument("--val_dir", type=str, default="/home/kim/sao_runs/drum_sep_data/val",
                    help="Path to validation directory with manifest.json")
@@ -318,13 +337,20 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 1. Load SAME-L autoencoder for decoding
+    # 1. Load SAME-L autoencoder for decoding & encoding
     print("Loading SAME-L autoencoder...")
     cfg_path, ckpt_path = ae_models["same-l"].resolve()
     ae = load_autoencoder(cfg_path, ckpt_path, device=device)
 
-    # 2. Load fine-tuned separation model
+    # 2. Load fine-tuned separation model (Primary)
+    print(f"Loading primary separation model from {args.checkpoint}...")
     model = load_separation_model(args.checkpoint, device=device)
+
+    # Optional Compare model (e.g. Arm A)
+    compare_model = None
+    if args.compare_checkpoint and Path(args.compare_checkpoint).exists():
+        print(f"Loading comparison model from {args.compare_checkpoint}...")
+        compare_model = load_separation_model(args.compare_checkpoint, device=device)
 
     # 3. Evaluate on held-out validation samples
     val_manifest_path = Path(args.val_dir) / "manifest.json"
@@ -377,28 +403,135 @@ def main():
 
             print(f"  -> SI-SDR: {metrics['si_sdr_db']:.2f} dB | LSD: {metrics['lsd_db']:.2f} dB | Onset F1: {metrics['onset_f1_20']:.3f}")
 
-    # 4. Summary & Benchmarking Table
+    # 4. Evaluate on Benchmark Comparison Multitracks
+    comp_results = []
+    comp_dir = Path(args.comparison_dir)
+    if comp_dir.exists():
+        comp_tracks = ["acid_alien", "black_moon", "goddess_guerrilla"]
+        print(f"\nEvaluating on benchmark comparison multitracks from {comp_dir}...")
+        for track_id in comp_tracks:
+            tdir = comp_dir / track_id
+            mix_path = tdir / "mix.wav"
+            if not mix_path.exists():
+                continue
+            gt_path = tdir / "studio_kick.wav"
+            if not gt_path.exists():
+                gt_path = tdir / "studio_ground_truth.wav"
+            if not gt_path.exists():
+                continue
+
+            print(f"\n--- Benchmark Track: {track_id} ---")
+            mix_wav, _ = sf.read(str(mix_path))
+            gt_wav, _ = sf.read(str(gt_path))
+            gt_mono = np.mean(gt_wav, axis=-1) if gt_wav.ndim > 1 else gt_wav
+
+            # Encode mix to SAME-L latents
+            mix_lat = encode_wav(ae, mix_wav, device=device)
+
+            # Separate with Primary Model
+            print(f"  Separating with primary model ({Path(args.checkpoint).name})...")
+            sa3_wav = separate_window(model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+            sa3_mono = np.mean(sa3_wav, axis=0)
+
+            track_audio_out = audio_out / track_id
+            track_audio_out.mkdir(parents=True, exist_ok=True)
+            sf.write(str(track_audio_out / "mix.wav"), mix_wav, SR)
+            sf.write(str(track_audio_out / "ground_truth.wav"), gt_wav, SR)
+            sf.write(str(track_audio_out / "sa3_kick.wav"), sa3_wav.T, SR)
+
+            m_sa3 = compute_all_metrics(gt_mono, sa3_mono, SR)
+            print(f"  -> SA3 Kick:      SI-SDR: {m_sa3['si_sdr_db']:6.2f} dB | LSD: {m_sa3['lsd_db']:5.2f} dB | Onset F1: {m_sa3['onset_f1_20']:.3f} | Attack: {m_sa3['attack_dev_db']:+5.2f} dB")
+
+            row = {
+                "track_id": track_id,
+                "sa3": m_sa3,
+                "audio": {
+                    "mix": f"audio/{track_id}/mix.wav",
+                    "ground_truth": f"audio/{track_id}/ground_truth.wav",
+                    "sa3_kick": f"audio/{track_id}/sa3_kick.wav",
+                }
+            }
+
+            # Optional Comparison Model (e.g. Arm A)
+            if compare_model is not None:
+                print(f"  Separating with compare model ({Path(args.compare_checkpoint).name})...")
+                cmp_wav = separate_window(compare_model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+                cmp_mono = np.mean(cmp_wav, axis=0)
+                sf.write(str(track_audio_out / "sa3_compare_kick.wav"), cmp_wav.T, SR)
+                m_cmp = compute_all_metrics(gt_mono, cmp_mono, SR)
+                row["sa3_compare"] = m_cmp
+                row["audio"]["sa3_compare_kick"] = f"audio/{track_id}/sa3_compare_kick.wav"
+                print(f"  -> SA3 Compare:   SI-SDR: {m_cmp['si_sdr_db']:6.2f} dB | LSD: {m_cmp['lsd_db']:5.2f} dB | Onset F1: {m_cmp['onset_f1_20']:.3f} | Attack: {m_cmp['attack_dev_db']:+5.2f} dB")
+
+            # BS-RoFormer baseline
+            bs_path = tdir / "bs_roformer_sw_drums.wav"
+            if not bs_path.exists():
+                bs_path = tdir / "bs_roformer_zfturbo_drums.wav"
+            if bs_path.exists():
+                bs_wav, _ = sf.read(str(bs_path))
+                bs_mono = np.mean(bs_wav, axis=-1) if bs_wav.ndim > 1 else bs_wav
+                sf.write(str(track_audio_out / "bs_roformer.wav"), bs_wav, SR)
+                m_bs = compute_all_metrics(gt_mono, bs_mono, SR)
+                row["bs_roformer"] = m_bs
+                row["audio"]["bs_roformer"] = f"audio/{track_id}/bs_roformer.wav"
+                print(f"  -> BS-RoFormer:   SI-SDR: {m_bs['si_sdr_db']:6.2f} dB | LSD: {m_bs['lsd_db']:5.2f} dB | Onset F1: {m_bs['onset_f1_20']:.3f} | Attack: {m_bs['attack_dev_db']:+5.2f} dB")
+
+            # MSG-LD baseline
+            msgld_path = tdir / "msgld_kick.wav"
+            if msgld_path.exists():
+                m_wav, sr_m = sf.read(str(msgld_path))
+                if sr_m != SR:
+                    resampler = torchaudio.transforms.Resample(sr_m, SR)
+                    m_wav_t = resampler(torch.from_numpy(m_wav).unsqueeze(0).float()).squeeze(0).numpy()
+                else:
+                    m_wav_t = m_wav
+                sf.write(str(track_audio_out / "msgld_kick.wav"), m_wav_t, SR)
+                m_msgld = compute_all_metrics(gt_mono, m_wav_t, SR)
+                row["msgld"] = m_msgld
+                row["audio"]["msgld"] = f"audio/{track_id}/msgld_kick.wav"
+                print(f"  -> MSG-LD Kick:   SI-SDR: {m_msgld['si_sdr_db']:6.2f} dB | LSD: {m_msgld['lsd_db']:5.2f} dB | Onset F1: {m_msgld['onset_f1_20']:.3f} | Attack: {m_msgld['attack_dev_db']:+5.2f} dB")
+
+            comp_results.append(row)
+
+    # 5. Summary & Benchmarking Table
     summary_path = out_dir / "eval_results.json"
     with open(summary_path, "w") as f:
         json.dump({
             "checkpoint": args.checkpoint,
+            "compare_checkpoint": args.compare_checkpoint,
             "steps": args.steps,
             "cfg": args.cfg,
-            "n_samples": len(val_results),
-            "mean_si_sdr_db": float(np.mean([r["si_sdr_db"] for r in val_results])) if val_results else 0.0,
-            "mean_lsd_db": float(np.mean([r["lsd_db"] for r in val_results])) if val_results else 0.0,
-            "mean_onset_f1_20": float(np.mean([r["onset_f1_20"] for r in val_results])) if val_results else 0.0,
-            "samples": val_results
+            "n_val_samples": len(val_results),
+            "mean_val_si_sdr_db": float(np.mean([r["si_sdr_db"] for r in val_results])) if val_results else 0.0,
+            "mean_val_lsd_db": float(np.mean([r["lsd_db"] for r in val_results])) if val_results else 0.0,
+            "mean_val_onset_f1_20": float(np.mean([r["onset_f1_20"] for r in val_results])) if val_results else 0.0,
+            "val_samples": val_results,
+            "comp_samples": comp_results
         }, f, indent=2)
+
+    # 6. Deploy Audition Console HTML
+    from scripts.drum_sep.audition_console import generate_html_console
+    generate_html_console(out_dir, val_results, comp_results, {
+        "checkpoint": args.checkpoint,
+        "compare_checkpoint": args.compare_checkpoint,
+        "steps": args.steps,
+        "cfg": args.cfg
+    })
 
     print(f"\n================================================================================")
     print("GATE G2 EVALUATION COMPLETE")
     print(f"Results saved to {summary_path}")
     if val_results:
-        print(f"Mean SI-SDR:  {np.mean([r['si_sdr_db'] for r in val_results]):.2f} dB")
-        print(f"Mean LSD:     {np.mean([r['lsd_db'] for r in val_results]):.2f} dB")
-        print(f"Mean Onset F1: {np.mean([r['onset_f1_20'] for r in val_results]):.3f}")
+        print(f"Held-out Val Mean SI-SDR:  {np.mean([r['si_sdr_db'] for r in val_results]):.2f} dB")
+        print(f"Held-out Val Mean LSD:     {np.mean([r['lsd_db'] for r in val_results]):.2f} dB")
+        print(f"Held-out Val Mean Onset F1: {np.mean([r['onset_f1_20'] for r in val_results]):.3f}")
+    if comp_results:
+        print(f"Benchmark Tracks Mean SI-SDR: {np.mean([r['sa3']['si_sdr_db'] for r in comp_results]):.2f} dB")
+        print(f"Benchmark Tracks Mean LSD:    {np.mean([r['sa3']['lsd_db'] for r in comp_results]):.2f} dB")
+        print(f"Benchmark Tracks Mean Onset:  {np.mean([r['sa3']['onset_f1_20'] for r in comp_results]):.3f}")
+    print(f"Audition Console: file://{out_dir}/index.html")
     print(f"================================================================================")
 
 if __name__ == "__main__":
     main()
+
