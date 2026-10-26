@@ -609,14 +609,20 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
             if vw:
                 wiener_badge = f'<span class="m-badge" style="background: rgba(16, 185, 129, 0.15); color: var(--green);">Wiener SI-SDR: <strong>{vw.get("si_sdr_db", float("nan")):.2f} dB</strong></span>'
 
-            has_val_wiener = (out_dir / f"audio/{s_tag}_wiener_kick.wav").exists()
+            stem_tag = v.get("stem_tag", "kick")
+            stem_cap = stem_tag.capitalize()
+            gt_file = f"{s_tag}_gt_{stem_tag}.wav" if (out_dir / f"audio/{s_tag}_gt_{stem_tag}.wav").exists() else f"{s_tag}_gt_kick.wav"
+            sa3_file = f"{s_tag}_sa3_{stem_tag}.wav" if (out_dir / f"audio/{s_tag}_sa3_{stem_tag}.wav").exists() else f"{s_tag}_sa3_kick.wav"
+            wiener_file = f"{s_tag}_wiener_{stem_tag}.wav" if (out_dir / f"audio/{s_tag}_wiener_{stem_tag}.wav").exists() else f"{s_tag}_wiener_kick.wav"
+
+            has_val_wiener = (out_dir / f"audio/{wiener_file}").exists()
             grid_cols = "repeat(4, 1fr)" if has_val_wiener else "repeat(3, 1fr)"
 
             html += f"""
     <div class="track-section" id="val_track_{v_idx}">
       <div class="track-header">
         <div class="track-title">
-          <span>{song} (Window {win}, {remix})</span>
+          <span>{song} ({stem_cap}, Window {win}, {remix})</span>
         </div>
         <div class="stem-metrics">
           <span class="m-badge">SI-SDR: <strong>{v.get('si_sdr_db', float('nan')):.2f} dB</strong></span>
@@ -633,24 +639,24 @@ def generate_html_console(out_dir: Path, val_results: list, comp_results: list, 
           </div>
         </div>
         <div class="stem-card" style="border-color: rgba(168, 85, 247, 0.4);">
-          <span class="stem-name" style="color: var(--purple);">Ground Truth Kick</span>
+          <span class="stem-name" style="color: var(--purple);">Ground Truth {stem_cap}</span>
           <div class="audio-wrap">
-            <audio controls src="audio/{s_tag}_gt_kick.wav" preload="none"></audio>
+            <audio controls src="audio/{gt_file}" preload="none"></audio>
           </div>
         </div>
         <div class="stem-card" style="border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.04);">
-          <span class="stem-name" style="color: var(--accent);">SA3 Gate G2 Kick (Generative)</span>
+          <span class="stem-name" style="color: var(--accent);">SA3 {stem_cap} (Generative)</span>
           <div class="audio-wrap">
-            <audio controls src="audio/{s_tag}_sa3_kick.wav" preload="none"></audio>
+            <audio controls src="audio/{sa3_file}" preload="none"></audio>
           </div>
         </div>
 """
             if has_val_wiener:
                 html += f"""
         <div class="stem-card" style="border-color: rgba(16, 185, 129, 0.5); background: rgba(16, 185, 129, 0.04);">
-          <span class="stem-name" style="color: var(--green);">SA3 Kick (Wiener Masked)</span>
+          <span class="stem-name" style="color: var(--green);">SA3 {stem_cap} (Wiener Masked)</span>
           <div class="audio-wrap">
-            <audio controls src="audio/{s_tag}_wiener_kick.wav" preload="none"></audio>
+            <audio controls src="audio/{wiener_file}" preload="none"></audio>
           </div>
         </div>
 """

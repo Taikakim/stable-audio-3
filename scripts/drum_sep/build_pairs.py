@@ -44,6 +44,13 @@ DEFAULT_HOLDOUTS = [
     "Summamutikka - Black Moon psychedelic goa trance",
 ]
 
+STEM_PROMPTS = {
+    "kick": "solo kick drum, punchy goa trance kick, dry isolated hit",
+    "snare": "acoustic snare drum, snap and crack, punchy tight transient",
+    "hihat": "crisp closed hi-hats, bright metallic offbeat 16th pattern",
+    "percussion": "tribal percussion, shakers, congas, rolling grooves"
+}
+
 def load_audio_stem(path: Path, target_sr=SR):
     """Load audio file as (C, T) float32 stereo at target_sr."""
     y, fs = sf.read(str(path), dtype="float32", always_2d=True)
@@ -81,6 +88,8 @@ def main():
     p.add_argument("--split", type=str, default="train", choices=["train", "val", "all"])
     p.add_argument("--remixes", action="store_true", default=True, help="Include remix augmentations (3x pairs)")
     p.add_argument("--no_remixes", dest="remixes", action="store_false")
+    p.add_argument("--stems", type=str, default="kick,snare,hihat,percussion",
+                   help="Comma-separated target stems to extract")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -156,75 +165,105 @@ def main():
         n_windows = max(0, (min_len - win_samples) // hop_samples + 1)
         print(f"  Audio duration: {min_len / SR:.1f}s -> {n_windows} windows of {args.window_sec:.1f}s")
         
+        # Collect available target stems for this track
+        available_stems = {}
+        if kick_files:
+            available_stems["kick"] = kick_wav
+
+        flacs = [f for f in drums_dir.glob("*.flac") if f.name != "DRUMS_downmix.flac"]
+        cat_files = {"snare": [], "hihat": [], "percussion": []}
+        for f in flacs:
+            name = f.name.lower()
+            if "snare" in name or "clap" in name:
+                cat_files["snare"].append(f)
+            elif any(k in name for k in ["hat", "cymbal", "ride", "crash"]):
+                cat_files["hihat"].append(f)
+            else:
+                cat_files["percussion"].append(f)
+
+        for cat, c_files in cat_files.items():
+            if c_files:
+                cat_wav = np.zeros_like(drums_wav)
+                for f in c_files:
+                    cat_wav += load_audio_stem(f)[:, :min_len]
+                available_stems[cat] = cat_wav
+
+        # Fallback if no sub-stems in drums/
+        if "snare" not in available_stems and "hihat" not in available_stems and "percussion" not in available_stems:
+            available_stems["percussion"] = drums_wav
+
+        target_stems_filter = [s.strip() for s in args.stems.split(",") if s.strip()]
+
         track_pairs = 0
         for w in range(n_windows):
             start = w * hop_samples
             end = start + win_samples
-            
-            k_win = kick_wav[:, start:end]
-            d_win = drums_wav[:, start:end]
             b_win = bus_wav[:, start:end]
 
-            # Activity gate: skip windows where kick is silent
-            k_rms = np.sqrt(np.mean(k_win**2))
-            if k_rms < 0.005:
-                continue
+            for s_tag, stem_wav in available_stems.items():
+                if s_tag not in target_stems_filter:
+                    continue
 
-            # Prepare batch of variants to encode together on GPU
-            # 1. Base clean bus & clean kick
-            # 2. Remix 1: kick boosted (+2.5 dB), other drums attenuated (-2.5 dB)
-            # 3. Remix 2: kick attenuated (-2.5 dB), other drums boosted (+2.5 dB)
-            remix1_b = k_win * 1.33 + d_win * 0.75
-            remix1_k = k_win * 1.33
-            remix2_b = k_win * 0.75 + d_win * 1.33
-            remix2_k = k_win * 0.75
+                s_win = stem_wav[:, start:end]
+                # Activity gate: skip windows where target stem is silent
+                s_rms = np.sqrt(np.mean(s_win**2))
+                if s_rms < 0.003:
+                    continue
 
-            if args.remixes:
-                wav_batch = torch.from_numpy(np.stack([
-                    k_win, b_win,
-                    remix1_k, remix1_b,
-                    remix2_k, remix2_b
-                ], axis=0)) # (6, 2, win_samples)
-                lat_batch = encode_batch(ae, wav_batch, device, model_dtype)
-                
-                variants = [
-                    ("orig", lat_batch[0], lat_batch[1]),
-                    ("kick_boost", lat_batch[2], lat_batch[3]),
-                    ("kick_cut", lat_batch[4], lat_batch[5]),
-                ]
-            else:
-                wav_batch = torch.from_numpy(np.stack([k_win, b_win], axis=0))
-                lat_batch = encode_batch(ae, wav_batch, device, model_dtype)
-                variants = [("orig", lat_batch[0], lat_batch[1])]
+                # Prepare batch of variants to encode together on GPU
+                if args.remixes:
+                    boost_s = s_win * 1.33
+                    boost_b = b_win + (boost_s - s_win)
+                    cut_s = s_win * 0.75
+                    cut_b = b_win + (cut_s - s_win)
 
-            for v_name, target_lat, mix_lat in variants:
-                sample_id = f"{t_idx:03d}_{w:04d}_{v_name}"
-                npz_fname = f"{sample_id}.npz"
-                npz_path = split_dir / npz_fname
-                
-                T_lat = target_lat.shape[-1]
-                np.savez_compressed(
-                    npz_path,
-                    target_lat=target_lat, # (256, T_lat) fp16
-                    mix_lat=mix_lat,       # (256, T_lat) fp16
-                    prompt="solo kick drum, punchy goa trance kick, dry isolated hit",
-                    stem_tag="kick",
-                    seconds_total=args.window_sec,
-                    padding_mask=np.ones(T_lat, dtype=np.uint8),
-                    song=song_name,
-                    window_idx=w,
-                    remix_type=v_name
-                )
-                
-                samples_manifest.append({
-                    "id": sample_id,
-                    "file": npz_fname,
-                    "song": song_name,
-                    "window": w,
-                    "remix": v_name,
-                    "t_lat": T_lat
-                })
-                track_pairs += 1
+                    wav_batch = torch.from_numpy(np.stack([
+                        s_win, b_win,
+                        boost_s, boost_b,
+                        cut_s, cut_b
+                    ], axis=0)) # (6, 2, win_samples)
+                    lat_batch = encode_batch(ae, wav_batch, device, model_dtype)
+
+                    variants = [
+                        ("orig", lat_batch[0], lat_batch[1]),
+                        (f"{s_tag}_boost", lat_batch[2], lat_batch[3]),
+                        (f"{s_tag}_cut", lat_batch[4], lat_batch[5]),
+                    ]
+                else:
+                    wav_batch = torch.from_numpy(np.stack([s_win, b_win], axis=0))
+                    lat_batch = encode_batch(ae, wav_batch, device, model_dtype)
+                    variants = [("orig", lat_batch[0], lat_batch[1])]
+
+                prompt = STEM_PROMPTS.get(s_tag, f"solo {s_tag} drum, dry isolated hit")
+                for v_name, target_lat, mix_lat in variants:
+                    sample_id = f"{t_idx:03d}_{w:04d}_{s_tag}_{v_name}"
+                    npz_fname = f"{sample_id}.npz"
+                    npz_path = split_dir / npz_fname
+
+                    T_lat = target_lat.shape[-1]
+                    np.savez_compressed(
+                        npz_path,
+                        target_lat=target_lat, # (256, T_lat) fp16
+                        mix_lat=mix_lat,       # (256, T_lat) fp16
+                        prompt=prompt,
+                        stem_tag=s_tag,
+                        seconds_total=args.window_sec,
+                        padding_mask=np.ones(T_lat, dtype=np.uint8),
+                        song=song_name,
+                        window_idx=w,
+                        remix_type=v_name
+                    )
+
+                    samples_manifest.append({
+                        "id": sample_id,
+                        "file": npz_fname,
+                        "song": song_name,
+                        "stem": s_tag,
+                        "window": w,
+                        "remix": v_name,
+                        "t_lat": T_lat
+                    })
+                    track_pairs += 1
 
         print(f"  -> Generated {track_pairs} paired samples")
         total_pairs += track_pairs

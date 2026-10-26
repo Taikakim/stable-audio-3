@@ -481,13 +481,15 @@ def main():
                 song = str(npz["song"])
                 window = int(npz["window_idx"])
                 remix = str(npz["remix_type"])
+                prompt = str(npz["prompt"]) if "prompt" in npz.files else "solo kick drum, punchy goa trance kick, dry isolated hit"
+                stem_tag = str(npz["stem_tag"]) if "stem_tag" in npz.files else "kick"
 
-            print(f"[{s_idx+1}/{len(samples)}] {song} (win {window}, {remix})...")
+            print(f"[{s_idx+1}/{len(samples)}] {song} ({stem_tag}, win {window}, {remix})...")
 
-            sample_tag = f"val_{s_idx:03d}_{window}_{remix}"
+            sample_tag = f"val_{s_idx:03d}_{window}_{stem_tag}_{remix}"
             mix_p = audio_out / f"{sample_tag}_mix.wav"
-            gt_p = audio_out / f"{sample_tag}_gt_kick.wav"
-            sa3_path = audio_out / f"{sample_tag}_sa3_kick.wav"
+            gt_p = audio_out / f"{sample_tag}_gt_{stem_tag}.wav"
+            sa3_path = audio_out / f"{sample_tag}_sa3_{stem_tag}.wav"
 
             if args.reuse_existing and mix_p.exists() and gt_p.exists() and sa3_path.exists():
                 mix_wav, _ = sf.read(str(mix_p))
@@ -500,15 +502,15 @@ def main():
                 if est_k_wav.ndim > 1 and est_k_wav.shape[0] > 2:
                     est_k_wav = est_k_wav.T
             else:
-                # Decode ground truth kick & mixture for audio comparison
+                # Decode ground truth target stem & mixture for audio comparison
                 with torch.inference_mode():
                     gt_k_t = torch.from_numpy(target_lat).unsqueeze(0).to(device=device, dtype=torch.float32)
                     mix_t = torch.from_numpy(mix_lat).unsqueeze(0).to(device=device, dtype=torch.float32)
                     gt_k_wav = ae.decode(gt_k_t).squeeze(0).cpu().float().numpy()
                     mix_wav = ae.decode(mix_t).squeeze(0).cpu().float().numpy()
 
-                # Separate target kick using trained model
-                est_k_wav = separate_window(model, ae, mix_lat, steps=args.steps, cfg_scale=args.cfg, device=device)
+                # Separate target stem using trained model with stem-specific prompt
+                est_k_wav = separate_window(model, ae, mix_lat, prompt=prompt, steps=args.steps, cfg_scale=args.cfg, device=device)
                 sf.write(str(sa3_path), est_k_wav.T, SR)
                 sf.write(str(mix_p), mix_wav.T, SR)
                 sf.write(str(gt_p), gt_k_wav.T, SR)
@@ -521,21 +523,22 @@ def main():
             # Apply Wiener Masking Reconciliation if requested
             if args.wiener_alpha > 0:
                 w_k_wav = apply_wiener_masking(est_k_wav, mix_wav, alpha=args.wiener_alpha)
-                sf.write(str(audio_out / f"{sample_tag}_wiener_kick.wav"), w_k_wav.T, SR)
+                sf.write(str(audio_out / f"{sample_tag}_wiener_{stem_tag}.wav"), w_k_wav.T, SR)
                 w_mono = np.mean(w_k_wav, axis=0)
                 metrics["wiener"] = compute_all_metrics(ref_mono, w_mono, SR)
 
             # Save audio files
             sf.write(str(audio_out / f"{sample_tag}_mix.wav"), mix_wav.T, SR)
-            sf.write(str(audio_out / f"{sample_tag}_gt_kick.wav"), gt_k_wav.T, SR)
+            sf.write(str(audio_out / f"{sample_tag}_gt_{stem_tag}.wav"), gt_k_wav.T, SR)
 
             metrics["sample_tag"] = sample_tag
             metrics["song"] = song
             metrics["window"] = window
             metrics["remix"] = remix
+            metrics["stem_tag"] = stem_tag
             val_results.append(metrics)
 
-            msg = f"  -> SA3 Kick: SI-SDR: {metrics['si_sdr_db']:.2f} dB | LSD: {metrics['lsd_db']:.2f} dB | Onset F1: {metrics['onset_f1_20']:.3f}"
+            msg = f"  -> SA3 {stem_tag.capitalize()}: SI-SDR: {metrics['si_sdr_db']:.2f} dB | LSD: {metrics['lsd_db']:.2f} dB | Onset F1: {metrics['onset_f1_20']:.3f}"
             if "wiener" in metrics:
                 msg += f" | Wiener: SI-SDR: {metrics['wiener']['si_sdr_db']:.2f} dB | LSD: {metrics['wiener']['lsd_db']:.2f} dB"
             print(msg)
