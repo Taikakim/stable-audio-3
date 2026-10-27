@@ -87,18 +87,31 @@ echo "Start: $(date)"
 CKPT_LOW="$SAVE_DIR_LOW/epoch=0-step=3000.ckpt"
 CKPT_HIGH="$SAVE_DIR_HIGH/epoch=0-step=3000.ckpt"
 
-# Run evaluation on held-out tracks comparing baseline vs best new checkpoints
+# Run evaluation on held-out tracks comparing baseline vs both new checkpoints
 CUDA_VISIBLE_DEVICES=0 $PYTHON "$STABLE_AUDIO_DIR/scripts/drum_sep/eval_separation.py" \
     --checkpoint "$CKPT_LOW" \
     --compare_checkpoint "$BASE_CKPT" \
+    --val_dir "$DATA_DIR/val" \
     --steps 25 \
     --cfg 2.5 \
     --wiener_alpha 1.5 \
-    --val_samples 20 \
-    --out_dir "$EVAL_DIR"
+    --max_samples 20 \
+    --out_dir "$EVAL_DIR/lr3e5_anneal"
+
+CUDA_VISIBLE_DEVICES=0 $PYTHON "$STABLE_AUDIO_DIR/scripts/drum_sep/eval_separation.py" \
+    --checkpoint "$CKPT_HIGH" \
+    --compare_checkpoint "$BASE_CKPT" \
+    --val_dir "$DATA_DIR/val" \
+    --steps 25 \
+    --cfg 2.5 \
+    --wiener_alpha 1.5 \
+    --max_samples 20 \
+    --out_dir "$EVAL_DIR/lr2e4_boost"
 
 echo "================================================================================"
 echo "OVERNIGHT DRUM SEPARATION RUNS COMPLETE"
 echo "End Time: $(date)"
-echo "Audition Console: file://$EVAL_DIR/index.html"
+echo "Audition Consoles:"
+echo "  Low-LR (3e-5):  file://$EVAL_DIR/lr3e5_anneal/index.html"
+echo "  High-LR (2e-4): file://$EVAL_DIR/lr2e4_boost/index.html"
 echo "================================================================================"
