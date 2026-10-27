@@ -369,6 +369,7 @@ def make_optimizer(args, model):
                                normuon_mode=args.mod_normuon_mode, update_scale=args.mod_update_scale,
                                normuon_after_unwhiten=args.mod_normuon_after_unwhiten,
                                ns_dtype=args.mod_ns_dtype, ns_batch=args.mod_ns_batch,
+                               strict_group_lrs=not args.allow_uniform_lr,
                                beta_precond=args.mod_precond_beta, normuon_beta=args.mod_normuon_beta,
                                adam_beta2=args.mod_adam_beta2)
         print(opt.summary())
@@ -1167,6 +1168,8 @@ if __name__ == "__main__":
                    help="--optimizer modular: separate lr for the sign group (1-D gains/biases, 2-D sign layers), or for the "
                         "adam group with --mod-scalar-opt adam. Default: --lr. Test plan B: cool the 1-D group only")
     p.add_argument("--mod-sign-wd", type=float, default=0.0, help="--optimizer modular: weight decay of the sign/adam group")
+    p.add_argument("--allow-uniform-lr", action="store_true",
+                   help="--optimizer modular: accept ONE learning rate for the spectral and the 1-D groups (default: refuse; the sign step moves a bias by the full lr, a matrix weight by ~lr/sqrt(max dim); give --mod-sign-lr instead, TRAINING.md D34)")
     p.add_argument("--mod-scalar-opt", choices=["sign", "adam"], default="sign",
                    help="--optimizer modular: step the sign-routed parameters by sign descent (historical) or element-wise "
                         "Adam (the SF-NorMuon recipe runs them on Schedule-Free AdamW)")

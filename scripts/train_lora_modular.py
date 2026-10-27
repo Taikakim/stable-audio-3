@@ -606,6 +606,7 @@ def train(args):
                         "ns_dtype": args.modular_ns_dtype,
                         "state_dtype": args.modular_state_dtype,
                         "ns_batch": args.modular_ns_batch,
+                        "strict_group_lrs": not getattr(args, "allow_uniform_lr", False),
                     },
                     "param_groups": {
                         "default_whitening": args.modular_whitening,
@@ -1038,6 +1039,8 @@ def main():
                      help="dtype of the Newton-Schulz iteration only (bf16 = FusionOpt's hot path)")
     mod.add_argument("--modular-ns-batch", action="store_true",
                      help="one batched Newton-Schulz call per matrix shape instead of one per matrix (speed)")
+    mod.add_argument("--allow-uniform-lr", action="store_true",
+                     help="accept ONE learning rate for the spectral and the 1-D groups (default: refuse; the sign step moves a bias by the full lr, a matrix weight by ~lr/sqrt(max dim); give --mod-sign-lr instead, TRAINING.md D34)")
     mod.add_argument("--modular-state-dtype", choices=["param", "fp32"], default="param",
                      help="fp32 = optimizer state + fp32 master copy for low-precision (bf16) parameters")
     mod.add_argument("--modular-scalar-opt", choices=["sign", "adam"], default="sign",

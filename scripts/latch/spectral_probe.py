@@ -184,7 +184,7 @@ def point_from_state(model, groups, opt_state, which, spectral):
     (1 - sf_beta) z + sf_beta x; "x": the Schedule-Free average. Parameters without Schedule-Free state keep
     the module's value. The optimizer is rebuilt on the same routing and only read."""
     from stable_audio_tools.training.modular_opt import ModularOptimizer
-    opt = ModularOptimizer(groups, lr=1e-2)
+    opt = ModularOptimizer(groups, lr=1e-2, strict_group_lrs=False)  # analysis probe, not a run
     opt.load_state_dict(opt_state)
     point = {n: p.detach().clone() for n, p in model.named_parameters()}
     for g in opt.param_groups:
