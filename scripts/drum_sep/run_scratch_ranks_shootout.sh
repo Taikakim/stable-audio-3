@@ -63,13 +63,16 @@ evaluate_arm() {
 # Arm 1: Rank 64 NorMuon + Warmup + Schedule-Free
 # -----------------------------------------------------------------------------
 run_arm1() {
-    local ckpt="$SAVE_DIR_ARM1/epoch=0-step=4000.ckpt"
+    local ckpt="$SAVE_DIR_ARM1/epoch=0-step=2000.ckpt"
+    if [ ! -f "$ckpt" ]; then
+        ckpt="$SAVE_DIR_ARM1/epoch=0-step=4000.ckpt"
+    fi
     echo ""
     echo "================================================================================"
-    echo "=== ARM 1: Rank 64 NorMuon + Warmup + Schedule-Free (4000 steps) ==="
+    echo "=== ARM 1: Rank 64 NorMuon + Warmup + Schedule-Free (Step 2000 Best) ==="
     echo "================================================================================"
     if [ -f "$ckpt" ]; then
-        echo "Checkpoint $ckpt already exists. Skipping training."
+        echo "Checkpoint $ckpt already exists. Proceeding to evaluation."
     else
         CUDA_VISIBLE_DEVICES=0 $PYTHON "$STABLE_AUDIO_DIR/scripts/train_lora.py" \
             --devices 1 \
@@ -87,6 +90,9 @@ run_arm1() {
             --spectral-lr 1e-3 \
             --scalar-lr 2e-4 \
             --warmup_steps 500 \
+            --fusion-decay wsd \
+            --fusion-decay-start-frac 0.4 \
+            --fusion-decay-min 0.1 \
             --weight_decay 0.01 \
             --save_dir "$SAVE_DIR_ARM1" \
             --name drum_sep_r64_normuon_sf
@@ -195,6 +201,9 @@ run_arm3() {
             --spectral-lr 1e-3 \
             --scalar-lr 2e-4 \
             --warmup_steps 500 \
+            --fusion-decay wsd \
+            --fusion-decay-start-frac 0.4 \
+            --fusion-decay-min 0.1 \
             --weight_decay 0.01 \
             --save_dir "$SAVE_DIR_ARM3" \
             --name drum_sep_r128_normuon_sf

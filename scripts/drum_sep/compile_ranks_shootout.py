@@ -22,11 +22,11 @@ import numpy as np
 def build_shootout_dashboard(eval_root: Path):
     arms_meta = {
         "arm1_r64_normuon_sf": {
-            "name": "Arm 1: Rank 64 NorMuon + SF",
+            "name": "Arm 1: Rank 64 NorMuon + SF (Step 2000)",
             "tag": "NorMuon + SF",
             "rank": 64,
             "params": "117.6M",
-            "desc": "33M mix_lat: SF-NorMuon (1e-3) | LoRA: SF-AdamW (2e-4) | No LR decay needed",
+            "desc": "33M mix_lat: SF-NorMuon (1e-3) | LoRA: SF-AdamW (2e-4) | Step 2000 (Loss 0.167)",
             "color": "#38bdf8"
         },
         "arm0_r64_adamw": {
@@ -99,7 +99,7 @@ def build_shootout_dashboard(eval_root: Path):
         # Per stem SI-SDR
         stem_sisdr = {}
         for st in stem_types:
-            st_samples = [s for s in val_samples if s.get("stem") == st or st in s.get("file", "")]
+            st_samples = [s for s in val_samples if f"_{st}_" in s.get("sample_tag", "") or st == s.get("stem_tag", "") or st == s.get("stem", "")]
             if st_samples:
                 stem_sisdr[st] = float(np.mean([s.get("wiener", {}).get("si_sdr_db", s.get("si_sdr_db", float("nan"))) for s in st_samples]))
             else:

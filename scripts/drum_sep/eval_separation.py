@@ -346,6 +346,8 @@ def separate_long_audio(model, ae, mix_wav: np.ndarray, prompt="solo kick drum, 
         end = start + window_frames
         chunk_lat = mix_lat[:, start:end]
         chunk_wav = separate_window(model, ae, chunk_lat, prompt=prompt, steps=steps, cfg_scale=cfg_scale, device=device)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         a_start = start * DOWNSAMPLING_RATIO
         a_end = min(total_samples, a_start + chunk_wav.shape[-1])
@@ -454,11 +456,7 @@ def main():
         # 2. Load fine-tuned separation model (Primary)
         print(f"Loading primary separation model from {args.checkpoint}...")
         model = load_separation_model(args.checkpoint, device=device)
-
-        # Optional Compare model (e.g. Arm A)
-        if args.compare_checkpoint and Path(args.compare_checkpoint).exists():
-            print(f"Loading comparison model from {args.compare_checkpoint}...")
-            compare_model = load_separation_model(args.compare_checkpoint, device=device)
+        # Note: compare_model is lazy-loaded after primary model finishes to stay under 16GB VRAM
     else:
         print("Reusing existing separated audio from disk (--reuse_existing). Skipping model load.")
 
@@ -629,24 +627,6 @@ def main():
                         print(f"  -> SA3 Wiener:    SI-SDR: {m_sa3_w['si_sdr_db']:6.2f} dB | LSD: {m_sa3_w['lsd_db']:5.2f} dB | Onset F1: {m_sa3_w['onset_f1_20']:.3f} | Attack: {m_sa3_w.get('attack_db', float('nan')):+5.2f} dB")
 
 
-            # Optional Comparison Model (e.g. Arm A)
-            if compare_model is not None:
-                cmp_path = track_audio_out / "sa3_compare_kick.wav"
-                if args.reuse_existing and cmp_path.exists():
-                    cmp_wav, _ = sf.read(str(cmp_path))
-                    if cmp_wav.ndim > 1 and cmp_wav.shape[0] > 2:
-                        cmp_wav = cmp_wav.T
-                else:
-                    print(f"  Separating with compare model ({Path(args.compare_checkpoint).name})...")
-                    cmp_wav = separate_long_audio(compare_model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
-                    sf.write(str(cmp_path), cmp_wav.T, SR)
-
-                cmp_mono = np.mean(cmp_wav, axis=0)
-                m_cmp = compute_all_metrics(gt_mono, cmp_mono, SR)
-                row["sa3_compare"] = m_cmp
-                row["audio"]["sa3_compare_kick"] = f"audio/{track_id}/sa3_compare_kick.wav"
-                print(f"  -> SA3 Compare:   SI-SDR: {m_cmp['si_sdr_db']:6.2f} dB | LSD: {m_cmp['lsd_db']:5.2f} dB | Onset F1: {m_cmp['onset_f1_20']:.3f} | Attack: {m_cmp.get('attack_db', float('nan')):+5.2f} dB")
-
             # BS-RoFormer baseline
             bs_path = tdir / "bs_roformer_sw_drums.wav"
             if not bs_path.exists():
@@ -675,8 +655,49 @@ def main():
                 row["audio"]["msgld"] = f"audio/{track_id}/msgld_kick.wav"
                 print(f"  -> MSG-LD Kick:   SI-SDR: {m_msgld['si_sdr_db']:6.2f} dB | LSD: {m_msgld['lsd_db']:5.2f} dB | Onset F1: {m_msgld['onset_f1_20']:.3f} | Attack: {m_msgld.get('attack_db', float('nan')):+5.2f} dB")
 
-
             comp_results.append(row)
+
+        # Phase 2: Comparison Model (if provided), run after primary model is released from VRAM
+        if args.compare_checkpoint and Path(args.compare_checkpoint).exists():
+            print(f"\nPhase 2: Offloading primary model and evaluating compare model from {args.compare_checkpoint}...")
+            del model
+            model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            compare_model = load_separation_model(args.compare_checkpoint, device=device)
+
+            for row in comp_results:
+                track_id = row["track_id"]
+                tdir = comp_dir / track_id
+                mix_path = tdir / "mix.wav"
+                gt_path = tdir / "studio_kick.wav"
+                if not gt_path.exists():
+                    gt_path = tdir / "studio_ground_truth.wav"
+                mix_wav, _ = sf.read(str(mix_path))
+                gt_wav, _ = sf.read(str(gt_path))
+                gt_mono = np.mean(gt_wav, axis=-1) if gt_wav.ndim > 1 else gt_wav
+
+                track_audio_out = audio_out / track_id
+                cmp_path = track_audio_out / "sa3_compare_kick.wav"
+                if args.reuse_existing and cmp_path.exists():
+                    cmp_wav, _ = sf.read(str(cmp_path))
+                    if cmp_wav.ndim > 1 and cmp_wav.shape[0] > 2:
+                        cmp_wav = cmp_wav.T
+                else:
+                    print(f"  Separating {track_id} kick with compare model ({Path(args.compare_checkpoint).name})...")
+                    cmp_wav = separate_long_audio(compare_model, ae, mix_wav, steps=args.steps, cfg_scale=args.cfg, device=device)
+                    sf.write(str(cmp_path), cmp_wav.T, SR)
+
+                cmp_mono = np.mean(cmp_wav, axis=0)
+                m_cmp = compute_all_metrics(gt_mono, cmp_mono, SR)
+                row["sa3_compare"] = m_cmp
+                row["audio"]["sa3_compare_kick"] = f"audio/{track_id}/sa3_compare_kick.wav"
+                print(f"  -> SA3 Compare:   SI-SDR: {m_cmp['si_sdr_db']:6.2f} dB | LSD: {m_cmp['lsd_db']:5.2f} dB | Onset F1: {m_cmp['onset_f1_20']:.3f} | Attack: {m_cmp.get('attack_db', float('nan')):+5.2f} dB")
+
+            del compare_model
+            compare_model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # 5. Summary & Benchmarking Table
     summary_path = out_dir / "eval_results.json"
