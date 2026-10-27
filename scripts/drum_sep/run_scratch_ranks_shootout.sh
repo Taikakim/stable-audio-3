@@ -41,6 +41,10 @@ evaluate_arm() {
     local arm_eval_dir="$EVAL_ROOT/$arm_id"
 
     echo ""
+    if [ -f "$arm_eval_dir/eval_results.json" ]; then
+        echo ">>> Evaluation for $arm_id already completed ($arm_eval_dir/eval_results.json exists). Skipping evaluation."
+        return 0
+    fi
     echo ">>> Running evaluation for $arm_id on $ckpt_path..."
     mkdir -p "$arm_eval_dir"
 
