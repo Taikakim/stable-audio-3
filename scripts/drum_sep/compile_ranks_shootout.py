@@ -45,9 +45,17 @@ def build_shootout_dashboard(eval_root: Path):
             "desc": "33M mix_lat: Pure NS5 (3e-4) | LoRA: AdamW (2e-4) | WSD decay",
             "color": "#f59e0b"
         },
+        "arm3_r128_step1000_healthy": {
+            "name": "Arm 3: Rank 128 NorMuon + SF (Step 1000 Peak)",
+            "tag": "Rank 128 (Step 1000)",
+            "rank": 128,
+            "params": "202.2M",
+            "desc": "SF-NorMuon (1e-3) | SF-AdamW (2e-4) | Saved at Step 1000 before loss spike (Loss 0.178)",
+            "color": "#c084fc"
+        },
         "arm3_r128_normuon_sf": {
-            "name": "Arm 3: Rank 128 NorMuon + SF",
-            "tag": "Rank 128 NorMuon + SF",
+            "name": "Arm 3: Rank 128 NorMuon + SF (Step 4000)",
+            "tag": "Rank 128 (Step 4000)",
             "rank": 128,
             "params": "202.2M",
             "desc": "33M mix_lat: SF-NorMuon (1e-3) | Rank-128 LoRA: force-scalar SF-AdamW (2e-4)",

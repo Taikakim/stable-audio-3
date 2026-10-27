@@ -212,6 +212,7 @@ run_arm3() {
             --save_dir "$SAVE_DIR_ARM3" \
             --name drum_sep_r128_normuon_sf
     fi
+    evaluate_arm "arm3_r128_step1000_healthy" "$SAVE_DIR_ARM3/epoch=0-step=1000.ckpt"
     evaluate_arm "arm3_r128_normuon_sf" "$ckpt"
 }
 
