@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Compile a TRT engine from a pre-built ONNX file pulled from HuggingFace.
+
+This is the "consumer" build path: no stable-audio-tools, no model checkpoints,
+no PyTorch source — just TensorRT + the public ONNX files from
+stabilityai/stable-audio-3-optimized/onnx/.
+
+To rebuild engines for a new GPU arch (sm_100, sm_120, ...) you run this on
+that GPU and TRT bakes the arch into the engine.
+
+Usage:
+    python build_from_onnx.py t5gemma
+    python build_from_onnx.py same-s-encoder
+    python build_from_onnx.py same-s-decoder
+    python build_from_onnx.py same-l-encoder
+    python build_from_onnx.py same-l-decoder
+    python build_from_onnx.py sa3-sm-music
+    python build_from_onnx.py sa3-sm-sfx
+    python build_from_onnx.py sa3-m
+    python build_from_onnx.py all          # build everything for this arch
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPTS_DIR))
+# diff_attn_nocast_plugin + triton_swa_v2 (for SAME-L plugin) live in ../scripts/
+sys.path.insert(0, str(SCRIPTS_DIR.parent / "scripts"))
+
+from _arch import detect_arch, arch_dir  # noqa: E402
+
+
+HF_REPO = "stabilityai/stable-audio-3-optimized"
+HF_ONNX_PREFIX = "onnx"  # files at HF_REPO/onnx/<engine_subdir>/<file>.onnx
+
+T5_TOKENS = 256
+T5_HIDDEN_DIM = 768
+SAMPLES_PER_LATENT = 4096
+
+
+# DiT optimization profile — shared by all 3 DiT variants since they have the
+# same input shapes (cond bakedin, dynamic L in [1, 4096]).
+# Min lowered from 256 → 1 after benchmarking showed TRT picks identical
+# tactics across the [1, 4096] range at opt=1292; the extended lower bound
+# unlocks sub-trained short-form output (~93 ms minimum) at zero perf cost.
+# Audio quality below L=256 (~23.8 s) is undefined — the model was trained on
+# L≥256 — but the engine runs.
+_DIT_PROFILE = {
+    "x":              [(1, 256, 1),     (1, 256, 1292),   (1, 256, 4096)],
+    "t":              [(1,),            (1,),             (1,)],
+    "t5_hidden":      [(1, T5_TOKENS, T5_HIDDEN_DIM)] * 3,
+    "t5_mask":        [(1, T5_TOKENS)] * 3,
+    "seconds_total":  [(1,)] * 3,
+    "local_add_cond": [(1, 257, 1),     (1, 257, 1292),   (1, 257, 4096)],
+}
+
+# Per-engine recipe: where the ONNX lives on HF, where the .trt goes locally,
+# what TRT builder flags to use, and the optimization profile shapes.
+TARGETS = {
+    "t5gemma": {
+        "onnx_hf":     ["t5gemma/encoder.onnx"],
+        # tokenizer.json ships bundled with the repo at scripts/tokenizer.json
+        # (arch-agnostic), so we don't fetch it here anymore.
+        "trt_local":    "t5gemma/t5gemma_fp16mixed.trt",
+        "flags":        set(),  # STRONGLY_TYPED carries the FP16/FP32 dtype hints
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 8,
+        "profile":      None,  # static shapes
+        "plugin":       False,
+    },
+    "same-s-encoder": {
+        "onnx_hf":      ["same-s/enc_dynamic_bf16.onnx"],
+        "trt_local":    "same-s/enc_dynamic_bf16.trt",
+        "flags":        {"BF16"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
+                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
+                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
+        "plugin":       False,
+    },
+    "same-s-decoder": {
+        "onnx_hf":      ["same-s/dec_dynamic_bf16.onnx"],
+        "trt_local":    "same-s/dec_dynamic_bf16.trt",
+        "flags":        {"BF16"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
+        "plugin":       False,
+    },
+    "same-l-encoder": {
+        "onnx_hf":      ["same-l/enc_dynamic_triton_swa.onnx"],
+        "trt_local":    "same-l/enc_dynamic_triton_swa.trt",
+        "flags":        set(),  # STRONGLY_TYPED carries dtype hints
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      {"audio": [(1, 2, 32 * SAMPLES_PER_LATENT),
+                                    (1, 2, 1292 * SAMPLES_PER_LATENT),
+                                    (1, 2, 4096 * SAMPLES_PER_LATENT)]},
+        "plugin":       True,
+    },
+    "same-l-decoder": {
+        "onnx_hf":      ["same-l/dec_dynamic_triton_swa.onnx"],
+        "trt_local":    "same-l/dec_dynamic_triton_swa.trt",
+        "flags":        set(),
+        "network":      "STRONGLY_TYPED",
+        "workspace_gb": 16,
+        "profile":      {"latent": [(1, 256, 32), (1, 256, 1292), (1, 256, 4096)]},
+        "plugin":       True,
+    },
+    "sa3-sm-music": {
+        "onnx_hf":      ["sa3-sm-music/dit.onnx"],
+        "trt_local":    "sa3-sm-music/dit_bf16.trt",
+        "flags":        {"BF16"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
+    "sa3-sm-sfx": {
+        "onnx_hf":      ["sa3-sm-sfx/dit.onnx"],
+        "trt_local":    "sa3-sm-sfx/dit_bf16.trt",
+        "flags":        {"BF16"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
+    "sa3-m": {
+        # The medium DiT's ONNX exceeds 2 GB, so it has an external data sidecar.
+        "onnx_hf":      ["sa3-m/dit.onnx", "sa3-m/dit.onnx.data"],
+        "trt_local":    "sa3-m/dit_bf16.trt",
+        "flags":        {"BF16"},
+        "network":      "EXPLICIT_BATCH",
+        "workspace_gb": 16,
+        "profile":      _DIT_PROFILE,
+        "plugin":       False,
+    },
+}
+
+
+def _ensure_onnx(rel_paths):
+    """Pull the ONNX (and any .data sidecar) from HF; cache on disk."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        sys.exit("error: huggingface_hub not installed. pip install huggingface-hub")
+    local_paths = []
+    for rel in rel_paths:
+        hf_filename = f"{HF_ONNX_PREFIX}/{rel}"
+        print(f"  hf_hub_download → {hf_filename}", flush=True)
+        local = hf_hub_download(repo_id=HF_REPO, filename=hf_filename)
+        local_paths.append(local)
+    # The proto path is the first listed; .data sidecars travel alongside.
+    return local_paths[0]
+
+
+def build_one(name: str) -> str:
+    recipe = TARGETS[name]
+    print(f"\n━━━ build_from_onnx: {name} ━━━")
+
+    # 1. Pull ONNX (cached by huggingface_hub)
+    onnx_path = _ensure_onnx(recipe["onnx_hf"])
+    print(f"  onnx: {onnx_path}", flush=True)
+
+    # 2. Optional plugin import (SAME-L only — registers samel::diff_attn_swa)
+    if recipe["plugin"]:
+        print(f"  registering Triton SWA plugin...", flush=True)
+        import diff_attn_nocast_plugin  # noqa: F401
+
+    # 3. Build the engine
+    import tensorrt as trt
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    if recipe["network"] == "STRONGLY_TYPED":
+        net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+    else:
+        net_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(net_flags)
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse_from_file(onnx_path):
+        for i in range(parser.num_errors):
+            print(f"  parse error: {parser.get_error(i)}", flush=True)
+        sys.exit(2)
+
+    cfg = builder.create_builder_config()
+    cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, recipe["workspace_gb"] << 30)
+    if "BF16" in recipe["flags"]:
+        cfg.set_flag(trt.BuilderFlag.BF16)
+
+    if recipe["profile"]:
+        profile = builder.create_optimization_profile()
+        for input_name, (lo, opt, hi) in recipe["profile"].items():
+            profile.set_shape(input_name, lo, opt, hi)
+        cfg.add_optimization_profile(profile)
+        print(f"  optimization profile: {len(recipe['profile'])} input(s)", flush=True)
+
+    print(f"  building TRT (workspace {recipe['workspace_gb']} GB"
+          f"{', BF16' if 'BF16' in recipe['flags'] else ''}"
+          f"{', STRONGLY_TYPED' if recipe['network']=='STRONGLY_TYPED' else ''})...", flush=True)
+    t0 = time.time()
+    serialized = builder.build_serialized_network(network, cfg)
+    if serialized is None:
+        print(f"  BUILD FAILED", flush=True)
+        sys.exit(3)
+    print(f"  built in {time.time()-t0:.0f}s ({serialized.nbytes/1e6:.0f} MB)", flush=True)
+
+    # 4. Write .trt under models/<arch>/<engine>/
+    out_dir = arch_dir()
+    target = Path(out_dir) / recipe["trt_local"]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "wb") as f:
+        f.write(serialized)
+    print(f"  wrote {target}", flush=True)
+
+    return str(target)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("\navailable targets:")
+        for k in TARGETS:
+            print(f"  {k}")
+        print("  all")
+        sys.exit(1)
+
+    target = sys.argv[1]
+    if target == "all":
+        for name in TARGETS:
+            build_one(name)
+    elif target in TARGETS:
+        build_one(target)
+    else:
+        print(f"unknown target: {target}")
+        print(f"valid: {list(TARGETS)} + 'all'")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

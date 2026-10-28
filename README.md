@@ -9,6 +9,23 @@
 
 Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined platform for inference and fine-tuning, built on lessons from [stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools). If you're doing foundational research or working with previous Stable Audio models, that repo is still the place to go.
 
+---
+
+> **Fork note — [Taikakim/stable-audio-3](https://github.com/Taikakim/stable-audio-3).** This is a personal research fork. This box and the table directly below are the fork maintainer's addition; the rest of this README is Stable Audio 3's upstream documentation.
+
+## A personal fork — the pipeline it belongs to
+
+This fork is one of three repositories that together form a small pipeline for **controllable** AI music generation:
+
+| Repository | Role |
+|---|---|
+| **[mir-feature-extraction](https://github.com/Taikakim/mir-feature-extraction)** | Extracts musical features from audio (rhythm/beat, loudness, spectral, harmonic, timbral, aesthetic) as the **control targets** everything downstream steers toward. |
+| **[audio-tools-avp](https://github.com/Taikakim/audio-tools-avp)** | Trains the **control** layer: latent-control heads (LatCH) against those features, the FusionOpt optimizer, SAO-Small finetuning, and Stable Audio 3 control adapters. A fork of `stable-audio-tools`. |
+| **stable-audio-3** *(this fork)* | Runs **Stable Audio 3** inference with those controls: LatCH-guided generation, LoRA finetuning, long-form rendering, and experimental samplers. |
+
+**Flow:** `mir-feature-extraction` (measure musical features) → `audio-tools-avp` (train heads/adapters that steer toward them) → **stable-audio-3** (generate, steered). Because the control heads read the same latent space the generator carves, **a feature `mir` can measure becomes a knob you can steer**.
+
+> The fork's own experimental work (SA3 LatCH guidance, long-form rendering, experimental samplers) lives on the **`latch-sa3-phase1`** branch.
 
 ---
 
