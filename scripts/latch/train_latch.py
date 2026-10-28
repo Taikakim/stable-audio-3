@@ -11,6 +11,7 @@
 # Last edited: WINTERMUTE 2026-10-22 -- --val-t-bins (default 10): held-out loss per t-bin each epoch -> val_by_t.jsonl + checkpoint
 # Last edited: WINTERMUTE 2026-10-23 -- --save-every N: ep<N>.pt every N epochs + the last epoch (incl. an early stop)
 # Last edited: WINTERMUTE 2026-10-23 -- --save-resume / --resume-from (full continuation), --step-log / --layer-log (local per-step telemetry), --device
+# Last edited: WINTERMUTE 2026-10-28 -- --log-grad-noise-t: gradient noise per flow-time bin and per model part (default off)
 """Train a LatCH head on SA3 SAME latents.
 
 Phase 1 was AdamW + masked MSE on rectified_flow. This iteration adds the
@@ -238,6 +239,60 @@ def _gn_measure(meter, model, criterion, z_t, t, targets, mask, step, device, us
               f"B_simple {out['grad_noise/b_simple_ema']:.1f} (raw {out['grad_noise/b_simple_raw']:.1f}) "
               f"full-batch cos est {out['grad_noise/cos_fullbatch_est']:.3f}", flush=True)
     return out
+
+
+def _part_of(name):
+    """Model part: inside a block its sub-module (blocks.3.attn / .mlp / .adaLN_mod / .norm1), elsewhere the first two
+    name components (latent_proj.weight, t_embedder.mlp, out_proj.weight). Sum over a block's parts for layers.jsonl's grouping."""
+    c = name.removeprefix("_orig_mod.").split(".")
+    return ".".join(c[:3] if c[0] == "blocks" else c[:2])
+
+
+def _gn_by_t(model, criterion, latents, targets, mask, step, device, use_bf16, nbins, out_path):
+    """Gradient noise resolved by flow time t AND by model part (Kim 2026-10-28: "standard loggables").
+
+    For each of nbins equal t-bins, the step's last micro-batch is re-noised with t drawn inside that bin (fresh noise,
+    RNG forked, p.grad untouched) and split into two halves; each half's mean gradient comes from its own
+    forward+backward. Per part and pooled: cos(g1, g2) (the signal share at half the batch), noise_ratio
+    |g1-g2|^2/|g1+g2|^2, and McCandlish's B_simple = tr(Sigma)/|G|^2 in samples, from the same two-batch-size
+    estimate as GradNoiseMeter (|G|^2 = 2|G_2b|^2 - |G_b|^2, S = 2b(|G_b|^2 - |G_2b|^2)). All parameters, 1-D
+    included. One reading per bin per call is noisy at a half of 4-8 items; average over steps when reading.
+    Cost: 2 x nbins extra forward+backward passes on logged steps."""
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    params = [p for _, p in named]
+    h = latents.shape[0] // 2
+    rec = {"step": int(step), "b_half": h, "bins": []}
+    with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+        for k in range(nbins):
+            t = (k + torch.rand(latents.shape[0], device=device)) / nbins
+            z_t = forward_noise(latents, torch.randn_like(latents), t)
+            halves = []
+            for sl in (slice(0, h), slice(h, 2 * h)):
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    ph = model(z_t[sl], t[sl])
+                lh = criterion(ph.float(), targets[sl], mask[sl])
+                halves.append(torch.autograd.grad(lh, params, allow_unused=True))
+            sums = {}
+            for (n, _), a, b in zip(named, *halves):
+                if a is None or b is None:
+                    continue
+                a, b = a.float(), b.float()
+                s = sums.setdefault(_part_of(n), [0.0, 0.0, 0.0])
+                s[0] += float((a * a).sum()); s[1] += float((b * b).sum()); s[2] += float((a * b).sum())
+            sums["_all"] = [sum(v[i] for v in sums.values()) for i in range(3)]
+
+            def _stats(n11, n22, n12):
+                full = 0.25 * (n11 + n22 + 2 * n12)
+                gb = 0.5 * (n11 + n22)
+                g2, s_est = 2 * full - gb, 2 * h * (gb - full)
+                return {"cos": round(n12 / math.sqrt(max(n11 * n22, 1e-30)), 5),
+                        "noise_ratio": round((n11 + n22 - 2 * n12) / max(n11 + n22 + 2 * n12, 1e-30), 5),
+                        "b_simple": round(s_est / g2, 3) if g2 > 0 else None, "g_norm": round(math.sqrt(max(gb, 0.0)), 6)}
+            rec["bins"].append({"t_lo": k / nbins, "t_hi": (k + 1) / nbins,
+                                "all": _stats(*sums.pop("_all")), "parts": {p: _stats(*v) for p, v in sums.items()}})
+    with open(out_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+    print(f"[grad-noise-t] step {step}: cos by t " + " ".join(f"{b['t_lo']:.1f}:{b['all']['cos']:.2f}" for b in rec["bins"]), flush=True)
 
 
 def _arm_late_modular(opt):
@@ -744,6 +799,9 @@ def train(args):
                     gn_snap = None
                 elif gn_meter is not None and gn_meter.due(step) and z_t.shape[0] >= 2:
                     _gn_measure(gn_meter, model, criterion, z_t, t, targets, mask, step, device, use_bf16)
+                if args.log_grad_noise_t > 0 and step % args.log_grad_noise_t == 0 and latents.shape[0] >= 2:
+                    _gn_by_t(model, criterion, latents, targets, mask, step, device, use_bf16, args.grad_noise_t_bins,
+                             os.path.join(args.save_dir, "grad_noise_by_t.jsonl"))
                 spike_inc, spike_skip, spike_med, spike_r, spike_raw, spike_top = False, False, None, None, None, None
                 if spike_rec is not None:   # raw (pre-clip) norm of the whole step's gradient
                     spike_raw = total_grad_norm(model.parameters())
@@ -1190,6 +1248,11 @@ if __name__ == "__main__":
                    help="every N optimizer steps, split the micro-batch in two halves and log gradient cosine / noise "
                         "scale per matrix to <save-dir>/grad_noise.jsonl (2 extra forward+backward passes on those steps; "
                         "training unchanged). 0 = off. Test plan section N")
+    p.add_argument("--log-grad-noise-t", type=int, default=0,
+                   help="every N optimizer steps, gradient noise per flow-time bin AND per model part (cos of two half-batch "
+                        "gradients, noise ratio, B_simple) -> <save-dir>/grad_noise_by_t.jsonl; 2 x --grad-noise-t-bins extra "
+                        "forward+backward passes on those steps, training unchanged. 0 = off")
+    p.add_argument("--grad-noise-t-bins", type=int, default=5)
     p.add_argument("--mod-ns-batch", action="store_true",
                    help="--optimizer modular: one batched Newton-Schulz call per matrix shape instead of one per matrix (speed)")
     p.add_argument("--log-mom-spectra", type=int, default=0,
