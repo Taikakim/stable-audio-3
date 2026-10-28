@@ -174,3 +174,4 @@ same_*.onnx.data
 *.onnx.data
 dit_*.onnx
 dit_*.onnx.data
+lora_checkpoints/
