@@ -45,7 +45,16 @@ class LatCHDataset(Dataset):
         self.bare_feature = target_feature.removesuffix("_ts")
         self.ts_feature = self.bare_feature + "_ts"
         self.target_source = target_source
-        self.chroma_dir = Path(chroma_dir) if chroma_dir else None
+        if chroma_dir:
+            if isinstance(chroma_dir, (list, tuple)):
+                self.chroma_dirs = [Path(d) for d in chroma_dir]
+            else:
+                _cparts = [s for s in str(chroma_dir).split(",") if s]
+                self.chroma_dirs = [Path(d) for d in _cparts]
+            self.chroma_dir = self.chroma_dirs[0]
+        else:
+            self.chroma_dirs = []
+            self.chroma_dir = None
         self.chroma_key = chroma_key   # which stem's SAME-chroma: other / bass / full_mix
         # Optional per-frame LOSS WEIGHT companion (e.g. f0_{other,bass}_voiced_ts — the
         # crop resampler's pooled VOICED FRACTION, continuous [0,1], not boolean). Melody
@@ -55,8 +64,14 @@ class LatCHDataset(Dataset):
         # feature's existing behavior is untouched: weight is all-ones everywhere.
         self.voiced_field = voiced_field
         self.items = []
-        for _d in self.latent_dirs:
-            self.items.extend(sorted(p for p in _d.glob("*.npy") if p.stem != "silence"))
+        self.chroma_map = {}
+        for idx_dir, _d in enumerate(self.latent_dirs):
+            c_dir = self.chroma_dirs[idx_dir] if idx_dir < len(self.chroma_dirs) else self.chroma_dir
+            for p in sorted(_d.glob("*.npy")):
+                if p.stem != "silence":
+                    self.items.append(p)
+                    if c_dir:
+                        self.chroma_map[p] = c_dir / (p.stem + ".npz")
         if not self.items:
             raise RuntimeError(f"No .npy latents in {latent_dir}")
         self._db = None
@@ -91,12 +106,12 @@ class LatCHDataset(Dataset):
             self.items = kept
         elif target_source == "chroma":
             # SAME-compatible (3,128,T) chroma from a separate per-crop npz (stem-resolved).
-            if self.chroma_dir is None:
+            if not self.chroma_dirs:
                 raise ValueError("target_source='chroma' requires chroma_dir")
-            kept = [p for p in self.items if (self.chroma_dir / (p.stem + ".npz")).exists()]
+            kept = [p for p in self.items if self.chroma_map.get(p, Path("")).exists()]
             if not kept:
                 raise RuntimeError(
-                    f"target_source='chroma' but no <stem>.npz in {self.chroma_dir}")
+                    f"target_source='chroma' but no <stem>.npz in {self.chroma_dirs}")
             self.items = kept
         elif target_source == "scalar_json":
             # Per-crop scalar sidecar (<idx>.TIMBRAL.json: hardness/depth/booming,
@@ -160,7 +175,8 @@ class LatCHDataset(Dataset):
 
     def _load_target(self, npy_path: Path, t_frames: int) -> np.ndarray:
         if self.target_source == "chroma":
-            with np.load(str(self.chroma_dir / (npy_path.stem + ".npz"))) as z:
+            target_path = self.chroma_map.get(npy_path, self.chroma_dir / (npy_path.stem + ".npz"))
+            with np.load(str(target_path)) as z:
                 if self.chroma_key not in z.files:
                     raise ValueError(f"{self.chroma_key} not in chroma npz for {npy_path.stem}")
                 arr = z[self.chroma_key].astype(np.float32)              # (3, 128, T)
