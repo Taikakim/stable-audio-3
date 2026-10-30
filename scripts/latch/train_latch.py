@@ -467,12 +467,20 @@ def train(args):
         latent_dir = _parts if len(_parts) > 1 else args.latent_dir
     if isinstance(latent_dir, list):
         print(f"Multi-root dataset: {len(latent_dir)} corpora {latent_dir}")
+    target_spec = None
+    if args.target_spec:
+        from scripts.latch.mood_targets import load_spec
+        target_spec = load_spec(args.target_spec)
+        if args.standardize:
+            print("[target-spec] the spec already z-scores each channel; --standardize adds one global "
+                  "mean/std on top (harmless, but not needed)")
     ds = LatCHDataset(latent_dir, target_feature=args.feature,
                       db_path=args.db_path, target_source=args.target_source,
                       chroma_dir=args.chroma_dir, chroma_key=args.chroma_key,
-                      voiced_field=args.voiced_field)
+                      voiced_field=args.voiced_field, target_spec=target_spec)
     print(f"Dataset: {len(ds)} crops, target_source={args.target_source}, feature={args.feature}"
-          + (f", voiced_field={args.voiced_field}" if args.voiced_field else ""))
+          + (f", voiced_field={args.voiced_field}" if args.voiced_field else "")
+          + (f", target_spec={target_spec['names']}" if target_spec else ""))
     sample_latent, sample_target, _ = ds[0]
     out_channels = sample_target.shape[0]
 
@@ -502,6 +510,9 @@ def train(args):
         train_ds = Subset(ds, tr_idx)
     else:
         train_ds, tr_idx = ds, list(range(len(ds)))
+    if target_spec is not None:
+        from scripts.latch.mood_targets import check_split
+        check_split(target_spec, ds.items, tr_idx, args.val_frac, args.val_seed, args.val_group_by)
 
     rec_sampler = None
     if args.flight_recorder or args.skip_spike_ratio > 0:
@@ -1007,6 +1018,9 @@ def train(args):
                 "target_source": args.target_source,
                 "chroma_dir": args.chroma_dir,
                 "chroma_key": args.chroma_key,
+                # mood/VA heads: tags, transform and train-split stats needed to turn a UI value
+                # ("dark +2 SD") into a target at inference (scripts/latch/mood_targets.py)
+                "target_spec": target_spec,
                 "db_path": args.db_path,
                 "noise_schedule": "rectified_flow",
                 "loss_type": loss_type,
@@ -1088,6 +1102,11 @@ if __name__ == "__main__":
     p.add_argument("--chroma-dir", default=None,
                    help="dir of per-crop <stem>.npz SAME-chroma (3,128,T); enables --target-source chroma")
     p.add_argument("--chroma-key", default="other", help="which stem's chroma: other / bass / full_mix")
+    p.add_argument("--target-spec", default=None,
+                   help="JSON from scripts/latch/mood_census.py (mood_spec.json / va_spec.json): selects "
+                        "channels of a multi-channel npz field, logit/z-transforms them with the census's "
+                        "train-split stats and smooths over time. Needs --target-source npz and the "
+                        "SAME latent dirs and --val-* settings the census used (checked). Saved in the ckpt.")
     p.add_argument("--voiced-field", default=None,
                    help="npz field carrying a per-frame [0,1] loss WEIGHT, pooled-voiced-fraction "
                         "convention (e.g. f0_other_voiced_ts for --feature f0_other). Melody/pitch "
