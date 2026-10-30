@@ -160,7 +160,15 @@ class LatCHDataset(Dataset):
             val = None
             if meta.exists():
                 try:
-                    val = json.loads(meta.read_text()).get(group_by)
+                    d = json.loads(meta.read_text())
+                    if group_by == "song":
+                        # Augmented corpora (latents_avp) give every pitch/tempo variant its
+                        # own source_track ("Song/pitch+1"); grouping on that leaks the val
+                        # songs' variants into train. parent_track names the real song; plain
+                        # crops have no parent_track and fall back to source_track.
+                        val = d.get("parent_track") or d.get("source_track")
+                    else:
+                        val = d.get(group_by)
                 except Exception:
                     val = None
             if val is None:
