@@ -65,6 +65,13 @@ class LatCHDataset(Dataset):
         self.voiced_field = voiced_field
         self.items = []
         self.chroma_map = {}
+        # One chroma dir per latent root, in the same order. Corpora reuse crop names
+        # (000000.npy in goa AND avp), so a shared chroma dir pairs the second root's crops
+        # with the first root's targets without any error (KUANG 2026-10-30).
+        if self.chroma_dirs and len(self.latent_dirs) > 1 and len(self.chroma_dirs) != len(self.latent_dirs):
+            raise ValueError(
+                f"{len(self.latent_dirs)} latent dirs but {len(self.chroma_dirs)} chroma dirs: pass one "
+                f"chroma dir per latent dir, in the same order")
         for idx_dir, _d in enumerate(self.latent_dirs):
             c_dir = self.chroma_dirs[idx_dir] if idx_dir < len(self.chroma_dirs) else self.chroma_dir
             for p in sorted(_d.glob("*.npy")):
@@ -112,6 +119,15 @@ class LatCHDataset(Dataset):
             if not kept:
                 raise RuntimeError(
                     f"target_source='chroma' but no <stem>.npz in {self.chroma_dirs}")
+            # __getitem__ skips any item that fails to load, so a chroma dir that lacks
+            # chroma_key would silently drop that whole corpus. Check one file per dir here.
+            for c_dir in self.chroma_dirs:
+                first = next((self.chroma_map[p] for p in kept if self.chroma_map[p].parent == c_dir), None)
+                if first is None:
+                    continue
+                with np.load(str(first)) as z:
+                    if self.chroma_key not in z.files:
+                        raise ValueError(f"chroma key {self.chroma_key!r} not in {first} (has {z.files})")
             self.items = kept
         elif target_source == "scalar_json":
             # Per-crop scalar sidecar (<idx>.TIMBRAL.json: hardness/depth/booming,
