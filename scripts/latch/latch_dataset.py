@@ -33,7 +33,7 @@ class LatCHDataset(Dataset):
     def __init__(self, latent_dir, target_feature: str = "rms_energy_bass",
                  db=None, db_path: Optional[str] = None, target_source: str = "db",
                  chroma_dir: Optional[str] = None, chroma_key: str = "other",
-                 voiced_field: Optional[str] = None):
+                 voiced_field: Optional[str] = None, mood_dir: Optional[str] = None):
         # multi-root: accept a single dir (str/Path) OR a list of dirs — glob each and
         # concatenate the FULL-PATH item lists. Each item carries its own absolute path, so
         # the 000000.* stem COLLISION between corpora (goa + avp) is sidestepped and all the
@@ -45,6 +45,7 @@ class LatCHDataset(Dataset):
         self.bare_feature = target_feature.removesuffix("_ts")
         self.ts_feature = self.bare_feature + "_ts"
         self.target_source = target_source
+        self.mood_dir = Path(mood_dir) if mood_dir else None
         if chroma_dir:
             if isinstance(chroma_dir, (list, tuple)):
                 self.chroma_dirs = [Path(d) for d in chroma_dir]
@@ -134,6 +135,15 @@ class LatCHDataset(Dataset):
                     f"target_source='scalar_json' but no *.TIMBRAL.json with "
                     f"'{self.bare_feature}' in {latent_dir}")
             self.items = kept
+        elif target_source == "mood":
+            # Per-crop (56, T) mood target stored as <stem>.npy in mood_dir
+            if not self.mood_dir:
+                raise ValueError("target_source='mood' requires mood_dir")
+            kept = [p for p in self.items if (self.mood_dir / (p.stem + ".npy")).exists()]
+            if not kept:
+                raise RuntimeError(
+                    f"target_source='mood' but no <stem>.npy in {self.mood_dir}")
+            self.items = kept
         else:
             raise ValueError(f"unknown target_source={target_source!r}")
 
@@ -194,6 +204,10 @@ class LatCHDataset(Dataset):
             import json as _json
             v = _json.load(open(npy_path.with_suffix(".TIMBRAL.json")))[self.bare_feature]
             return build_target("constant", float(v), t_frames)
+        if self.target_source == "mood":
+            target_path = self.mood_dir / (npy_path.stem + ".npy")
+            arr = np.load(str(target_path)).astype(np.float32)  # (56, T)
+            return resample_target(arr, t_frames)
         if self.target_source == "npz":
             with np.load(str(npy_path.with_suffix(".TIMESERIES.npz"))) as z:
                 if self.ts_feature not in z.files:

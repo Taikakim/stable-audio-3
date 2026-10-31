@@ -470,7 +470,7 @@ def train(args):
     ds = LatCHDataset(latent_dir, target_feature=args.feature,
                       db_path=args.db_path, target_source=args.target_source,
                       chroma_dir=args.chroma_dir, chroma_key=args.chroma_key,
-                      voiced_field=args.voiced_field)
+                      voiced_field=args.voiced_field, mood_dir=args.mood_dir)
     print(f"Dataset: {len(ds)} crops, target_source={args.target_source}, feature={args.feature}"
           + (f", voiced_field={args.voiced_field}" if args.voiced_field else ""))
     sample_latent, sample_target, _ = ds[0]
@@ -1088,6 +1088,8 @@ if __name__ == "__main__":
     p.add_argument("--chroma-dir", default=None,
                    help="dir of per-crop <stem>.npz SAME-chroma (3,128,T); enables --target-source chroma")
     p.add_argument("--chroma-key", default="other", help="which stem's chroma: other / bass / full_mix")
+    p.add_argument("--mood-dir", default=None,
+                   help="dir of per-crop <stem>.npy mood targets (56,T); enables --target-source mood")
     p.add_argument("--voiced-field", default=None,
                    help="npz field carrying a per-frame [0,1] loss WEIGHT, pooled-voiced-fraction "
                         "convention (e.g. f0_other_voiced_ts for --feature f0_other). Melody/pitch "
@@ -1095,11 +1097,12 @@ if __name__ == "__main__":
                         "directly -- weighting by voiced fraction rather than hard-masking is the "
                         "settled design (SAO WORKLOG 2026-08-13). Only target_source=npz honors this; "
                         "default None = every other feature's loss is byte-identical to before.")
-    p.add_argument("--target-source", choices=["db", "npz", "chroma", "scalar_json"], default="npz",
+    p.add_argument("--target-source", choices=["db", "npz", "chroma", "scalar_json", "mood"], default="npz",
                    help="npz = <stem>.TIMESERIES.npz companions (latents_sa3, medium grid); "
                         "db = legacy per-crop TimeseriesDB (small-music-base / phase 1); "
                         "scalar_json = constant target from <stem>.TIMBRAL.json "
-                        "(--feature hardness/depth/booming, pooled-readout head).")
+                        "(--feature hardness/depth/booming, pooled-readout head); "
+                        "mood = <stem>.npy 56-dim continuous mood targets from --mood-dir.")
     # Training loop
     p.add_argument("--val-frac", type=float, default=0.0,
                    help="fraction of GROUPS (source tracks) held out for validation. 0 (default) "
