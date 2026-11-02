@@ -94,3 +94,37 @@ def chroma_loss_rung3_softdtw(*a, **kw):  # pragma: no cover
     raise NotImplementedError(
         "windowed soft-DTW: build only if rung 1/2 fail Kim's ear "
         "(docs/chroma-phase-tolerant-matching.md §3)")
+
+
+# ── rotation-invariant cosine: a chord SHAPE in whatever key the render is in ─────
+# EXPERIMENTS E22 (Kim 2026-10-29: "a [chroma steer] which does not [shift the root], forcing it to be more
+# creative"). The TARGET is rotated through the 12 transpositions and the loss is a soft minimum over them,
+# so the gradient pulls toward the NEAREST transposition of the requested shape instead of a fixed root.
+# Well-posed only for heads that are transposition-equivariant (E21b/E21c: hpcp, the E13 same_chroma head).
+# Layout: C == 12 (hpcp-style, integer roll) or C == 3*128 (SAME 3-band chroma, fractional roll of
+# 128/12 bins per semitone within each band, all bands together). The target is constant, so rolling it
+# needs no gradient; pred is untouched. Shapes (B, C, T), as LatCH heads emit. (CONTINUITY 2026-10-29)
+def _roll_target(target: torch.Tensor, semis: int) -> torch.Tensor:
+    B, C, T = target.shape
+    if C == 12:
+        return torch.roll(target, semis, dims=1)
+    if C % 3 == 0 and C // 3 == 128:
+        x = target.reshape(B, 3, 128, T)
+        s = semis * 128.0 / 12.0
+        lo = int(s // 1)
+        a = s - lo
+        out = (1.0 - a) * torch.roll(x, lo, dims=2) + a * torch.roll(x, lo + 1, dims=2)
+        return out.reshape(B, C, T)
+    raise ValueError(f"rotation-invariant chroma loss needs C=12 or C=384, got {C}")
+
+
+def chroma_loss_rotinv(pred: torch.Tensor, target: torch.Tensor, tau: float = 0.05) -> torch.Tensor:
+    """Soft-min over the 12 transpositions of the per-frame cosine loss. tau -> 0 is a hard min."""
+    p = pred / (pred.norm(dim=1, keepdim=True) + 1e-8)
+    losses = []
+    for r in range(12):
+        t = _roll_target(target, r)
+        t = t / (t.norm(dim=1, keepdim=True) + 1e-8)
+        losses.append((1.0 - (p * t).sum(dim=1)).mean())
+    L = torch.stack(losses)
+    return -tau * torch.logsumexp(-L / tau, dim=0)

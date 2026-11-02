@@ -44,6 +44,12 @@ def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
             t = target / (target.norm(dim=1, keepdim=True) + 1e-8)
             return (1.0 - (p * t).sum(dim=1)).mean()
         return _cos
+    if loss_type == "cosine_rotinv":
+        # EXPERIMENTS E22: steer a chord SHAPE in whatever key the render is in (soft-min over the 12
+        # transpositions of the target). huber_beta doubles as the soft-min temperature (default 0.05).
+        from .chroma_losses import chroma_loss_rotinv
+        _tau = 0.05 if huber_beta in (None, 1.0) else float(huber_beta)
+        return lambda pred, target: chroma_loss_rotinv(pred, target, tau=_tau)
     if loss_type == "smooth_l1":
         return torch.nn.SmoothL1Loss(beta=float(huber_beta or 1.0))
     if loss_type == "mse":
