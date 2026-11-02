@@ -239,6 +239,14 @@ def build_crop_timeseries(timeseries_root: Path | None, track_folder: Path, trac
         return None
 
 
+def _savez_atomic(npz_path: Path, arrays: dict):
+    """Write beside the target, then rename over it: an interrupted --companion-only run (or a
+    trainer reading the corpus meanwhile) never sees a half-written companion. KUANG 2026-10-30."""
+    tmp = npz_path.with_name(npz_path.name + ".partial.npz")
+    np.savez(tmp, **arrays)
+    os.replace(tmp, npz_path)
+
+
 def rebuild_companions(out_dir: Path, timeseries_root: Path | None,
                        fields: set | None = None, additive: bool = False):
     """--companion-only: rebuild the <idx>.TIMESERIES.npz beside existing <idx>.npy latents, from
@@ -289,12 +297,12 @@ def rebuild_companions(out_dir: Path, timeseries_root: Path | None,
             with np.load(npz_path) as z:
                 merged = {k: z[k] for k in z.files}      # preserve ALL existing fields
             merged.update(ts)                            # add/overwrite only the whitelisted new ones
-            np.savez(npz_path, **merged)
+            _savez_atomic(npz_path, merged)
         else:
             rp0, rp1 = info.get("relative_position_start"), info.get("relative_position_end")
             if rp0 is not None and rp1 is not None:      # re-add exactly as the full path does
                 ts["relative_position_ts"] = np.linspace(float(rp0), float(rp1), LATENT_FRAMES, dtype=np.float32)
-            np.savez(npz_path, **ts)
+            _savez_atomic(npz_path, ts)
         n_ok += 1
         if n_ok % 200 == 0:
             print(f"  {n_ok} companions written", flush=True)

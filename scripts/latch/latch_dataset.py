@@ -33,7 +33,7 @@ class LatCHDataset(Dataset):
     def __init__(self, latent_dir, target_feature: str = "rms_energy_bass",
                  db=None, db_path: Optional[str] = None, target_source: str = "db",
                  chroma_dir: Optional[str] = None, chroma_key: str = "other",
-                 voiced_field: Optional[str] = None, mood_dir: Optional[str] = None):
+                 voiced_field: Optional[str] = None, mood_dir: Optional[str] = None, target_spec=None):
         # multi-root: accept a single dir (str/Path) OR a list of dirs — glob each and
         # concatenate the FULL-PATH item lists. Each item carries its own absolute path, so
         # the 000000.* stem COLLISION between corpora (goa + avp) is sidestepped and all the
@@ -64,8 +64,26 @@ class LatCHDataset(Dataset):
         # the settled design (SAO WORKLOG 2026-08-13, W+F+Kim). None (default) = every other
         # feature's existing behavior is untouched: weight is all-ones everywhere.
         self.voiced_field = voiced_field
+        # Optional mood / valence-arousal target spec (scripts/latch/mood_targets.py): channel
+        # selection + logit/z transform + smoothing of a multi-channel .TIMESERIES.npz field.
+        if isinstance(target_spec, (str, Path)):
+            from scripts.latch.mood_targets import load_spec
+            target_spec = load_spec(target_spec)
+        self.target_spec = target_spec
+        if target_spec is not None:
+            if target_source != "npz":
+                raise ValueError("target_spec needs target_source='npz'")
+            if target_spec["field"] != self.ts_feature:
+                raise ValueError(f"target spec is for {target_spec['field']!r}, feature is {self.ts_feature!r}")
         self.items = []
         self.chroma_map = {}
+        # One chroma dir per latent root, in the same order. Corpora reuse crop names
+        # (000000.npy in goa AND avp), so a shared chroma dir pairs the second root's crops
+        # with the first root's targets without any error (KUANG 2026-10-30).
+        if self.chroma_dirs and len(self.latent_dirs) > 1 and len(self.chroma_dirs) != len(self.latent_dirs):
+            raise ValueError(
+                f"{len(self.latent_dirs)} latent dirs but {len(self.chroma_dirs)} chroma dirs: pass one "
+                f"chroma dir per latent dir, in the same order")
         for idx_dir, _d in enumerate(self.latent_dirs):
             c_dir = self.chroma_dirs[idx_dir] if idx_dir < len(self.chroma_dirs) else self.chroma_dir
             for p in sorted(_d.glob("*.npy")):
@@ -90,20 +108,28 @@ class LatCHDataset(Dataset):
             # requested voiced_field, if any -- same fail-loud convention as the target
             # field itself: a crop silently falling back to weight=1 would hide unweighted
             # items in a mixed corpus rather than surfacing them at dataset-build time).
-            kept = []
+            # The target field itself is checked too (KUANG 2026-10-30): a companion without it
+            # used to pass here and then fail in __getitem__, which silently substitutes the next
+            # item -- e.g. the crops whose track never got the expanded mood fields.
+            kept, n_no_field = [], 0
             for p in self.items:
                 npz = p.with_suffix(".TIMESERIES.npz")
                 if not npz.exists():
                     continue
-                if self.voiced_field is not None:
-                    with np.load(str(npz)) as z:
-                        if self.voiced_field not in z.files:
-                            continue
+                with np.load(str(npz)) as z:
+                    if self.ts_feature not in z.files:
+                        n_no_field += 1
+                        continue
+                    if self.voiced_field is not None and self.voiced_field not in z.files:
+                        continue
                 kept.append(p)
             if not kept:
                 raise RuntimeError(
                     f"target_source='npz' but no *.TIMESERIES.npz companions in {latent_dir} "
                     f"with the requested field(s)")
+            if n_no_field:
+                print(f"[LatCHDataset] {n_no_field} crops have a companion without {self.ts_feature}; "
+                      f"left out ({len(kept)} kept)")
             self.items = kept
         elif target_source == "chroma":
             # SAME-compatible (3,128,T) chroma from a separate per-crop npz (stem-resolved).
@@ -113,6 +139,15 @@ class LatCHDataset(Dataset):
             if not kept:
                 raise RuntimeError(
                     f"target_source='chroma' but no <stem>.npz in {self.chroma_dirs}")
+            # __getitem__ skips any item that fails to load, so a chroma dir that lacks
+            # chroma_key would silently drop that whole corpus. Check one file per dir here.
+            for c_dir in self.chroma_dirs:
+                first = next((self.chroma_map[p] for p in kept if self.chroma_map[p].parent == c_dir), None)
+                if first is None:
+                    continue
+                with np.load(str(first)) as z:
+                    if self.chroma_key not in z.files:
+                        raise ValueError(f"chroma key {self.chroma_key!r} not in {first} (has {z.files})")
             self.items = kept
         elif target_source == "scalar_json":
             # Per-crop scalar sidecar (<idx>.TIMBRAL.json: hardness/depth/booming,
@@ -213,6 +248,9 @@ class LatCHDataset(Dataset):
                 if self.ts_feature not in z.files:
                     raise ValueError(f"{self.ts_feature} not in {npy_path.stem}.TIMESERIES.npz")
                 arr = z[self.ts_feature]
+            if self.target_spec is not None:
+                from scripts.latch.mood_targets import apply_spec
+                arr = apply_spec(arr, self.target_spec)                  # (C_out, T)
             return resample_target(arr, t_frames)
         arrays = self._db.get(npy_path.stem)
         if arrays is None or arrays.get(self.ts_feature) is None:
