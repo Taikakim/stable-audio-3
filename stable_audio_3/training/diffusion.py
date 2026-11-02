@@ -1117,7 +1117,10 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
             **get_lora_state_dict(self.diffusion.conditioner),
             **{k: v for k, v in self.diffusion.model.state_dict().items() if "modular_local_embeds" in k}
         }
-        save_lora_safetensors(state_dict, self.lora_config, path)
+        # Pass the model so dora-* row norms are baked in at save time; see
+        # get_dora_norm_state_dict. Cheap, and it spares loaders a base-model load.
+        save_lora_safetensors(state_dict, self.lora_config, path,
+                              model=[self.diffusion.model, self.diffusion.conditioner])
 
     def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
         """Arm FusionOpt's per-component telemetry for this step (if logging interval is hit).

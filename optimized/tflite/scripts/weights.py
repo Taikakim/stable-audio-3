@@ -1,0 +1,272 @@
+"""Shared weights manifest + downloader.
+
+Maps every TFLite / LiteRT model file the runtime needs to its position in the
+`stabilityai/stable-audio-3-optimized` HuggingFace repo (under `tflite/…`).
+
+`install.py` calls `ensure_local` upfront for the bundles the user picks.
+`sa3_tflite.py` calls `ensure_local` lazily, just before each model loads — so
+a fresh checkout with no weights still works if the user is willing to wait for
+the first run to download them.
+
+The SentencePiece tokenizer is BUNDLED at models/tokenizer.model (the .tflite
+T5Gemma is encoder-only), so it's not in this manifest.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+REPO_ID = "stabilityai/stable-audio-3-optimized"
+# weights.py lives in <project>/scripts/; SCRIPT_DIR points at the project
+# root so the local rel paths in the manifest ("models/tflite/foo.tflite")
+# resolve against the actual project layout.
+SCRIPT_DIR = Path(__file__).resolve().parent.parent
+
+
+# Bundles the install script offers to the user. Each maps to a list of
+# model files (local relative path on the left, HF repo path on the right).
+# T5Gemma is in SHARED because every bundle needs it. All three families ship
+# the SAME-S codec by default (medium's latents decode fine on SAME-S — ~7x
+# faster and ~5x smaller than SAME-L, which lazy-downloads if asked). Each ships
+# at its runtime default precision — all three DiTs now ship the cache-safe rung
+# w8a8 (int8); SAME codec w8a8 (quality-free and ~5x smaller). Any other tier
+# (fp32, etc.) lazy-downloads on demand.
+
+DIT_BUNDLES: dict[str, list[tuple[str, str]]] = {
+    "sm-music": [
+        ("models/tflite/sa3-sm-music/dit_w8a8.tflite", "tflite/sa3-sm-music/dit_w8a8.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
+    ],
+    "sm-sfx": [
+        ("models/tflite/sa3-sm-sfx/dit_w8a8.tflite",   "tflite/sa3-sm-sfx/dit_w8a8.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
+    ],
+    "medium": [
+        ("models/tflite/sa3-m/dit_w8a8.tflite",        "tflite/sa3-m/dit_w8a8.tflite"),
+        ("models/tflite/same-s/enc_w8a8.tflite",       "tflite/same-s/enc_w8a8.tflite"),
+        ("models/tflite/same-s/dec_w8a8.tflite",       "tflite/same-s/dec_w8a8.tflite"),
+    ],
+}
+
+SHARED: list[tuple[str, str]] = [
+    ("models/tflite/t5gemma/encoder_fp16.tflite", "tflite/t5gemma/encoder_fp16.tflite"),
+]
+
+# Human-friendly bundle sizes (for the install prompt). Exact, from HF metadata.
+BUNDLE_SIZES = {
+    "sm-music": "0.7 GB  (small music DiT w8a8 + SAME-S codec w8a8)",
+    "sm-sfx":   "0.7 GB  (small sfx DiT w8a8 + SAME-S codec w8a8)",
+    "medium":   "1.8 GB  (medium DiT w8a8 + SAME-S codec w8a8)",
+}
+# T5Gemma (shared, fp16) adds ~0.6 GB the first time any bundle is fetched.
+
+# DiT precision tiers are PER-FAMILY. ALL THREE DiTs now ship as static RUNG ladders — exactly two files
+# each, dit_fp32.tflite + dit_w8a8.tflite, built from stable_audio_3.models.dit by build/build_dit.sh
+# (medium) / build/build_dit_small.sh (sm-music, sm-sfx) and merged into one weight-shared multi-signature
+# .tflite (needs litert >= 2.2.0, like the SAME rungs), so RAM stays flat across length. medium's ladder tops
+# at 4096 (380 s); the small DiTs' ladder tops at 1292 (their 2-min max). The old varlen tiers
+# (fp32/w16a32/w8a32/w8a8-dyn) are retired to tflite/sa3-*/legacy/. NB: int8 on the DiT is NOT bit-identical
+# (the distilled few-step sampler is chaotically sensitive, so w8a8 is a different — not necessarily worse —
+# sample); it supersedes the old published w8a8-dyn. w8a8 is the default for every family (CJ's calls:
+# 2026-10-09 medium, 2026-10-10 small); fp32 lazy-downloads for LoRA merges or a bit-exact A/B. wXaY =
+# weight/activation bits ("16" = fp16).
+DIT_PRECISIONS_BY_FAMILY = {
+    "medium":   ("fp32", "w8a8"),
+    "sm-music": ("fp32", "w8a8"),
+    "sm-sfx":   ("fp32", "w8a8"),
+}
+DIT_SUBDIR = {"sm-music": "sa3-sm-music", "sm-sfx": "sa3-sm-sfx", "medium": "sa3-m"}
+# Union across families — what --precision / --dit-precision may name (validated per-family at load).
+DIT_PRECISIONS = tuple(dict.fromkeys(p for ps in DIT_PRECISIONS_BY_FAMILY.values() for p in ps))
+# The SAME autoencoder ships as static RUNG models (need litert >= 2.2.0) with just TWO tiers:
+# fp32 and w8a8. The codec runs once on a fixed latent, so int8 is quality-free on the round-trip —
+# w16a32 / w8a32 add no audible quality and are bigger/slower, so they're retired to
+# tflite/same-*/legacy/ (with the pre-rung varlen models). w8a8 is the recommended codec default.
+CODEC_PRECISIONS = ("fp32", "w8a8")
+PRECISIONS = DIT_PRECISIONS   # what --precision accepts (a global; the codec maps it via _codec_of)
+
+
+def dit_rel(dit: str, precision: str = "fp32") -> str:
+    """Local rel path of a DiT model file for (family, precision)."""
+    return f"models/tflite/{DIT_SUBDIR[dit]}/dit_{precision}.tflite"
+
+
+def dit_precisions(dit: str) -> tuple[str, ...]:
+    """Precision tiers available for a DiT family (medium = rung fp32/w8a8; small = varlen tiers)."""
+    return DIT_PRECISIONS_BY_FAMILY[dit]
+
+
+def dec_rel(dec: str, precision: str = "w8a8") -> str:
+    """Local rel path of a SAME codec DECODER rung file for (codec, precision∈CODEC_PRECISIONS).
+    These are static multi-signature rung models (litert>=2.2.0); driven by rung_decoder.RungDecoder."""
+    return f"models/tflite/{dec}/dec_{precision}.tflite"
+
+
+def enc_rel(dec: str, precision: str = "w8a8") -> str:
+    """Local rel path of a SAME codec ENCODER rung file for (codec, precision∈CODEC_PRECISIONS).
+    Static multi-signature rung model (litert>=2.2.0); driven by rung_encoder.RungEncoder."""
+    return f"models/tflite/{dec}/enc_{precision}.tflite"
+
+# Flat (local_rel_path → hf_path) lookup — used by sa3_tflite.py for lazy
+# auto-download at load time.
+FLAT_MANIFEST: dict[str, str] = {}
+for _items in DIT_BUNDLES.values():
+    for _rel, _hf in _items:
+        FLAT_MANIFEST[_rel] = _hf
+for _rel, _hf in SHARED:
+    FLAT_MANIFEST[_rel] = _hf
+for _fam, _precs in DIT_PRECISIONS_BY_FAMILY.items():   # every DiT tier (medium rung w8a8 + small varlen)
+    for _prec in _precs:
+        _rel = dit_rel(_fam, _prec)
+        FLAT_MANIFEST.setdefault(_rel, _rel.replace("models/tflite/", "tflite/", 1))  # don't clobber the bundle's entry
+for _prec in CODEC_PRECISIONS:                     # SAME-AE rung tiers (fp32 + w8a8) for both codecs
+    for _dec in ("same-s", "same-l"):
+        for _rel in (dec_rel(_dec, _prec), enc_rel(_dec, _prec)):
+            FLAT_MANIFEST[_rel] = _rel.replace("models/tflite/", "tflite/", 1)
+
+
+def _hf_token_configured() -> bool:
+    """True if any HF token is set — env var or cached login on disk."""
+    import os
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return True
+    try:
+        from huggingface_hub import get_token  # huggingface_hub ≥ 0.19
+        return bool(get_token())
+    except ImportError:
+        try:
+            from huggingface_hub import HfFolder
+            return bool(HfFolder.get_token())
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+_LOGIN_TIP_SHOWN = False
+_LINK_FALLBACK_SHOWN = False
+
+
+def _link_or_copy(cached: Path, target: Path) -> None:
+    """Expose the HF-cached file at `target`: symlink → hardlink → copy.
+
+    A symlink keeps the HF cache canonical (one copy on disk) and is used
+    wherever possible. On Windows, creating symlinks requires Developer Mode
+    or admin rights (WinError 1314), so fall back to a hardlink (privilege-
+    free and zero-copy, but same-volume only), then to a plain copy (works
+    everywhere, at the cost of a second copy on disk). Unlike a symlink, a
+    hardlink/copy won't track future HF-cache updates — acceptable, because
+    downloads are content-addressed: a changed file resolves to a new cache
+    path, and `ensure_local` only ever links each target once.
+    """
+    global _LINK_FALLBACK_SHOWN
+    try:
+        target.symlink_to(cached)
+        return
+    except OSError:
+        pass
+    import os
+    import shutil
+    try:
+        os.link(cached, target)   # hardlink: no privilege needed, same volume only
+        mode = "hardlink"
+    except OSError:
+        shutil.copy2(cached, target)
+        mode = "copy"
+    if not _LINK_FALLBACK_SHOWN:
+        _LINK_FALLBACK_SHOWN = True
+        print(f"  (symlinks unavailable on this system — materialized as a {mode} instead)")
+
+
+def _show_hf_login_tip_once() -> None:
+    """Print a one-time login suggestion if no HF token is configured.
+
+    Anonymous downloads work but have a ~50 GB/day soft cap on HF's LFS CDN
+    and lower aggregate bandwidth — a free token effectively removes both.
+    Stays silent if a token is already in place.
+    """
+    global _LOGIN_TIP_SHOWN
+    if _LOGIN_TIP_SHOWN:
+        return
+    _LOGIN_TIP_SHOWN = True
+    if _hf_token_configured():
+        return
+    import sys
+    YEL  = "\033[1;33m" if sys.stdout.isatty() else ""
+    BOLD = "\033[1m"    if sys.stdout.isatty() else ""
+    DIM  = "\033[2m"    if sys.stdout.isatty() else ""
+    RST  = "\033[0m"    if sys.stdout.isatty() else ""
+    print()
+    print(f"  {YEL}⚠  not logged in to HuggingFace{RST} — anonymous downloads work but are")
+    print(f"     rate-limited (~50 GB/day cap on the LFS CDN). For faster, higher-limit")
+    print(f"     downloads, log in once with a free read-only token:")
+    print()
+    print(f"       1. create an account at {BOLD}https://huggingface.co/join{RST}")
+    print(f"       2. generate a token at {BOLD}https://huggingface.co/settings/tokens{RST}")
+    print(f"          {DIM}('Read' scope is enough){RST}")
+    print(f"       3. save it on this machine — pick one:")
+    print(f"            {BOLD}hf auth login{RST}              {DIM}# modern (huggingface_hub ≥ 1.0){RST}")
+    print(f"            {BOLD}huggingface-cli login{RST}      {DIM}# classic; still works{RST}")
+    print(f"            {BOLD}export HF_TOKEN=hf_xxx{RST}     {DIM}# one-off / scripts{RST}")
+    print()
+
+
+def ensure_local(local_rel_path: str, verbose: bool = True) -> Path:
+    """Resolve a model file to an absolute local path, downloading if missing.
+
+    Files are streamed into the HuggingFace cache (~/.cache/huggingface/hub/)
+    and symlinked into the project at `local_rel_path` so the on-disk layout
+    looks the same whether the file was bundled or downloaded.
+    """
+    target = SCRIPT_DIR / local_rel_path
+    if target.exists() or target.is_symlink():
+        return target
+
+    if local_rel_path not in FLAT_MANIFEST:
+        raise FileNotFoundError(
+            f"{local_rel_path} is not in the weights manifest — can't auto-download."
+        )
+
+    # First-download tip: nudge users toward logging in to HF for better limits.
+    # No-op if a token is already configured.
+    _show_hf_login_tip_once()
+
+    hf_filename = FLAT_MANIFEST[local_rel_path]
+    if verbose:
+        print(f"  ↓ downloading {hf_filename}  (from {REPO_ID})")
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise RuntimeError(
+            "huggingface_hub is required to auto-download weights.\n"
+            "Run:  pip install huggingface_hub\n"
+            "Or run the install.py script in this directory."
+        ) from e
+
+    cached = hf_hub_download(repo_id=REPO_ID, filename=hf_filename)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Expose the file at the project-relative path the runtime expects.
+    # Symlink when possible (keeps the HF cache canonical — one copy on disk);
+    # falls back to hardlink → copy on systems without symlink privileges
+    # (Windows without Developer Mode). The `exists() or is_symlink()`
+    # early-exits above and in is_present() are satisfied by every mode.
+    if target.is_symlink():
+        target.unlink()
+    _link_or_copy(Path(cached), target)
+    return target
+
+
+def is_present(local_rel_path: str) -> bool:
+    """True if the file exists locally (does not trigger a download)."""
+    p = SCRIPT_DIR / local_rel_path
+    return p.exists() or p.is_symlink()
+
+
+def bundle_status(bundle: str) -> tuple[int, int]:
+    """Returns (present_count, total_count) for the bundle (including SHARED)."""
+    items = DIT_BUNDLES[bundle] + SHARED
+    present = sum(1 for rel, _ in items if is_present(rel))
+    return present, len(items)
