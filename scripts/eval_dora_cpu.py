@@ -1,4 +1,5 @@
 #!/home/kim/Projects/SAO/stable-audio-3/.venv/bin/python
+# Last edited: THE-FINN 2026-11-03 — paths updated for the __theme sorting of sa3_lora_runs and latch_sweep
 """eval_dora_cpu.py — ALL-CPU audition-render harness for the SA3 DoRA finetune.
 
 Auditions DoRA checkpoints from scripts/train_lora.py (adapter_type=dora-rows,
@@ -41,7 +42,7 @@ Usage
 
     # loop every checkpoint in a run (skips ones already rendered); --watch to poll
     $VENV scripts/eval_dora_cpu.py \
-        --run-dir /run/media/kim/Mantu/sa3_lora_runs/sa3-goa-dora-47s \
+        --run-dir /run/media/kim/Mantu/sa3_lora_runs/__finetunes/sa3-goa-dora-47s \
         --out-dir renders_dora --watch
 
     # base model sanity (no DoRA)

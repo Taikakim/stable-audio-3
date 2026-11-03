@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Last edited: THE-FINN 2026-11-03 — paths updated for the __theme sorting of sa3_lora_runs and latch_sweep
 """Direct weight-space check: does merge_adapters() bake in the CURRENT set_lora_strength(w),
 or does it silently merge as if w=1 regardless (WINTERMUTE's review point 1, 13e)?
 
@@ -18,7 +19,7 @@ import torch.nn.utils.parametrize as P
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from demo_cfg_sweep import merge_adapters  # noqa: E402
 
-ADAPTER = "/run/media/kim/Mantu/sa3_lora_runs/goa3_avp_r128_shampoo_b16_3e4_2026-09-25/slim_adapter_x_step3804.pt"
+ADAPTER = "/run/media/kim/Mantu/sa3_lora_runs/__finetunes/goa3_avp_r128_shampoo_b16_3e4_2026-09-25/slim_adapter_x_step3804.pt"
 
 
 def check(strength: float):

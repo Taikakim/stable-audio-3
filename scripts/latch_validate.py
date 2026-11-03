@@ -1,8 +1,9 @@
 #!/usr/bin/env python
+# Last edited: THE-FINN 2026-11-03 — paths updated for the __theme sorting of sa3_lora_runs and latch_sweep
 """latch_validate.py — CPU-vs-GPU cosine validation harness for the LatCH ONNX path.
 
 WHY: ``sa3_latch_onnx.generate_z0_latch_guided`` is a numpy/ORT *CPU* port of the
-torch GPU oracle ``/run/media/kim/Mantu/latch_sweep/gen_one.py::gen_guided``
+torch GPU oracle ``/run/media/kim/Mantu/latch_sweep/__misc/gen_one.py::gen_guided``
 (``sample_flow_euler_multi_latch_guided``, the two-stage variance+mean Selective-TFG
 sampler). This script runs BOTH halves with matched params and checks that the two
 clean latents agree (z0 cosine >= 0.999), and that the LatCH head measures the

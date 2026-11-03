@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Last edited: THE-FINN 2026-11-03 — paths updated for the __theme sorting of sa3_lora_runs and latch_sweep
 """sa3_latch_onnx.py — CPU LatCH-GUIDED generator over the PLAIN DiT ONNX.
 
 The LatCH sibling of ``sa3_control_onnx.py``. Where the control-DiT bakes a trained
@@ -11,7 +12,7 @@ numpy<->torch around the head grad calls; the DiT itself never sees torch.
 This is a faithful port of
 ``stable_audio_3.inference.latch_guided.sample_flow_euler_multi_latch_guided``
 (the TWO-stage variance+mean Selective-TFG sampler) and the schedule/target/seed
-conventions in ``/run/media/kim/Mantu/latch_sweep/gen_one.py`` (the cos-validation
+conventions in ``/run/media/kim/Mantu/latch_sweep/__misc/gen_one.py`` (the cos-validation
 oracle). Everything runs fp32 on CPU; the ORT session is passed in (CPUExecutionProvider).
 
 SCHEDULE (verified, NOT sa3_control_onnx.schedule):

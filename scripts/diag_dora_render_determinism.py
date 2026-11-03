@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Last edited: THE-FINN 2026-11-03 — paths updated for the __theme sorting of sa3_lora_runs and latch_sweep
 """Repro for the live-DoRA render fault (SAO docs/training-findings.md 13e).
 
 Renders ONE prompt at a fixed seed several times in one process, interleaving calls of different
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from demo_cfg_sweep import adapter_state, load_model  # noqa: E402
 from eval_demo_callback import CANONICAL_DEMO_PROMPTS, generate_clip_latents  # noqa: E402
 
-RUN = "/run/media/kim/Mantu/sa3_lora_runs/goa3_avp_r128_shampoo_b16_3e4_2026-09-25"
+RUN = "/run/media/kim/Mantu/sa3_lora_runs/__finetunes/goa3_avp_r128_shampoo_b16_3e4_2026-09-25"
 
 
 def main():
