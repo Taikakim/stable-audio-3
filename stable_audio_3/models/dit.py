@@ -513,7 +513,9 @@ class DiffusionTransformer(nn.Module):
                 batch_local_add_cond = None
 
             if modular_local_cond is not None:
-                batch_modular_local_cond = {k: torch.cat([v, v], dim=0) for k, v in modular_local_cond.items()}
+                # modular_cfg_null (W 2026-11-03, default off): zeros in the uncond branch, the null the inlet trains on, so CFG scales the stream as it scales the text.
+                _null_stream = getattr(self, "modular_cfg_null", False)
+                batch_modular_local_cond = {k: torch.cat([v, torch.zeros_like(v) if _null_stream else v], dim=0) for k, v in modular_local_cond.items()}
             else:
                 batch_modular_local_cond = None
 
