@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Last edited: THE-FINN 2026-11-03 — root-variable paths updated for the __theme sorting
 """Build DoRA model soups by CPU weight-averaging Lightning .ckpt LoRA checkpoints.
 
 Each source .ckpt stores LoRA tensors in ck['state_dict'] (lora_A/lora_B/magnitude,
@@ -29,14 +30,14 @@ OUT.mkdir(parents=True, exist_ok=True)
 # Epoch-ordered (ep0..ep7) source checkpoint paths per variant.
 VARIANTS = {
     "r16": [
-        RUNS / "sa3-goa-dora-47s-b4/vjnnndnu/checkpoints/epoch=0-step=1350.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4/vjnnndnu/checkpoints/epoch=1-step=2700.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4/vjnnndnu/checkpoints/epoch=2-step=4050.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=0-step=1350.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=1-step=2700.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=2-step=4050.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=3-step=5400.ckpt",
-        RUNS / "sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=4-step=6750.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4/vjnnndnu/checkpoints/epoch=0-step=1350.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4/vjnnndnu/checkpoints/epoch=1-step=2700.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4/vjnnndnu/checkpoints/epoch=2-step=4050.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=0-step=1350.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=1-step=2700.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=2-step=4050.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=3-step=5400.ckpt",
+        RUNS / "__finetunes/sa3-goa-dora-47s-b4-cont/x20b3ygb/checkpoints/epoch=4-step=6750.ckpt",
     ],
     "r64": [
         RUNS / f"sa3-goa-dora-47s-r64/i8nygj4y/checkpoints/epoch={i}-step={(i+1)*1350}.ckpt"

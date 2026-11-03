@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Last edited: THE-FINN 2026-11-03 — root-variable paths updated for the __theme sorting
 """Build cross-optimiser DoRA soups: w_A*(AdamW ckpt) + w_F*(Fusion ckpt).
 
 Reuses soup_dora.py's averaging (`soup`, fp64 accumulate) and the canonical
@@ -21,8 +22,8 @@ RUNS = Path("/run/media/kim/Mantu/sa3_lora_runs")
 OUT = RUNS / "soups_dora"
 OUT.mkdir(parents=True, exist_ok=True)
 
-ADAMW = RUNS / "sa3-goa-dora-47s-r128-adamw/dq0egegi/checkpoints/epoch=0-step=1350.ckpt"
-FUSION = RUNS / "sa3-goa-dora-47s-r128-fusion/mqe3ne49/checkpoints/epoch=3-step=5400.ckpt"
+ADAMW = RUNS / "__finetunes/sa3-goa-dora-47s-r128-adamw/dq0egegi/checkpoints/epoch=0-step=1350.ckpt"
+FUSION = RUNS / "__finetunes/sa3-goa-dora-47s-r128-fusion/mqe3ne49/checkpoints/epoch=3-step=5400.ckpt"
 
 # (AdamW weight, Fusion weight)
 RATIOS = {
