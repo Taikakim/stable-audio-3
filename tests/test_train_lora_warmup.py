@@ -1,4 +1,4 @@
-from scripts.train_lora import compute_warmup_steps
+from scripts.train_lora import FUSION_LORA_WARMUP, compute_warmup_steps, default_warmup_steps
 
 
 def test_no_frac_passes_through_raw_steps():
@@ -42,3 +42,18 @@ def test_frac_overrides_raw_warmup_steps_when_both_given():
         dataset_len=5400, batch_size=4, accumulate_grad_batches=1, epochs=20, steps=10_000,
     )
     assert steps == 1350
+
+
+def test_fusion_lora_defaults_to_the_momentum_window():
+    assert default_warmup_steps(None, "fusion", False) == FUSION_LORA_WARMUP == 20
+
+
+def test_default_stays_zero_off_fusion_lora():
+    assert default_warmup_steps(None, "adamw", False) == 0
+    assert default_warmup_steps(None, "lion", False) == 0
+    assert default_warmup_steps(None, "fusion", True) == 0
+
+
+def test_explicit_zero_restores_the_old_behaviour():
+    assert default_warmup_steps(0, "fusion", False) == 0
+    assert default_warmup_steps(250, "adamw", False) == 250

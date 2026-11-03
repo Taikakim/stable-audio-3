@@ -1,3 +1,4 @@
+# Last edited: WINTERMUTE 2026-11-04 — Fusion + LoRA warms up over the momentum window by default, --warmup-steps 0 restores the old behaviour (EXPERIMENTS A7)
 # Last edited: THE-FINN 2026-11-03 — keep the script and its launcher with each run (TRAINING.md D37)
 """
 Simple LoRA fine-tuning for Stable Audio 3.
@@ -145,6 +146,18 @@ def load_model(model_name: str, device: torch.device,
     if model.pretransform is not None:
         model.pretransform.enable_grad = False
     return model, model_config
+
+
+# FusionOpt's momentum window, 1 / (1 - mu) with mu 0.95. NS5 sets every singular value of the update to 1
+# whatever the gradient's size, so a zero-init LoRA B takes a full-size step on step 1 (EXPERIMENTS A7).
+FUSION_LORA_WARMUP = 20
+
+
+def default_warmup_steps(warmup_steps, optimizer, full_finetune):
+    """--warmup-steps as given; when not given, the momentum window for Fusion + LoRA, otherwise 0."""
+    if warmup_steps is not None:
+        return warmup_steps
+    return FUSION_LORA_WARMUP if optimizer == "fusion" and not full_finetune else 0
 
 
 def compute_warmup_steps(warmup_steps, warmup_frac, dataset_len, batch_size,
@@ -542,7 +555,8 @@ def train(args):
     # full-FT latent-runaway incident: fusion full-FT MUST override this (~0.1).
     _wd = args.weight_decay if args.weight_decay is not None else (0.0 if args.optimizer == "fusion" else 0.01)
     _warmup_steps = compute_warmup_steps(
-        args.warmup_steps, args.warmup_frac, len(dataset), args.batch_size,
+        default_warmup_steps(args.warmup_steps, args.optimizer, args.full_finetune),
+        args.warmup_frac, len(dataset), args.batch_size,
         args.accumulate_grad_batches, args.epochs, args.steps)
     # total OPTIMIZER steps of this run (same units as warmup) — the horizon for --fusion-decay
     # steps are OPTIMIZER steps as Lightning counts them: divide by DDP world size too
@@ -1221,11 +1235,11 @@ def main():
              "unchanged. Composes with --fusion-split-qkv. Off by default.",
     )
     p.add_argument(
-        "--warmup-steps", "--warmup_steps", dest="warmup_steps", type=int, default=0,
+        "--warmup-steps", "--warmup_steps", dest="warmup_steps", type=int, default=None,
         help="FusionOpt only: linear ramp of the effective step size (gamma_t) from 0->1 "
-             "over this many OPTIMIZER steps. Default 0 = no warmup (matches every Fusion "
-             "run to date -- warmup_steps was a FusionOpt constructor param never threaded "
-             "to a flag before 2026-08-14). No effect for adamw.",
+             "over this many OPTIMIZER steps. Default: 20 (the momentum window) for Fusion + LoRA, "
+             "because NS5 gives a zero-init B a full-size first step (EXPERIMENTS A7); 0 for a full "
+             "fine-tune. Pass 0 to match Fusion LoRA runs before 2026-11-04. No effect for adamw.",
     )
     p.add_argument(
         "--warmup-frac", "--warmup_frac", dest="warmup_frac", type=float, default=None,
