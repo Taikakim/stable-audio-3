@@ -104,6 +104,8 @@ def pack_channel_index(pack: str):
         return list(range(2))
     if pack == "contour_interval":       # E24: 25 clipped steps + onset flag
         return list(range(26))
+    if pack == "contour_l3":             # E24 arm B, W 2026-11-03: eval/e24_build_l3_pack.py, 13 K&P L3 shapes + note-on + sounding
+        return list(range(15))
     idx = []
     for f in PACKS[pack]:
         lo, hi = _OFFSETS[f]
