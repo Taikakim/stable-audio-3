@@ -1,3 +1,4 @@
+# Last edited: THE-FINN 2026-11-03 — keep the script and its launcher with each run (TRAINING.md D37)
 # scripts/latch/train_latch.py
 # Last edited: GHOST-NOTE 2026-10-14 -- --save-every-epoch (per-epoch snapshots alongside best.pt; default off)
 # Last edited: WINTERMUTE 2026-10-21 -- --lr-watchdog: per-group lr halving when a group's weight RMS runs away (default off)
@@ -42,6 +43,19 @@ import argparse
 import json
 import math
 import os
+import sys
+
+
+def _snapshot_code(run_dir):
+    """TRAINING.md D37: keep this script and its launcher with the run. Rank 0 only; never fatal."""
+    if os.environ.get("LOCAL_RANK", "0") != "0":
+        return
+    try:
+        import subprocess as _sp
+        _sp.run([sys.executable, "/home/kim/Projects/SAO/Misc/run_record.py", "autosnapshot", str(run_dir),
+                 os.path.abspath(sys.argv[0])], timeout=120, check=False)
+    except Exception as e:  # never lose a run to bookkeeping
+        print(f"[run_record] snapshot failed: {e}", flush=True)
 
 
 def _apply_rocm_training_profile():
@@ -582,6 +596,7 @@ def train(args):
 
     print(f"Loss: {loss_type}; Optimizer: {args.optimizer}; Precision: {args.precision}")
     os.makedirs(args.save_dir, exist_ok=True)
+    _snapshot_code(args.save_dir)
 
     # Target standardization stats (zero-mean/unit-std) from a sample of the dataset.
     std_mean, std_std = 0.0, 1.0

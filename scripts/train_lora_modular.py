@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Last edited: THE-FINN 2026-11-03 — keep the script and its launcher with each run (TRAINING.md D37)
 """Experimental Modular Stage-Based Optimizer Trainer for SA3 LoRA.
 
 A standalone copy of train_lora.py, stripped of research-specific features (glitch,
@@ -77,6 +78,18 @@ PRECISION_MODES = {
 
 # Canonical subset path (symlinks)
 SUBSET_300_PATH = "/run/media/kim/Kosmos/latents/latents_sa3_subset300"
+
+
+def _snapshot_code(run_dir):
+    """TRAINING.md D37: keep this script and its launcher with the run. Rank 0 only; never fatal."""
+    if os.environ.get("LOCAL_RANK", "0") != "0":
+        return
+    try:
+        import subprocess as _sp
+        _sp.run([sys.executable, "/home/kim/Projects/SAO/Misc/run_record.py", "autosnapshot", str(run_dir),
+                 os.path.abspath(sys.argv[0])], timeout=120, check=False)
+    except Exception as e:  # never lose a run to bookkeeping
+        print(f"[run_record] snapshot failed: {e}", flush=True)
 
 
 def load_model(model_name: str, device: torch.device,
@@ -758,6 +771,7 @@ def train(args):
     run_dir = os.path.join(args.save_dir, args.name) if (args.save_dir and args.name) else (args.save_dir or "./")
     os.makedirs(run_dir, exist_ok=True)
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    _snapshot_code(run_dir)
 
     # Raw-gradient telemetry + outlier flight recorder (diagnostic only; see
     # stable_audio_3/training/flight_recorder.py and docs/train_lora_modular.md §7).

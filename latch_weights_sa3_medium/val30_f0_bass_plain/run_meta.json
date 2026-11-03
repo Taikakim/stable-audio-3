@@ -1,0 +1,22 @@
+{
+  "run": "val30_f0_bass_plain",
+  "created": "2026-08-18T19:30:19+03:00",
+  "purpose": "First held-out-validated training of the D3 melody head. Answers whether the head generalises on unseen tracks, at which epoch it turns over, and whether EMA damping helps -- none of which the 3-epoch pilot or the 5-epoch 2026-08-14 bracket could, both having been scored on training loss only.",
+  "voice": "f0_bass",
+  "ema": 0,
+  "recipe": {"t_injection": "adaln_zero", "loss": "smooth_l1", "epochs": 30, "ema": 0,
+             "batch_size": 32, "lr": 3e-4, "optimizer": "adamw", "precision": "bf16",
+             "dim": 256, "depth": 4, "heads": 8, "standardize": true,
+             "voiced_field": "f0_bass_voiced_ts", "seed": 0},
+  "validation": {"val_frac": 0.15, "val_seed": 0, "group_by": "source_track",
+                 "why_grouped": "every track in latents_sa3 has >=2 crops; a crop-level split leaks a sibling crop of nearly every val track into train",
+                 "best_ckpt_selected_on": "val_loss"},
+  "dataset": {"latents": "/home/kim/Projects/latents_sa3", "corpus": "goa (Goa_Separated), beat-aligned T=4096 crops",
+              "target": "PredominantPitchMelodia f0 on the separated stem, 100 Hz, masked by voiced fraction"},
+  "script": "latch/run_melody_val_arms.sh",
+  "trainer": "stable-audio-3/scripts/latch/train_latch.py",
+  "log": "/home/kim/Projects/SAO/latch/val_arm_logs/val30_f0_bass_plain.log",
+  "exit_code": 0,
+  "result": null,
+  "kim_feedback": null
+}

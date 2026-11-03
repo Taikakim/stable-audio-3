@@ -1,3 +1,4 @@
+# Last edited: THE-FINN 2026-11-03 — keep the script and its launcher with each run (TRAINING.md D37)
 """
 Simple LoRA fine-tuning for Stable Audio 3.
 
@@ -37,6 +38,7 @@ Usage:
 # Disable HuggingFace progress bars BEFORE any imports
 # This must be at the very top to take effect
 import os
+import sys
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -92,6 +94,18 @@ PRECISION_MODES = {
     "bf16-mixed": (torch.float32,  None,   "bf16-mixed"),
     "fp16-mixed": (torch.float32,  None,   "16-mixed"),
 }
+
+
+def _snapshot_code(run_dir):
+    """TRAINING.md D37: keep this script and its launcher with the run. Rank 0 only; never fatal."""
+    if os.environ.get("LOCAL_RANK", "0") != "0":
+        return
+    try:
+        import subprocess as _sp
+        _sp.run([sys.executable, "/home/kim/Projects/SAO/Misc/run_record.py", "autosnapshot", str(run_dir),
+                 os.path.abspath(sys.argv[0])], timeout=120, check=False)
+    except Exception as e:  # never lose a run to bookkeeping
+        print(f"[run_record] snapshot failed: {e}", flush=True)
 
 
 def load_layer_update_weights(spec):
@@ -779,6 +793,8 @@ def train(args):
     else:
         logger = None
         checkpoint_dir = args.save_dir if args.save_dir else None
+    if args.save_dir:
+        _snapshot_code(args.save_dir)
 
     if args.checkpoint_every_epochs:
         ckpt_callback = pl.callbacks.ModelCheckpoint(
