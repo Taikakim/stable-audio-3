@@ -100,6 +100,10 @@ def pack_channel_index(pack: str):
     """Channel indices (into the superset ctrl array) for a named pack."""
     if pack == "pianoroll":
         return list(range(128))          # its own 128-ch sidecar, not the 36-ch superset
+    if pack == "contour_centered":       # E24, W 2026-11-03: eval/e24_build_contour_packs.py, own sidecar via --mir_ctrl_dir
+        return list(range(2))
+    if pack == "contour_interval":       # E24: 25 clipped steps + onset flag
+        return list(range(26))
     idx = []
     for f in PACKS[pack]:
         lo, hi = _OFFSETS[f]
