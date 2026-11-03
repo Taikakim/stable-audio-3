@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Last edited: THE-FINN 2026-11-03 — paths updated for the sa3_control_runs/__theme reorganisation
 """export_dit_control_onnx.py — export the SA3 DiT with a trained **scalar control
 adapter baked in** (e.g. onset-density steering), to ONNX for low-VRAM AMD inference.
 
@@ -24,7 +25,7 @@ Export + validate run on CPU. Validation is THREE-way to prove the control actua
 landed in the graph: ONNX==torch(with control), and both differ from torch(no control).
 
     python scripts/export_dit_control_onnx.py \
-        --ckpt /run/media/kim/Mantu/sa3_control_runs/onset_FUSION_lr2e5_40epoch/soup_exppeak.pt \
+        --ckpt /run/media/kim/Mantu/sa3_control_runs/__onsets/onset_FUSION_lr2e5_40epoch/soup_exppeak.pt \
         --model medium-base --frames 256 --text-seq 128 --validate
 """
 import argparse
