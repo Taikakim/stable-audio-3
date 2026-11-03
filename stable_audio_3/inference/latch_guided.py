@@ -1,4 +1,5 @@
 # stable_audio_3/inference/latch_guided.py
+# Last edited: WINTERMUTE 2026-11-04 — guide_softclip (soft cap on the step relative to the state) and per-guide dim_weights, EXPERIMENTS D6
 # Last edited: WINTERMUTE 2026-10-15 — guide_schedule="flat" option (constant per-step weight) beside the TFG alpha schedule
 # Last edited: WINTERMUTE 2026-10-15 — guide_anchor (cap x_t std at its healthy value per sigma, every step)
 # Last edited: WINTERMUTE 2026-10-15 — guide_rescale (per-step std rescale after each guidance edit, LatCH analogue of CFG rescale)
@@ -92,7 +93,7 @@ def _make_latch_criterion(loss_type, huber_beta=1.0, w_sec=None, fps=None):
 def sample_flow_euler_multi_latch_guided(
     model, x, sigmas, guides, *,
     rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0, guide_anchor=0.0,
-    log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
+    guide_softclip=0.0, log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Flow-matching Euler sampler with multiple LatCH guides (Selective TFG).
 
@@ -140,8 +141,10 @@ def sample_flow_euler_multi_latch_guided(
         # window's share of a whole-schedule budget -- see _st_weights for the numbers
         # and the 10.8x legacy-gain caveat.
         g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule)
-        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
-                                                w_sec=g.get("w_sec"), fps=g.get("fps"))
+        g["_criterion"] = _with_dim_weights(
+            _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
+                                  w_sec=g.get("w_sec"), fps=g.get("fps")),
+            g.get("dim_weights"), x.device)
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
 
     # Pre-warm per-guide adaLN-zero time caches with the full schedule + t=0.
@@ -187,7 +190,7 @@ def sample_flow_euler_multi_latch_guided(
                     "gv_norm": grad_var.detach().norm().item(),
                     "x_norm": x.detach().norm().item(), "rho_t": rho_t,
                 })
-            x = _rescale_like((x - rho_t * grad_var).detach(), x.detach(), guide_rescale)
+            x = _rescale_like((x - _soft_clip_step(rho_t * grad_var, x.detach(), guide_softclip)).detach(), x.detach(), guide_rescale)
 
         with torch.no_grad():
             v = model(x.to(model_dtype), t_b.to(model_dtype), **model_kwargs).float()
@@ -208,7 +211,7 @@ def sample_flow_euler_multi_latch_guided(
                     for g in active
                 )
                 grad_mean = torch.autograd.grad(loss_mean, z0)[0]
-                z0 = (z0 - mu_t * grad_mean).detach()
+                z0 = (z0 - _soft_clip_step(mu_t * grad_mean, z0.detach(), guide_softclip)).detach()
             z0 = _rescale_like(z0, z0_pre, guide_rescale)
 
         t_b3 = t_curr.clamp(min=1e-6)
@@ -260,7 +263,7 @@ def resolve_guided_sampler(objective, latch_hparams=None, sampler_type=None):
 def sample_flow_pingpong_multi_latch_guided(
     model, x, sigmas, guides, *,
     rho=1.0, mu=1.0, gamma=0.3, n_iter=4, guide_schedule="alpha", guide_rescale=0.0, guide_anchor=0.0,
-    log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
+    guide_softclip=0.0, log_norms=False, disable_tqdm=False, callback=None, **model_kwargs,
 ):
     """Ping-pong sampler with multiple LatCH guides — the rf_denoiser twin of
     ``sample_flow_euler_multi_latch_guided``.
@@ -311,8 +314,10 @@ def sample_flow_pingpong_multi_latch_guided(
         g["_start"] = int(num_steps * g["start_pct"])
         g["_end"] = int(num_steps * g["end_pct"])
         g["_scale"] = _window_scale(alpha, g["_start"], g["_end"], guide_schedule)
-        g["_criterion"] = _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
-                                                w_sec=g.get("w_sec"), fps=g.get("fps"))
+        g["_criterion"] = _with_dim_weights(
+            _make_latch_criterion(g.get("loss_type", "mse"), g.get("huber_beta", 1.0),
+                                  w_sec=g.get("w_sec"), fps=g.get("fps")),
+            g.get("dim_weights"), x.device)
         g["target"] = g["target"].to(device=x.device, dtype=torch.float32)
 
     _t_values = sigmas[:-1].tolist() + [0.0]
@@ -348,7 +353,7 @@ def sample_flow_pingpong_multi_latch_guided(
                     "gv_norm": grad_var.detach().norm().item(),
                     "x_norm": x.detach().norm().item(), "rho_t": rho_t,
                 })
-            x = _rescale_like((x - rho_t * grad_var).detach(), x.detach(), guide_rescale)
+            x = _rescale_like((x - _soft_clip_step(rho_t * grad_var, x.detach(), guide_softclip)).detach(), x.detach(), guide_rescale)
 
         with torch.no_grad():
             v = model(x.to(model_dtype), t_b.to(model_dtype), **model_kwargs).float()
@@ -370,7 +375,7 @@ def sample_flow_pingpong_multi_latch_guided(
                     for g in active
                 )
                 grad_mean = torch.autograd.grad(loss_mean, z0)[0]
-                z0 = (z0 - mu_t * grad_mean).detach()
+                z0 = (z0 - _soft_clip_step(mu_t * grad_mean, z0.detach(), guide_softclip)).detach()
             z0 = _rescale_like(z0, z0_pre, guide_rescale)
 
         # --- the ONE line that differs from Euler: renoise with FRESH noise -----
@@ -385,6 +390,29 @@ def sample_flow_pingpong_multi_latch_guided(
             print(f"  i={r['i']:>3} sigma={r['sigma']:.4f} "
                   f"||grad_var||={r['gv_norm']:.4e} ||x||={r['x_norm']:.4e} rho_t={r['rho_t']:.4e}")
     return x
+
+
+def _soft_clip_step(step, ref, c):
+    """Soft cap on a guidance step's norm at c x the state's norm, per sample (EXPERIMENTS D6).
+
+    Below the cap the step is nearly untouched (tanh(u)/u -> 1); far above it the step is
+    the gradient's direction at length c x ||ref||, so one late, heavy step cannot throw the
+    state off. c <= 0 returns the step unchanged.
+    """
+    if c <= 0:
+        return step
+    shape = (-1,) + (1,) * (step.dim() - 1)
+    n = step.flatten(1).norm(dim=1).view(shape).clamp_min(1e-12)
+    lim = (c * ref.flatten(1).norm(dim=1).view(shape)).clamp_min(1e-12)
+    return step * (lim / n) * torch.tanh(n / lim)
+
+
+def _with_dim_weights(criterion, weights, device):
+    """Weight head output channels before the loss, for example per chroma band (EXPERIMENTS D6). None = unchanged."""
+    if weights is None:
+        return criterion
+    w = torch.as_tensor(weights, device=device, dtype=torch.float32).view(1, -1, 1)
+    return lambda pred, target: criterion(pred * w, target * w)
 
 
 def _rescale_like(new, ref, phi):

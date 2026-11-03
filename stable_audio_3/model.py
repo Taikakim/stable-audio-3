@@ -1,3 +1,4 @@
+# Last edited: WINTERMUTE 2026-11-04 — latch_hparams["guide_softclip"] and per-config dim_weights forwarded to the guided samplers, EXPERIMENTS D6
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_schedule"] ("alpha" | "flat") forwarded to the guided samplers
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_rescale"] (0..1 per-step std rescale) forwarded to the guided samplers
 # Last edited: WINTERMUTE 2026-10-15 — latch_hparams["guide_anchor"] (trajectory std ceiling s0) forwarded to the guided samplers
@@ -624,6 +625,7 @@ class StableAudioModel:
                     "huber_beta": meta.get("huber_beta") or 1.0,
                     "w_sec": cfg.get("w_sec"),
                     "fps": cfg.get("fps"),
+                    "dim_weights": cfg.get("dim_weights"),
                 })
 
             hp = {
@@ -634,6 +636,7 @@ class StableAudioModel:
                 "guide_schedule": str(latch_hparams.get("guide_schedule", "alpha")),
                 "guide_rescale": float(latch_hparams.get("guide_rescale", 0.0)),
                 "guide_anchor": float(latch_hparams.get("guide_anchor", 0.0)),
+                "guide_softclip": float(latch_hparams.get("guide_softclip", 0.0)),
                 "log_norms": bool(latch_hparams.get("log_norms", False)),
             }
 
