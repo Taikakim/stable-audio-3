@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Last edited: THE-FINN 2026-11-03 — keep the script and its launcher with each run (TRAINING.md D37)
+# Last edited: CONTINUITY 2026-11-22 — --x0-equiv-loss passthrough + --adapter-ema-half-life (EMA twin of every adapter checkpoint)
 """Experimental Modular Stage-Based Optimizer Trainer for SA3 LoRA.
 
 A standalone copy of train_lora.py, stripped of research-specific features (glitch,
@@ -141,6 +142,64 @@ def build_lora_tsd_optimizer(route_root, opt_cfg: dict):
 # ---------------------------------------------------------------------------
 # ModularTrainingWrapper — subclass that adds ModularOptimizer dispatch
 # ---------------------------------------------------------------------------
+
+class AdapterEMA(pl.Callback):
+    """EMA of the TRAINABLE adapter parameters only (fp32 shadow, ~adapter size; the 1.4B base is frozen so a full-DiT
+    EMA would only copy it). train_lora force-disables EMA for adapters; this adds one without touching the wrapper.
+    beta = 0.5 ** (1 / half_life), one update per optimizer step (no accumulation in our adapter runs; with
+    accumulation it is still per optimizer step, because it keys on global_step). Every `every` steps it writes an
+    EMA twin of the checkpoint to <save_dir>/<name>_ema/checkpoints/step=<N>.ckpt in the adapter-checkpoint format
+    (state_dict of lora keys + lora_config), so renderers load it like any adapter checkpoint (CONTINUITY 2026-11-22)."""
+    def __init__(self, half_life, every, out_dir):
+        self.beta = 0.5 ** (1.0 / float(half_life)); self.every, self.out_dir = int(every), out_dir
+        self.shadow, self.last = None, -1
+
+    def _params(self, pl_module):
+        for root_name in ("model", "conditioner"):
+            root = getattr(pl_module.diffusion, root_name)
+            for n, p in root.named_parameters():
+                if p.requires_grad:
+                    yield root_name, n, p
+
+    def on_train_start(self, trainer, pl_module):
+        self.shadow = {(r, n): p.detach().float().clone() for r, n, p in self._params(pl_module)}
+        print(f"[adapter-ema] {len(self.shadow)} tensors, beta {self.beta:.6f}, every {self.every} -> {self.out_dir}", flush=True)
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        step = trainer.global_step
+        if self.shadow is None or step == self.last:
+            return
+        self.last = step
+        for r, n, p in self._params(pl_module):
+            self.shadow[(r, n)].mul_(self.beta).add_(p.detach().float(), alpha=1.0 - self.beta)
+        if step > 0 and step % self.every == 0 and trainer.is_global_zero:
+            self.save(pl_module, step)
+
+    def on_train_end(self, trainer, pl_module):
+        if self.shadow is not None and trainer.is_global_zero and trainer.global_step % self.every != 0:
+            self.save(pl_module, trainer.global_step)
+
+    @torch.no_grad()
+    def save(self, pl_module, step):
+        from stable_audio_3.models.lora.utils import get_lora_state_dict
+        sd, hit = {}, 0
+        for root_name in ("model", "conditioner"):
+            root = getattr(pl_module.diffusion, root_name)
+            for k, v in get_lora_state_dict(root).items():
+                key = (root_name, k)
+                if key in self.shadow:
+                    sd[k] = self.shadow[key].to(v.dtype).cpu(); hit += 1
+                else:
+                    sd[k] = v.detach().cpu()
+        if hit != len(self.shadow):
+            raise RuntimeError(f"[adapter-ema] only {hit} of {len(self.shadow)} EMA tensors matched lora keys; not writing")
+        os.makedirs(self.out_dir, exist_ok=True)
+        path = os.path.join(self.out_dir, f"step={step}.ckpt")
+        torch.save({"state_dict": sd, "lora_config": pl_module.lora_config, "global_step": step,
+                    "adapter_ema": {"beta": self.beta, "updates": step}}, path)
+        print(f"[adapter-ema] wrote {path} ({hit} EMA tensors)", flush=True)
+
 
 class ModularTrainingWrapper(DiffusionCondTrainingWrapper):
     """Extends DiffusionCondTrainingWrapper with ModularOptimizer parameter routing.
@@ -764,6 +823,7 @@ def train(args):
         latent_var_weight=(args.var_barrier_weight if args.var_dampening is not None else 0.0),
         subspace_loss_basis=args.subspace_loss_basis,
         subspace_loss_weight=args.subspace_loss_weight,
+        x0_equiv_loss=args.x0_equiv_loss,
     )
 
     # ---- Callbacks ----
@@ -931,6 +991,9 @@ def train(args):
     if not hasattr(args, "gradient_clip_val") or args.gradient_clip_val == 0:
         args.gradient_clip_val = None
 
+    if args.adapter_ema_half_life and args.adapter_ema_half_life > 0:
+        callbacks.append(AdapterEMA(args.adapter_ema_half_life, args.checkpoint_every,
+                                    os.path.join(args.save_dir, args.name + "_ema", "checkpoints")))
     trainer = pl.Trainer(
         devices="auto",
         accelerator="auto",
@@ -1242,6 +1305,11 @@ def main():
     sub.add_argument("--subspace-loss-basis", "--subspace_loss_basis", dest="subspace_loss_basis", default=None,
                      help="npz with orthonormal latent-subspace rows (`basis15`, or first 15 of `melody_basis`), "
                           "e.g. lumi/melody_subspace15_selective_v3.npz (the subloss_k24 basis)")
+    p.add_argument("--x0-equiv-loss", "--x0_equiv_loss", dest="x0_equiv_loss", action="store_true",
+                   help="x0-equivalent loss: sigma^2-weighted v-loss, renormalised x3 (E1a; training/diffusion.py)")
+    p.add_argument("--adapter-ema-half-life", type=float, default=0.0,
+                   help="EMA of the adapter params with this half-life in optimizer steps; writes an EMA twin of each "
+                        "checkpoint to <save_dir>/<name>_ema/checkpoints/ (0 = off)")
     sub.add_argument("--subspace-loss-weight", "--subspace_loss_weight", dest="subspace_loss_weight",
                      type=float, default=1.0,
                      help="K: the RF error's share inside the subspace is weighted K x; 1.0 = off (byte-identical)")
